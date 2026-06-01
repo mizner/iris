@@ -1,0 +1,7 @@
+{
+  "name": "@mizner/iris-skill",
+  "version": "4.6.0",
+  "description": "Portable agent skill for Iris browser automation.",
+  "license": "MIT",
+  "private": true
+}

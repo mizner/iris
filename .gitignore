@@ -1,0 +1,15 @@
+node_modules/
+*.log
+.DS_Store
+.sisyphus/
+.codex-orchestrator.json
+.iris/
+artifacts/
+coverage/
+*.tgz
+.opencode/
+!.opencode/skills/
+!.opencode/skills/**
+packages/core/.opencode/
+packages/core/dist/
+build-cws-package.mjs

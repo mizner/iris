@@ -1,0 +1,31 @@
+{
+  "name": "@mizner/iris-opencode",
+  "version": "4.6.0",
+  "description": "OpenCode adapter for Iris browser automation.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mizner/iris.git",
+    "directory": "packages/opencode"
+  },
+  "main": "./dist/plugin.js",
+  "exports": {
+    ".": "./dist/plugin.js",
+    "./plugin": "./dist/plugin.js"
+  },
+  "scripts": {
+    "build": "bun build src/plugin.ts --target=node --outfile=dist/plugin.js"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "dependencies": {
+    "@mizner/iris": "file:../core",
+    "agent-browser": "^0.4.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "bun-types": "*"
+  }
+}

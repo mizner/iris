@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@mizner/iris": [
+        "./packages/core"
+      ],
+      "@mizner/iris/*": [
+        "./packages/core/*"
+      ],
+      "@mizner/iris-opencode": [
+        "./packages/opencode"
+      ],
+      "@mizner/iris-opencode/*": [
+        "./packages/opencode/*"
+      ],
+      "@mizner/iris-mcp": [
+        "./packages/mcp"
+      ],
+      "@mizner/iris-mcp/*": [
+        "./packages/mcp/*"
+      ]
+    }
+  }
+}

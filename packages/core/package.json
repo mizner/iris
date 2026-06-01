@@ -1,0 +1,33 @@
+{
+  "name": "@mizner/iris",
+  "version": "4.6.0",
+  "description": "Harness-agnostic browser runtime for Iris.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mizner/iris.git",
+    "directory": "packages/core"
+  },
+  "bin": {
+    "iris": "./bin/cli.js",
+    "browser-cli": "./bin/browser-cli.cjs"
+  },
+  "exports": {
+    ".": "./package.json",
+    "./broker": "./src/broker.ts",
+    "./paths": "./src/paths.ts"
+  },
+  "files": [
+    "bin",
+    "extension",
+    "src"
+  ],
+  "scripts": {
+    "runtime:install": "node bin/cli.js install",
+    "runtime:migrate": "node bin/cli.js migrate",
+    "runtime:status": "node bin/cli.js status",
+    "runtime:uninstall": "node bin/cli.js uninstall",
+    "runtime:update": "node bin/cli.js update"
+  }
+}
