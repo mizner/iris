@@ -3,6 +3,9 @@
   "version": "4.6.0",
   "description": "OpenCode adapter for Iris browser automation.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",

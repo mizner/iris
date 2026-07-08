@@ -3,6 +3,9 @@
   "version": "4.6.0",
   "description": "Harness-agnostic browser runtime for Iris.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",

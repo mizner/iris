@@ -39,7 +39,7 @@ const RUNTIME_DIR = process.env.IRIS_BROKER_SOCK?.trim() ? dirname(SOCKET_PATH) 
 
 const DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024;
 const MAX_UPLOAD_BYTES = (() => {
-  const raw = process.env.OPENCODE_BROWSER_MAX_UPLOAD_BYTES;
+  const raw = process.env.IRIS_MAX_UPLOAD_BYTES ?? process.env.OPENCODE_BROWSER_MAX_UPLOAD_BYTES;
   const value = raw ? Number(raw) : NaN;
   if (Number.isFinite(value) && value > 0) return value;
   return DEFAULT_MAX_UPLOAD_BYTES;
@@ -61,8 +61,8 @@ function buildFileUploadPayload(
   if (!stats.isFile()) throw new Error(`Not a file: ${absPath}`);
   if (stats.size > MAX_UPLOAD_BYTES) {
     throw new Error(
-      `File too large (${stats.size} bytes). Max is ${MAX_UPLOAD_BYTES} bytes (OPENCODE_BROWSER_MAX_UPLOAD_BYTES). ` +
-        `For larger uploads, use OPENCODE_BROWSER_BACKEND=agent.`
+      `File too large (${stats.size} bytes). Max is ${MAX_UPLOAD_BYTES} bytes (IRIS_MAX_UPLOAD_BYTES / OPENCODE_BROWSER_MAX_UPLOAD_BYTES). ` +
+        `For larger uploads, use IRIS_BACKEND=agent.`
     );
   }
   const base64 = readFileSync(absPath).toString("base64");
@@ -123,7 +123,12 @@ async function sleep(ms: number): Promise<void> {
   return await new Promise((r) => setTimeout(r, ms));
 }
 
-const BACKEND_MODE = (process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension")
+const BACKEND_MODE = (
+  process.env.IRIS_BACKEND ??
+  process.env.OPENCODE_BROWSER_BACKEND ??
+  process.env.OPENCODE_BROWSER_MODE ??
+  "extension"
+)
   .toLowerCase()
   .trim();
 const USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);

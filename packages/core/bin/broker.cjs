@@ -22,7 +22,7 @@ function readMsEnv(name, fallback) {
 }
 
 const LEASE_TTL_MS = (() => {
-  const raw = process.env.OPENCODE_BROWSER_CLAIM_TTL_MS;
+  const raw = process.env.IRIS_CLAIM_TTL_MS ?? process.env.OPENCODE_BROWSER_CLAIM_TTL_MS;
   const value = Number(raw);
   if (Number.isFinite(value) && value >= 0) return value;
   return DEFAULT_LEASE_TTL_MS;
@@ -152,7 +152,7 @@ function checkClaim(tabId, sessionId) {
   const existing = claims.get(tabId);
   if (!existing) return { ok: true };
   if (existing.sessionId === sessionId) return { ok: true };
-  return { ok: false, error: `Tab ${tabId} is owned by another OpenCode session (${existing.sessionId})` };
+  return { ok: false, error: `Tab ${tabId} is owned by another Iris session (${existing.sessionId})` };
 }
 
 function setClaim(tabId, sessionId) {
@@ -226,16 +226,16 @@ function probeExistingSocket(timeoutMs = 750) {
 async function prepareSocketPath() {
   const probe = await probeExistingSocket();
   if (probe.live) {
-    console.error(`[browser-broker] existing broker appears live at ${SOCKET_PATH}; not starting duplicate`);
+    console.error(`[iris-broker] existing broker appears live at ${SOCKET_PATH}; not starting duplicate`);
     return false;
   }
 
   if (fs.existsSync(SOCKET_PATH)) {
     try {
       fs.unlinkSync(SOCKET_PATH);
-      console.error(`[browser-broker] removed stale socket at ${SOCKET_PATH} (${probe.reason})`);
+      console.error(`[iris-broker] removed stale socket at ${SOCKET_PATH} (${probe.reason})`);
     } catch (err) {
-      console.error(`[browser-broker] could not remove stale socket at ${SOCKET_PATH}:`, err);
+      console.error(`[iris-broker] could not remove stale socket at ${SOCKET_PATH}:`, err);
       throw err;
     }
   }
@@ -427,7 +427,7 @@ function handleClientMessage(socket, client, msg) {
           if (typeof tabId !== "number") throw new Error("tabId is required");
           const existing = claims.get(tabId);
           if (existing && existing.sessionId !== sessionId && !force) {
-            throw new Error(`Tab ${tabId} is owned by another OpenCode session (${existing.sessionId})`);
+            throw new Error(`Tab ${tabId} is owned by another Iris session (${existing.sessionId})`);
           }
           if (existing && existing.sessionId !== sessionId && force) {
             clearDefaultTab(existing.sessionId, tabId);
@@ -447,7 +447,7 @@ function handleClientMessage(socket, client, msg) {
             return;
           }
           if (existing.sessionId !== sessionId) {
-            throw new Error(`Tab ${tabId} is owned by another OpenCode session (${existing.sessionId})`);
+            throw new Error(`Tab ${tabId} is owned by another Iris session (${existing.sessionId})`);
           }
           releaseClaim(tabId);
           replyOk({ ok: true, tabId, released: true });
@@ -521,15 +521,15 @@ async function start() {
     try {
       fs.chmodSync(SOCKET_PATH, 0o600);
     } catch {}
-    console.error(`[browser-broker] listening on ${SOCKET_PATH}`);
+    console.error(`[iris-broker] listening on ${SOCKET_PATH}`);
   });
 
   server.on("error", (err) => {
     if (err && err.code === "EADDRINUSE") {
-      console.error(`[browser-broker] socket already in use at ${SOCKET_PATH}; assuming another broker won the race`);
+      console.error(`[iris-broker] socket already in use at ${SOCKET_PATH}; assuming another broker won the race`);
       process.exit(0);
     }
-    console.error("[browser-broker] server error", err);
+    console.error("[iris-broker] server error", err);
     process.exit(1);
   });
 }
@@ -548,7 +548,7 @@ if (PING_INTERVAL_MS > 0) {
         continue;
       }
       if (now - info.lastPongAt > PONG_TIMEOUT_MS) {
-        console.error(`[browser-broker] dropping unresponsive host pid=${info.pid}`);
+        console.error(`[iris-broker] dropping unresponsive host pid=${info.pid}`);
         hosts.delete(hostSocket);
         hostSocket.destroy();
         continue;
@@ -562,6 +562,6 @@ if (PING_INTERVAL_MS > 0) {
 }
 
 start().catch((err) => {
-  console.error("[browser-broker] failed to start", err);
+  console.error("[iris-broker] failed to start", err);
   process.exit(1);
 });

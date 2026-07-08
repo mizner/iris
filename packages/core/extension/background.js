@@ -315,7 +315,7 @@ async function ensureDebuggerAttached(tabId) {
     await ensureDebuggerDomain(tabId, state, "Runtime")
   } catch (e) {
     state.unavailableReason = e?.message || String(e)
-    console.warn("[OpenCode] Failed to attach debugger:", e.message || e)
+    console.warn("[Iris] Failed to attach debugger:", e.message || e)
   }
 
   return state
@@ -571,7 +571,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   const silentMs = Date.now() - lastInboundAt
   // Broker pings keep the service worker warm; old brokers fall back to config probes without reconnect loops.
   if (sawPingOnPort && silentMs > 50000) {
-    console.warn("[OpenCode] No broker traffic for", silentMs, "ms; reconnecting")
+    console.warn("[Iris] No broker traffic for", silentMs, "ms; reconnecting")
     connect().catch(() => {})
   } else if (!sawPingOnPort && silentMs > 60000) {
     syncConfigFromNativeHost()
@@ -616,7 +616,7 @@ async function connectOnce() {
     updateBadge(false)
     if (!nativePermissionHintLogged) {
       nativePermissionHintLogged = true
-      console.log(`[OpenCode] Native messaging permission not granted. ${PERMISSION_HINT}`)
+      console.log(`[Iris] Native messaging permission not granted. ${PERMISSION_HINT}`)
     }
     return
   }
@@ -628,7 +628,7 @@ async function connectOnce() {
 
     port.onMessage.addListener((message) => {
       handleMessage(message).catch((e) => {
-        console.error("[OpenCode] Message handler error:", e)
+        console.error("[Iris] Message handler error:", e)
       })
     })
 
@@ -641,9 +641,9 @@ async function connectOnce() {
       if (err?.message) {
         connectionAttempts++
         if (connectionAttempts === 1) {
-          console.log("[OpenCode] Native host not available. Run: iris install")
+          console.log("[Iris] Native host not available. Run: iris install")
         } else if (connectionAttempts % 20 === 0) {
-          console.log("[OpenCode] Still waiting for native host...")
+          console.log("[Iris] Still waiting for native host...")
         }
       }
       scheduleReconnect(Math.min(15000, 1000 + connectionAttempts * 500))
@@ -657,7 +657,7 @@ async function connectOnce() {
   } catch (e) {
     isConnected = false
     updateBadge(false)
-    console.error("[OpenCode] connectNative failed:", e)
+    console.error("[Iris] connectNative failed:", e)
     scheduleReconnect(5000)
   }
 }
@@ -1452,12 +1452,12 @@ async function pageOps(command, args) {
     const rect = el.getBoundingClientRect()
 
     // Remove any existing highlight overlay
-    const existing = document.getElementById("__opc_highlight_overlay")
+    const existing = document.getElementById("__iris_highlight_overlay")
     if (existing) existing.remove()
 
     // Create overlay
     const overlay = document.createElement("div")
-    overlay.id = "__opc_highlight_overlay"
+    overlay.id = "__iris_highlight_overlay"
     overlay.style.cssText = `
       position: fixed;
       top: ${rect.top}px;
@@ -2355,9 +2355,9 @@ chrome.action.onClicked.addListener(async () => {
   if (!permissionResult.granted) {
     updateBadge(false)
     if (permissionResult.error) {
-      console.warn("[OpenCode] Permission request failed:", permissionResult.error)
+      console.warn("[Iris] Permission request failed:", permissionResult.error)
     } else {
-      console.warn("[OpenCode] Permission request denied.")
+      console.warn("[Iris] Permission request denied.")
     }
     return
   }
@@ -2365,7 +2365,7 @@ chrome.action.onClicked.addListener(async () => {
   if (permissionResult.requested) {
     const requestedPermissions = permissionResult.permissions.join(", ") || "none"
     const requestedOrigins = permissionResult.origins.join(", ") || "none"
-    console.log(`[OpenCode] Requested permissions -> permissions: ${requestedPermissions}; origins: ${requestedOrigins}`)
+    console.log(`[Iris] Requested permissions -> permissions: ${requestedPermissions}; origins: ${requestedOrigins}`)
   }
 
   await connect()

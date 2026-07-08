@@ -5,6 +5,9 @@
   "version": "4.6.0",
   "description": "Open-source Chrome extension and local browser automation runtime for OpenCode.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "bun run --cwd packages/opencode build && bun run --cwd packages/mcp build",
     "check:extension": "node --check packages/core/extension/background.js",

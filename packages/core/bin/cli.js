@@ -115,7 +115,7 @@ function getFlagValue(flag) {
 function getExtensionIdOverride() {
   const cliValue = getFlagValue("--extension-id") || getFlagValue("-e");
   if (cliValue) return cliValue;
-  const envValue = process.env.OPENCODE_BROWSER_EXTENSION_ID;
+  const envValue = process.env.IRIS_EXTENSION_ID ?? process.env.OPENCODE_BROWSER_EXTENSION_ID;
   return envValue ? envValue.trim() : null;
 }
 
@@ -185,6 +185,7 @@ function ensureDir(p) {
 }
 
 function resolveNodePath() {
+  if (process.env.IRIS_NODE) return process.env.IRIS_NODE;
   if (process.env.OPENCODE_BROWSER_NODE) return process.env.OPENCODE_BROWSER_NODE;
   const stableCandidates = [];
   if (platform() === "darwin") {
@@ -478,7 +479,7 @@ ${color("bright", "Usage:")}
   iris agent-gateway
 
 ${color("bright", "Options:")}
-  --extension-id <id> (or OPENCODE_BROWSER_EXTENSION_ID)
+  --extension-id <id> (or IRIS_EXTENSION_ID / OPENCODE_BROWSER_EXTENSION_ID)
 
 ${color("bright", "Quick Start:")}
   1. Run: iris install
@@ -487,7 +488,7 @@ ${color("bright", "Quick Start:")}
 
 ${color("bright", "Agent Mode:")}
   1. Run: iris agent-install
-  2. Set OPENCODE_BROWSER_BACKEND=agent
+  2. Set IRIS_BACKEND=agent (legacy OPENCODE_BROWSER_BACKEND also works)
   3. Optionally run: iris agent-gateway
 
 ${color("bright", "Connection Recovery:")}
@@ -582,7 +583,7 @@ Find it at ${color("cyan", "chrome://extensions")}:
 
   const nodePath = resolveNodePath();
   if (!/node(\.exe)?$/.test(nodePath)) {
-    warn(`Node not detected; using ${nodePath}. Set OPENCODE_BROWSER_NODE if needed.`);
+    warn(`Node not detected; using ${nodePath}. Set IRIS_NODE if needed.`);
   }
   const hostPath = writeHostWrapper(nodePath);
   success(`Installed host wrapper: ${hostPath}`);
@@ -849,7 +850,7 @@ Find it at ${color("cyan", "chrome://extensions")}:
 
   const nodePath = resolveNodePath();
   if (!/node(\.exe)?$/.test(nodePath)) {
-    warn(`Node not detected; using ${nodePath}. Set OPENCODE_BROWSER_NODE if needed.`);
+    warn(`Node not detected; using ${nodePath}. Set IRIS_NODE if needed.`);
   }
   const hostPath = writeHostWrapper(nodePath);
   success(`Updated host wrapper: ${hostPath}`);
