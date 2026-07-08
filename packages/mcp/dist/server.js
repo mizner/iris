@@ -36762,7 +36762,7 @@ var SOCKET_PATH2 = process.env.IRIS_BROKER_SOCK?.trim() || SOCKET_PATH;
 var RUNTIME_DIR = process.env.IRIS_BROKER_SOCK?.trim() ? dirname2(SOCKET_PATH2) : BASE_DIR;
 var DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024;
 var MAX_UPLOAD_BYTES = (() => {
-  const raw = process.env.OPENCODE_BROWSER_MAX_UPLOAD_BYTES;
+  const raw = process.env.IRIS_MAX_UPLOAD_BYTES ?? process.env.OPENCODE_BROWSER_MAX_UPLOAD_BYTES;
   const value = raw ? Number(raw) : NaN;
   if (Number.isFinite(value) && value > 0)
     return value;
@@ -36780,7 +36780,7 @@ function buildFileUploadPayload(filePath, fileName, mimeType) {
   if (!stats.isFile())
     throw new Error(`Not a file: ${absPath}`);
   if (stats.size > MAX_UPLOAD_BYTES) {
-    throw new Error(`File too large (${stats.size} bytes). Max is ${MAX_UPLOAD_BYTES} bytes (OPENCODE_BROWSER_MAX_UPLOAD_BYTES). ` + `For larger uploads, use OPENCODE_BROWSER_BACKEND=agent.`);
+    throw new Error(`File too large (${stats.size} bytes). Max is ${MAX_UPLOAD_BYTES} bytes (IRIS_MAX_UPLOAD_BYTES / OPENCODE_BROWSER_MAX_UPLOAD_BYTES). ` + `For larger uploads, use IRIS_BACKEND=agent.`);
   }
   const base643 = readFileSync2(absPath).toString("base64");
   const name = typeof fileName === "string" && fileName.trim() ? fileName.trim() : basename2(absPath);
@@ -36830,7 +36830,7 @@ async function connectToBroker() {
 async function sleep2(ms) {
   return await new Promise((r) => setTimeout(r, ms));
 }
-var BACKEND_MODE = (process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension").toLowerCase().trim();
+var BACKEND_MODE = (process.env.IRIS_BACKEND ?? process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension").toLowerCase().trim();
 var USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);
 var socket = null;
 var sessionId = Math.random().toString(36).slice(2);
@@ -36908,6 +36908,7 @@ function toolResultText(data, fallback) {
   return fallback;
 }
 var ROUTER_LOG_PATH = join3(RUNTIME_DIR, "router.log");
+var cachedAppleScriptApp = null;
 function logRouter(message) {
   const timestamp = new Date().toISOString();
   const line = `[${timestamp}] ${message}
@@ -36916,30 +36917,68 @@ function logRouter(message) {
     __require2("fs").appendFileSync(ROUTER_LOG_PATH, line);
   } catch {}
 }
+function appleScriptStringLiteral(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+function appleScriptApps() {
+  const preferred = process.env.IRIS_BROWSER_APP?.trim();
+  const defaults = ["Google Chrome", "Brave Browser", "Chromium"];
+  return preferred ? [preferred, ...defaults.filter((app) => app !== preferred)] : defaults;
+}
 async function tryAppleScript(toolName, args) {
   const supportedTools = ["open_tab", "navigate", "get_active_tab", "get_tabs"];
   if (!supportedTools.includes(toolName)) {
     throw new Error(`Apple Events does not support: ${toolName}`);
   }
-  const { exec, execFile } = await import("child_process");
+  const { execFile } = await import("child_process");
   const { promisify } = await import("util");
-  const execAsync = promisify(exec);
   const execFileAsync = promisify(execFile);
-  if (toolName === "open_tab" || toolName === "navigate") {
-    const url2 = args.url || "about:blank";
-    const script = `tell application "Google Chrome" to tell window 1 to make new tab with properties {URL:"${url2}"}`;
-    await execAsync(`osascript -e '${script}'`);
+  async function runAppleScript(buildArgs) {
+    const apps = cachedAppleScriptApp ? [cachedAppleScriptApp, ...appleScriptApps().filter((app) => app !== cachedAppleScriptApp)] : appleScriptApps();
+    let firstError = null;
+    for (const appName of apps) {
+      try {
+        const { stdout } = await execFileAsync("osascript", buildArgs(appName));
+        cachedAppleScriptApp = appName;
+        return { stdout, appName };
+      } catch (error45) {
+        if (!firstError)
+          firstError = error45;
+        if (cachedAppleScriptApp === appName)
+          cachedAppleScriptApp = null;
+      }
+    }
+    if (firstError instanceof Error)
+      throw firstError;
+    throw new Error(String(firstError || "Apple Events failed"));
+  }
+  if (toolName === "open_tab") {
+    const url2 = appleScriptStringLiteral(args.url || "about:blank");
+    await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to tell window 1 to make new tab with properties {URL:${url2}}`
+    ]);
     return { content: "Tab opened via Apple Events" };
   }
+  if (toolName === "navigate") {
+    const url2 = appleScriptStringLiteral(args.url || "about:blank");
+    await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to set URL of active tab of front window to ${url2}`
+    ]);
+    return { content: "Tab navigated via Apple Events" };
+  }
   if (toolName === "get_active_tab") {
-    const script = `tell application "Google Chrome" to return URL of active tab of front window`;
-    const { stdout } = await execAsync(`osascript -e '${script}'`);
+    const { stdout } = await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to return URL of active tab of front window`
+    ]);
     return { content: stdout.trim() };
   }
   if (toolName === "get_tabs") {
-    const { stdout } = await execFileAsync("osascript", [
+    const { stdout } = await runAppleScript((appName) => [
       "-e",
-      'tell application "Google Chrome"',
+      `tell application ${appleScriptStringLiteral(appName)}`,
       "-e",
       "set rows to {}",
       "-e",
@@ -36971,8 +37010,8 @@ async function tryAppleScript(toolName, args) {
     ]);
     const rows = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const tabs = rows.map((line) => {
-      const [id, windowId, index, active, title, ...urlParts] = line.split("tab");
-      const url2 = urlParts.join("tab");
+      const [id, windowId, index, active, title, ...urlParts] = line.split("\t");
+      const url2 = urlParts.join("\t");
       return {
         id: Number(id),
         windowId: Number(windowId),
