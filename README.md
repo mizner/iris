@@ -155,6 +155,16 @@ Example MCP config:
 
 Set `IRIS_BROKER_SOCK` only if you intentionally run the broker somewhere other than `~/.iris/broker.sock`.
 
+## Claude Code Setup
+
+Register Iris as a user-scope Claude Code MCP server:
+
+```bash
+claude mcp add --scope user iris -- node /absolute/path/to/iris/packages/mcp/dist/server.js
+```
+
+The OpenCode plugin and Claude MCP server can coexist; both talk to the same local Iris broker.
+
 ## CLI Usage
 
 The runtime installer places a small CLI at `~/.iris/browser-cli.cjs`:
