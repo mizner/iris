@@ -13522,6 +13522,14 @@ var plugin = async (ctx) => {
           return toolResultText(data, "ok");
         }
       }),
+      browser_get_active_tab: tool({
+        description: "Return the active browser tab",
+        args: {},
+        async execute(args, ctx2) {
+          const data = await toolRequest("get_active_tab", {});
+          return toolResultText(data, "ok");
+        }
+      }),
       browser_list_claims: tool({
         description: "List tab ownership claims",
         args: {},
@@ -13632,12 +13640,36 @@ var plugin = async (ctx) => {
         }
       }),
       browser_screenshot: tool({
-        description: "Take a screenshot of the current page. Returns base64 image data URL.",
+        description: "Take a screenshot of the current page. Supports visible, full-page, selector, and manual clip captures. Returns base64 image data URL.",
         args: {
-          tabId: schema.number().optional()
+          tabId: schema.number().optional(),
+          fullPage: schema.boolean().optional(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          x: schema.number().optional(),
+          y: schema.number().optional(),
+          width: schema.number().optional(),
+          height: schema.number().optional(),
+          format: schema.string().optional(),
+          quality: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
         },
-        async execute({ tabId }, ctx2) {
-          const data = await toolRequest("screenshot", { tabId });
+        async execute({ tabId, fullPage, selector, index, x, y, width, height, format, quality, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("screenshot", {
+            tabId,
+            fullPage,
+            selector,
+            index,
+            x,
+            y,
+            width,
+            height,
+            format,
+            quality,
+            timeoutMs,
+            pollMs
+          });
           return toolResultText(data, "Screenshot failed");
         }
       }),
@@ -13675,6 +13707,38 @@ var plugin = async (ctx) => {
         async execute({ ms, tabId }, ctx2) {
           const data = await toolRequest("wait", { ms, tabId });
           return toolResultText(data, "Waited");
+        }
+      }),
+      browser_wait_for: tool({
+        description: "Wait for a selector, text, page-text regex, URL pattern, or network idle condition.",
+        args: {
+          selector: schema.string().optional(),
+          text: schema.string().optional(),
+          pattern: schema.string().optional(),
+          urlPattern: schema.string().optional(),
+          state: schema.string().optional(),
+          networkIdleMs: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+          index: schema.number().optional(),
+          flags: schema.string().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ selector, text, pattern, urlPattern, state, networkIdleMs, timeoutMs, pollMs, index, flags, tabId }, ctx2) {
+          const data = await toolRequest("wait_for", {
+            selector,
+            text,
+            pattern,
+            urlPattern,
+            state,
+            networkIdleMs,
+            timeoutMs,
+            pollMs,
+            index,
+            flags,
+            tabId
+          });
+          return toolResultText(data, "Wait condition failed");
         }
       }),
       browser_query: tool({
@@ -13828,6 +13892,74 @@ var plugin = async (ctx) => {
         async execute({ tabId, clear }, ctx2) {
           const data = await toolRequest("errors", { tabId, clear });
           return toolResultText(data, "[]");
+        }
+      }),
+      browser_network_start: tool({
+        description: "Start capturing network requests for a tab using the Chrome debugger API. Headers are redacted in later output.",
+        args: {
+          tabId: schema.number().optional(),
+          clear: schema.boolean().optional(),
+          maxEntries: schema.number().optional()
+        },
+        async execute({ tabId, clear, maxEntries }, ctx2) {
+          const data = await toolRequest("network_start", { tabId, clear, maxEntries });
+          return toolResultText(data, "Network capture started");
+        }
+      }),
+      browser_network_stop: tool({
+        description: "Stop network capture for a tab while keeping captured records available until cleared.",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("network_stop", { tabId });
+          return toolResultText(data, "Network capture stopped");
+        }
+      }),
+      browser_network_list: tool({
+        description: "List captured network requests for a tab. Headers are omitted unless includeHeaders is true.",
+        args: {
+          tabId: schema.number().optional(),
+          limit: schema.number().optional(),
+          includeHeaders: schema.boolean().optional(),
+          filter: schema.string().optional(),
+          clear: schema.boolean().optional()
+        },
+        async execute({ tabId, limit, includeHeaders, filter, clear }, ctx2) {
+          const data = await toolRequest("network_list", { tabId, limit, includeHeaders, filter, clear });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_network_get: tool({
+        description: "Get details for a captured network request. Response body is omitted unless includeBody is true.",
+        args: {
+          tabId: schema.number().optional(),
+          requestId: schema.string().optional(),
+          index: schema.number().optional(),
+          includeBody: schema.boolean().optional(),
+          maxBodyBytes: schema.number().optional()
+        },
+        async execute({ tabId, requestId, index, includeBody, maxBodyBytes }, ctx2) {
+          const data = await toolRequest("network_get", { tabId, requestId, index, includeBody, maxBodyBytes });
+          return toolResultText(data, "{}");
+        }
+      }),
+      browser_profile_status: tool({
+        description: "Return Iris profile gating status for the active Chrome profile.",
+        args: {},
+        async execute(args, ctx2) {
+          const data = await toolRequest("get_profile_status", {});
+          return toolResultText(data, "{}");
+        }
+      }),
+      browser_webmcp_status: tool({
+        description: "Detect WebMCP/native model context signals on the current page.",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("get_webmcp_status", { tabId });
+          return toolResultText(data, "{}");
         }
       })
     }

@@ -23,6 +23,7 @@ let connectPromise = null
 // Debugger state management for console/error capture
 const debuggerState = new Map()
 const MAX_LOG_ENTRIES = 1000
+const MAX_NETWORK_ENTRIES = 1000
 
 function normalizeAllowlist(value) {
   if (!Array.isArray(value)) return []
@@ -148,11 +149,8 @@ async function injectWebMCPToken(origin, token) {
   }
 }
 
-async function toolGetWebMCPStatus() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-  if (!tab?.id) {
-    return { detected: false, error: "No active tab" }
-  }
+async function toolGetWebMCPStatus({ tabId } = {}) {
+  const tab = await getTabById(tabId)
   
   try {
     const results = await chrome.scripting.executeScript({
@@ -289,20 +287,219 @@ async function ensureDebuggerAttached(tabId) {
     }
   }
 
-  if (debuggerState.has(tabId)) return debuggerState.get(tabId)
+  let state = debuggerState.get(tabId)
+  if (!state) {
+    state = {
+      attached: false,
+      consoleMessages: [],
+      pageErrors: [],
+      enabledDomains: new Set(),
+      network: null,
+    }
+    debuggerState.set(tabId, state)
+  }
 
-  const state = { attached: false, consoleMessages: [], pageErrors: [] }
-  debuggerState.set(tabId, state)
+  if (state.attached) {
+    await ensureDebuggerDomain(tabId, state, "Runtime")
+    return state
+  }
+
+  state.enabledDomains = new Set()
+  if (state.network) state.network.enabled = false
 
   try {
     await chrome.debugger.attach({ tabId }, "1.3")
-    await chrome.debugger.sendCommand({ tabId }, "Runtime.enable")
     state.attached = true
+    await ensureDebuggerDomain(tabId, state, "Runtime")
   } catch (e) {
+    state.unavailableReason = e?.message || String(e)
     console.warn("[OpenCode] Failed to attach debugger:", e.message || e)
   }
 
   return state
+}
+
+async function ensureDebuggerDomain(tabId, state, domain) {
+  if (!state.enabledDomains) state.enabledDomains = new Set()
+  if (state.enabledDomains.has(domain)) return
+  await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`)
+  state.enabledDomains.add(domain)
+}
+
+async function sendDebuggerCommand(tabId, method, params = {}) {
+  const state = await ensureDebuggerAttached(tabId)
+  if (!state.attached) {
+    throw new Error(state.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+  return await chrome.debugger.sendCommand({ tabId }, method, params)
+}
+
+function makeNetworkState(maxEntries = MAX_NETWORK_ENTRIES) {
+  return {
+    enabled: false,
+    maxEntries: clampNumber(maxEntries, 1, 5000, MAX_NETWORK_ENTRIES),
+    requests: new Map(),
+    order: [],
+    startedAt: Date.now(),
+    lastEventAt: Date.now(),
+  }
+}
+
+function getNetworkState(state, options = {}) {
+  if (!state.network) state.network = makeNetworkState(options.maxEntries)
+  if (Number.isFinite(options.maxEntries)) {
+    state.network.maxEntries = clampNumber(options.maxEntries, 1, 5000, MAX_NETWORK_ENTRIES)
+  }
+  return state.network
+}
+
+function redactHeaders(headers) {
+  if (!headers || typeof headers !== "object") return {}
+  const out = {}
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase()
+    if (
+      lower === "authorization" ||
+      lower === "proxy-authorization" ||
+      lower === "cookie" ||
+      lower === "set-cookie" ||
+      lower.includes("api-key") ||
+      lower.includes("token")
+    ) {
+      out[key] = "[redacted]"
+    } else {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+function getOrCreateNetworkRecord(network, requestId) {
+  let record = network.requests.get(requestId)
+  if (!record) {
+    record = {
+      requestId,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      finished: false,
+      failed: false,
+    }
+    network.requests.set(requestId, record)
+    network.order.push(requestId)
+  }
+
+  while (network.order.length > network.maxEntries) {
+    const oldest = network.order.shift()
+    if (oldest) network.requests.delete(oldest)
+  }
+
+  network.lastEventAt = Date.now()
+  record.updatedAt = network.lastEventAt
+  return record
+}
+
+function handleNetworkEvent(state, method, params = {}) {
+  const network = state.network
+  if (!network?.enabled) return
+  const requestId = params.requestId
+  if (!requestId) return
+
+  const record = getOrCreateNetworkRecord(network, requestId)
+
+  if (method === "Network.requestWillBeSent") {
+    record.url = params.request?.url || record.url
+    record.method = params.request?.method || record.method
+    record.type = params.type || record.type
+    record.documentURL = params.documentURL || record.documentURL
+    record.frameId = params.frameId || record.frameId
+    record.loaderId = params.loaderId || record.loaderId
+    record.initiator = params.initiator || record.initiator
+    record.timestamp = params.timestamp
+    record.wallTime = params.wallTime
+    record.requestHeaders = redactHeaders(params.request?.headers)
+    record.finished = false
+    record.failed = false
+  }
+
+  if (method === "Network.responseReceived") {
+    record.url = params.response?.url || record.url
+    record.type = params.type || record.type
+    record.status = params.response?.status
+    record.statusText = params.response?.statusText
+    record.mimeType = params.response?.mimeType
+    record.protocol = params.response?.protocol
+    record.remoteIPAddress = params.response?.remoteIPAddress
+    record.remotePort = params.response?.remotePort
+    record.fromDiskCache = !!params.response?.fromDiskCache
+    record.fromServiceWorker = !!params.response?.fromServiceWorker
+    record.encodedDataLength = params.response?.encodedDataLength
+    record.responseHeaders = redactHeaders(params.response?.headers)
+    record.responseTimestamp = params.timestamp
+  }
+
+  if (method === "Network.loadingFinished") {
+    record.finished = true
+    record.failed = false
+    record.finishedAt = Date.now()
+    record.encodedDataLength = params.encodedDataLength ?? record.encodedDataLength
+  }
+
+  if (method === "Network.loadingFailed") {
+    record.finished = true
+    record.failed = true
+    record.finishedAt = Date.now()
+    record.errorText = params.errorText
+    record.canceled = !!params.canceled
+    record.blockedReason = params.blockedReason
+    record.corsErrorStatus = params.corsErrorStatus
+  }
+}
+
+async function ensureNetworkEnabled(tabId, options = {}) {
+  const state = await ensureDebuggerAttached(tabId)
+  if (!state.attached) {
+    throw new Error(state.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+
+  const network = getNetworkState(state, options)
+  if (options.clear) {
+    network.requests.clear()
+    network.order = []
+    network.startedAt = Date.now()
+    network.lastEventAt = Date.now()
+  }
+
+  if (!network.enabled) {
+    await ensureDebuggerDomain(tabId, state, "Network")
+    network.enabled = true
+  }
+
+  return { state, network }
+}
+
+function serializeNetworkRecord(record, includeHeaders = false) {
+  const out = {
+    requestId: record.requestId,
+    url: record.url,
+    method: record.method,
+    type: record.type,
+    status: record.status,
+    statusText: record.statusText,
+    mimeType: record.mimeType,
+    finished: !!record.finished,
+    failed: !!record.failed,
+    errorText: record.errorText,
+    encodedDataLength: record.encodedDataLength,
+    fromDiskCache: !!record.fromDiskCache,
+    fromServiceWorker: !!record.fromServiceWorker,
+    startedAt: record.startedAt,
+    updatedAt: record.updatedAt,
+  }
+  if (includeHeaders) {
+    out.requestHeaders = record.requestHeaders || {}
+    out.responseHeaders = record.responseHeaders || {}
+  }
+  return out
 }
 
 if (chrome.debugger?.onEvent) {
@@ -336,6 +533,10 @@ if (chrome.debugger?.onEvent) {
         timestamp: Date.now(),
       })
     }
+
+    if (method.startsWith("Network.")) {
+      handleNetworkEvent(state, method, params)
+    }
   })
 }
 
@@ -344,6 +545,8 @@ if (chrome.debugger?.onDetach) {
     if (debuggerState.has(source.tabId)) {
       const state = debuggerState.get(source.tabId)
       state.attached = false
+      state.enabledDomains = new Set()
+      if (state.network) state.network.enabled = false
     }
   })
 }
@@ -536,12 +739,17 @@ async function executeTool(toolName, args) {
     query: toolQuery,
     scroll: toolScroll,
     wait: toolWait,
+    wait_for: toolWaitFor,
     download: toolDownload,
     list_downloads: toolListDownloads,
     set_file_input: toolSetFileInput,
     highlight: toolHighlight,
     console: toolConsole,
     errors: toolErrors,
+    network_start: toolNetworkStart,
+    network_stop: toolNetworkStop,
+    network_list: toolNetworkList,
+    network_get: toolNetworkGet,
     get_profile_status: toolGetProfileStatus,
     get_webmcp_status: toolGetWebMCPStatus,
   }
@@ -936,6 +1144,71 @@ async function pageOps(command, args) {
     }
   }
 
+  function matchesPattern(value, pattern, flags) {
+    if (!pattern) return false
+    try {
+      return new RegExp(pattern, flags || "").test(value)
+    } catch {
+      return safeString(value).includes(pattern)
+    }
+  }
+
+  function elementRect(el) {
+    const rect = el.getBoundingClientRect()
+    return {
+      x: rect.x,
+      y: rect.y,
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+      pageX: rect.left + window.scrollX,
+      pageY: rect.top + window.scrollY,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    }
+  }
+
+  function waitCondition(selectors, state, text, urlPattern, pattern, flags, index) {
+    const targetState = safeString(state || "").toLowerCase()
+    const hasSelector = selectors.length > 0
+
+    if (hasSelector) {
+      const match = resolveMatchesOnce(selectors, index)
+      const visible = match.matches.filter(isVisible)
+      if (targetState === "hidden") {
+        return { ok: true, matched: !match.matches.length || visible.length === 0, selectorUsed: match.selectorUsed }
+      }
+      if (targetState === "detached") {
+        return { ok: true, matched: match.matches.length === 0, selectorUsed: match.selectorUsed }
+      }
+      if (targetState === "attached") {
+        return { ok: true, matched: match.matches.length > 0, selectorUsed: match.selectorUsed }
+      }
+      return { ok: true, matched: visible.length > 0, selectorUsed: match.selectorUsed }
+    }
+
+    if (typeof text === "string" && text) {
+      const pageText = safeString(document.body?.innerText || "")
+      return { ok: true, matched: pageText.includes(text) }
+    }
+
+    if (typeof pattern === "string" && pattern) {
+      const pageText = safeString(document.body?.innerText || "")
+      return { ok: true, matched: matchesPattern(pageText, pattern, flags) }
+    }
+
+    if (typeof urlPattern === "string" && urlPattern) {
+      return { ok: true, matched: matchesPattern(location.href, urlPattern, flags) || location.href.includes(urlPattern) }
+    }
+
+    return { ok: false, error: "selector, text, pattern, or urlPattern is required" }
+  }
+
   const mode = typeof options.mode === "string" && options.mode ? options.mode : "text"
   const selectors = normalizeSelectorList(options.selector)
   const index = Number.isFinite(options.index) ? options.index : 0
@@ -1116,6 +1389,14 @@ async function pageOps(command, args) {
     return { ok: true, selectorUsed: match.selectorUsed, count: dt.files.length, names }
   }
 
+  if (command === "element_rect") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+    return { ok: true, selectorUsed: match.selectorUsed, rect: elementRect(match.chosen) }
+  }
+
   if (command === "scroll") {
     const scrollX = Number.isFinite(options.x) ? options.x : 0
     const scrollY = Number.isFinite(options.y) ? options.y : 0
@@ -1131,6 +1412,25 @@ async function pageOps(command, args) {
     }
     window.scrollBy(scrollX, scrollY)
     return { ok: true }
+  }
+
+  if (command === "wait_for") {
+    const endAt = Date.now() + timeoutMs
+    const state = options.state || (selectors.length ? "visible" : "")
+    const text = typeof options.text === "string" ? options.text : null
+    const urlPattern = typeof options.urlPattern === "string" ? options.urlPattern : null
+
+    while (true) {
+      const result = waitCondition(selectors, state, text, urlPattern, pattern, flags, index)
+      if (!result.ok) return result
+      if (result.matched) {
+        return { ok: true, matched: true, selectorUsed: result.selectorUsed || null }
+      }
+      if (Date.now() >= endAt) {
+        return { ok: false, error: "Timed out waiting for condition" }
+      }
+      await new Promise((r) => setTimeout(r, pollMs))
+    }
   }
 
   if (command === "highlight") {
@@ -1349,10 +1649,98 @@ async function toolSelect({ selector, value, label, optionIndex, tabId, index = 
   return { tabId: tab.id, content: `Selected ${summary || "option"} in ${used}` }
 }
 
-async function toolScreenshot({ tabId }) {
+function normalizeScreenshotFormat(value) {
+  const format = typeof value === "string" ? value.trim().toLowerCase() : "png"
+  if (format === "jpeg" || format === "jpg") return "jpeg"
+  if (format === "webp") return "webp"
+  return "png"
+}
+
+function screenshotMime(format) {
+  if (format === "jpeg") return "image/jpeg"
+  if (format === "webp") return "image/webp"
+  return "image/png"
+}
+
+async function getElementScreenshotClip(tabId, selector, index = 0, timeoutMs, pollMs) {
+  const result = await runInPage(tabId, "element_rect", { selector, index, timeoutMs, pollMs })
+  if (!result?.ok) throw new Error(result?.error || "Failed to resolve screenshot element")
+  const rect = result.rect || {}
+  const width = Math.max(1, Math.ceil(rect.width || 0))
+  const height = Math.max(1, Math.ceil(rect.height || 0))
+  return {
+    x: Math.max(0, Math.floor(rect.pageX || 0)),
+    y: Math.max(0, Math.floor(rect.pageY || 0)),
+    width,
+    height,
+    scale: 1,
+  }
+}
+
+async function toolScreenshot({
+  tabId,
+  fullPage = false,
+  selector,
+  index = 0,
+  x,
+  y,
+  width,
+  height,
+  format,
+  quality,
+  timeoutMs,
+  pollMs,
+} = {}) {
   const tab = await getTabById(tabId)
-  const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
-  return { tabId: tab.id, content: png }
+  const screenshotFormat = normalizeScreenshotFormat(format)
+  const hasManualClip = [x, y, width, height].every((value) => Number.isFinite(value))
+  const hasSelectorClip = typeof selector === "string" && selector.trim()
+
+  if (!fullPage && !hasManualClip && !hasSelectorClip && screenshotFormat === "png" && !Number.isFinite(quality)) {
+    const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
+    return { tabId: tab.id, content: png }
+  }
+
+  const debuggerStateForTab = await ensureDebuggerAttached(tab.id)
+  if (!debuggerStateForTab.attached) {
+    throw new Error(debuggerStateForTab.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+  await ensureDebuggerDomain(tab.id, debuggerStateForTab, "Page")
+
+  let clip = null
+  if (hasSelectorClip) {
+    clip = await getElementScreenshotClip(tab.id, selector.trim(), index, timeoutMs, pollMs)
+  } else if (hasManualClip) {
+    clip = {
+      x: Math.max(0, Number(x)),
+      y: Math.max(0, Number(y)),
+      width: Math.max(1, Number(width)),
+      height: Math.max(1, Number(height)),
+      scale: 1,
+    }
+  } else if (fullPage) {
+    const metrics = await sendDebuggerCommand(tab.id, "Page.getLayoutMetrics")
+    const size = metrics?.contentSize || {}
+    clip = {
+      x: 0,
+      y: 0,
+      width: Math.max(1, Math.ceil(size.width || 1)),
+      height: Math.max(1, Math.ceil(size.height || 1)),
+      scale: 1,
+    }
+  }
+
+  const params = {
+    format: screenshotFormat,
+    captureBeyondViewport: !!clip,
+  }
+  if (clip) params.clip = clip
+  if (Number.isFinite(quality) && screenshotFormat !== "png") {
+    params.quality = clampNumber(quality, 0, 100, 80)
+  }
+
+  const result = await sendDebuggerCommand(tab.id, "Page.captureScreenshot", params)
+  return { tabId: tab.id, content: `data:${screenshotMime(screenshotFormat)};base64,${result.data}` }
 }
 
 async function toolSnapshot({ tabId }) {
@@ -1560,6 +1948,66 @@ async function toolWait({ ms = 1000, tabId }) {
   return { tabId, content: `Waited ${ms}ms` }
 }
 
+async function toolWaitFor({
+  selector,
+  text,
+  pattern,
+  urlPattern,
+  state,
+  networkIdleMs,
+  timeoutMs,
+  pollMs,
+  tabId,
+  index = 0,
+  flags,
+} = {}) {
+  const tab = await getTabById(tabId)
+  const timeout = clampNumber(timeoutMs, 0, 120000, 10000)
+  const poll = clampNumber(pollMs, 50, 5000, 200)
+  const wantsNetworkIdle =
+    state === "networkidle" ||
+    state === "network_idle" ||
+    Number.isFinite(networkIdleMs)
+
+  if (wantsNetworkIdle) {
+    const idleMs = clampNumber(networkIdleMs, 100, 30000, 500)
+    const { network } = await ensureNetworkEnabled(tab.id)
+    const startAt = Date.now()
+    const endAt = startAt + timeout
+
+    while (true) {
+      const now = Date.now()
+      const active = [...network.requests.values()].some((record) => {
+        return record.startedAt >= startAt && !record.finished && !record.failed
+      })
+      const quietFor = now - Math.max(network.lastEventAt || startAt, startAt)
+      if (!active && quietFor >= idleMs) {
+        return {
+          tabId: tab.id,
+          content: JSON.stringify({ ok: true, state: "networkidle", idleMs, quietFor }, null, 2),
+        }
+      }
+      if (now >= endAt) throw new Error("Timed out waiting for network idle")
+      await new Promise((resolve) => setTimeout(resolve, poll))
+    }
+  }
+
+  const result = await runInPage(tab.id, "wait_for", {
+    selector,
+    text,
+    pattern,
+    urlPattern,
+    state,
+    timeoutMs: timeout,
+    pollMs: poll,
+    index,
+    flags,
+  })
+
+  if (!result?.ok) throw new Error(result?.error || "Wait condition failed")
+  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+}
+
 function clampNumber(value, min, max, fallback) {
   const n = Number(value)
   if (!Number.isFinite(n)) return fallback
@@ -1719,6 +2167,115 @@ async function toolHighlight({ selector, tabId, index = 0, duration, color, show
       selectorUsed: result.selectorUsed,
     }),
   }
+}
+
+async function toolNetworkStart({ tabId, clear = true, maxEntries } = {}) {
+  const tab = await getTabById(tabId)
+  const { network } = await ensureNetworkEnabled(tab.id, { clear, maxEntries })
+  return {
+    tabId: tab.id,
+    content: JSON.stringify(
+      {
+        ok: true,
+        enabled: network.enabled,
+        startedAt: network.startedAt,
+        count: network.order.length,
+        maxEntries: network.maxEntries,
+      },
+      null,
+      2
+    ),
+  }
+}
+
+async function toolNetworkStop({ tabId } = {}) {
+  const tab = await getTabById(tabId)
+  const state = await ensureDebuggerAttached(tab.id)
+  const network = state.network
+  if (state.attached && network?.enabled) {
+    try {
+      await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.disable")
+    } catch {}
+    network.enabled = false
+    state.enabledDomains?.delete?.("Network")
+  }
+  return {
+    tabId: tab.id,
+    content: JSON.stringify({ ok: true, enabled: false, count: network?.order?.length || 0 }, null, 2),
+  }
+}
+
+async function toolNetworkList({ tabId, limit = 100, includeHeaders = false, filter, clear = false } = {}) {
+  const tab = await getTabById(tabId)
+  const { network } = await ensureNetworkEnabled(tab.id, { clear: false })
+  const maxItems = clampNumber(limit, 1, 1000, 100)
+  const filterText = typeof filter === "string" && filter.trim() ? filter.trim().toLowerCase() : null
+  let records = network.order.map((id) => network.requests.get(id)).filter(Boolean)
+
+  if (filterText) {
+    records = records.filter((record) => {
+      const haystack = `${record.url || ""} ${record.method || ""} ${record.status || ""} ${record.type || ""}`.toLowerCase()
+      return haystack.includes(filterText)
+    })
+  }
+
+  const items = records.slice(-maxItems).map((record) => serializeNetworkRecord(record, includeHeaders))
+  const out = {
+    enabled: network.enabled,
+    startedAt: network.startedAt,
+    count: records.length,
+    items,
+  }
+
+  if (clear) {
+    network.requests.clear()
+    network.order = []
+    network.startedAt = Date.now()
+    network.lastEventAt = Date.now()
+  }
+
+  return { tabId: tab.id, content: JSON.stringify(out, null, 2) }
+}
+
+async function toolNetworkGet({ tabId, requestId, index, includeBody = false, maxBodyBytes = 200000 } = {}) {
+  const tab = await getTabById(tabId)
+  const { network } = await ensureNetworkEnabled(tab.id, { clear: false })
+  let id = typeof requestId === "string" && requestId ? requestId : null
+
+  if (!id && Number.isFinite(index)) {
+    id = network.order[index]
+  }
+  if (!id) {
+    id = network.order[network.order.length - 1]
+  }
+  if (!id) throw new Error("No network requests captured")
+
+  const record = network.requests.get(id)
+  if (!record) throw new Error(`Unknown requestId: ${id}`)
+
+  const out = serializeNetworkRecord(record, true)
+  out.initiator = record.initiator
+  out.documentURL = record.documentURL
+  out.frameId = record.frameId
+  out.loaderId = record.loaderId
+  out.protocol = record.protocol
+  out.remoteIPAddress = record.remoteIPAddress
+  out.remotePort = record.remotePort
+
+  if (includeBody) {
+    try {
+      const body = await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.getResponseBody", { requestId: id })
+      const limit = clampNumber(maxBodyBytes, 0, 5_000_000, 200000)
+      const rawBody = typeof body?.body === "string" ? body.body : ""
+      out.body = rawBody.slice(0, limit)
+      out.base64Encoded = !!body?.base64Encoded
+      out.bodyTruncated = rawBody.length > limit
+    } catch (error) {
+      out.bodyError = error?.message || String(error)
+    }
+  }
+
+  return { tabId: tab.id, content: JSON.stringify(out, null, 2) }
 }
 
 async function toolConsole({ tabId, clear = false, filter } = {}) {
