@@ -5,13 +5,8 @@
   "version": "4.6.0",
   "description": "Open-source Chrome extension and local browser automation runtime for OpenCode.",
   "type": "module",
-  "main": "./dist/plugin.js",
-  "exports": {
-    ".": "./dist/plugin.js",
-    "./plugin": "./dist/plugin.js"
-  },
   "scripts": {
-    "build": "bun run --cwd packages/opencode build && bun run --cwd packages/mcp build && bun build src/plugin.ts --target=node --outfile=dist/plugin.js",
+    "build": "bun run --cwd packages/opencode build && bun run --cwd packages/mcp build",
     "check:extension": "node --check packages/core/extension/background.js",
     "check:runtime": "node --check packages/core/bin/broker.cjs packages/core/bin/browser-cli.cjs packages/core/bin/cli.js packages/core/bin/native-host.cjs packages/core/extension/background.js",
     "prepublishOnly": "bun run build",

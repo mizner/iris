@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { BASE_DIR, SOCKET_PATH as DEFAULT_SOCKET_PATH } from "../../core/src/paths.ts";
+import { BASE_DIR, SOCKET_PATH as DEFAULT_SOCKET_PATH } from "@mizner/iris/paths";
 import net from "net";
 import { createAgentBackend, type AgentBackend } from "./agent-backend.js";
 import { existsSync, mkdirSync, openSync, readFileSync, statSync } from "fs";

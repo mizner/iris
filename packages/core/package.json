@@ -15,13 +15,13 @@
   },
   "exports": {
     ".": "./package.json",
-    "./broker": "./src/broker.ts",
     "./paths": "./src/paths.ts"
   },
   "files": [
     "bin",
     "extension",
-    "src"
+    "src",
+    "templates"
   ],
   "scripts": {
     "runtime:install": "node bin/cli.js install",

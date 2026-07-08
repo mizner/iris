@@ -12335,7 +12335,7 @@ function tool(input) {
   return input;
 }
 tool.schema = exports_external;
-// ../core/src/paths.ts
+// node_modules/@mizner/iris/src/paths.ts
 import { homedir } from "os";
 import { join } from "path";
 var BASE_DIR = join(homedir(), ".iris");
@@ -13119,7 +13119,7 @@ function createAgentBackend(sessionId) {
 }
 
 // src/plugin.ts
-import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2, statSync } from "fs";
+import { existsSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
 import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath } from "url";
@@ -13199,7 +13199,8 @@ function maybeStartBroker() {
   if (!existsSync(brokerPath))
     return;
   try {
-    const child = spawn2(process.execPath, [brokerPath], { detached: true, stdio: "ignore" });
+    const out = openSync(join3(RUNTIME_DIR, "broker.log"), "a");
+    const child = spawn2(process.execPath, [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
     child.unref();
   } catch {}
 }

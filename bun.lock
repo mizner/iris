@@ -38,7 +38,7 @@
       "name": "@mizner/iris-opencode",
       "version": "4.6.0",
       "dependencies": {
-        "@mizner/iris": "file:../core",
+        "@mizner/iris": "workspace:*",
         "agent-browser": "^0.4.0",
       },
       "devDependencies": {
@@ -261,12 +261,10 @@
 
     "@mizner/iris-mcp/@mizner/iris-opencode": ["@mizner/iris-opencode@file:packages/opencode", { "dependencies": { "@mizner/iris": "file:../core", "agent-browser": "^0.4.0" }, "devDependencies": { "@opencode-ai/plugin": "*", "bun-types": "*" }, "peerDependencies": { "@opencode-ai/plugin": "*" } }],
 
-    "@mizner/iris-opencode/@mizner/iris": ["@mizner/iris@file:packages/core", { "bin": { "iris": "./bin/cli.js", "browser-cli": "./bin/browser-cli.cjs" } }],
-
     "@modelcontextprotocol/sdk/zod": ["zod@4.3.6", "", {}, "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg=="],
 
     "agent-browser/zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
 
-    "@mizner/iris-mcp/@mizner/iris-opencode/@mizner/iris": ["@mizner/iris@file:packages/core", {}],
+    "@mizner/iris-mcp/@mizner/iris-opencode/@mizner/iris": ["@mizner/iris@file:packages/core", { "bin": { "iris": "./bin/cli.js", "browser-cli": "./bin/browser-cli.cjs" } }],
   }
 }

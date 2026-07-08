@@ -1,5 +1,5 @@
 import net from "net";
-import { BASE_DIR } from "../../core/src/paths.ts";
+import { BASE_DIR } from "@mizner/iris/paths";
 import { mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, isAbsolute, join, resolve } from "path";

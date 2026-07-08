@@ -21,7 +21,7 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@mizner/iris": "file:../core",
+    "@mizner/iris": "workspace:*",
     "agent-browser": "^0.4.0"
   },
   "devDependencies": {

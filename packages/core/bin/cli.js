@@ -724,7 +724,9 @@ Format rules (summary):
 `);
 
   const skillName = "browser-automation";
-  const skillSrc = join(PACKAGE_ROOT, "..", "..", ".opencode", "skills", skillName, "SKILL.md");
+  const packagedSkillSrc = join(PACKAGE_ROOT, "templates", "skills", skillName, "SKILL.md");
+  const repoSkillSrc = join(PACKAGE_ROOT, "..", "..", ".opencode", "skills", skillName, "SKILL.md");
+  const skillSrc = existsSync(packagedSkillSrc) ? packagedSkillSrc : repoSkillSrc;
   const skillDstDir = join(process.cwd(), ".opencode", "skills", skillName);
   const skillDst = join(skillDstDir, "SKILL.md");
 
