@@ -1847,8 +1847,11 @@ async function toolSnapshot({ tabId }) {
         }
 
         if (el.shadowRoot) {
-          const r = build(el.shadowRoot.host, depth + 1, uid)
-          uid = r.nextUid
+          for (const child of el.shadowRoot.children) {
+            const r = build(child, depth + 1, uid)
+            nodes.push(...r.nodes)
+            uid = r.nextUid
+          }
         }
 
         for (const child of el.children) {

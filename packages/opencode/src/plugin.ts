@@ -215,6 +215,7 @@ function toolResultText(data: any, fallback: string): string {
 }
 
 const ROUTER_LOG_PATH = join(RUNTIME_DIR, "router.log");
+let cachedAppleScriptApp: string | null = null;
 
 function logRouter(message: string): void {
   const timestamp = new Date().toISOString();
@@ -224,6 +225,16 @@ function logRouter(message: string): void {
   } catch {}
 }
 
+function appleScriptStringLiteral(value: string): string {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function appleScriptApps(): string[] {
+  const preferred = process.env.IRIS_BROWSER_APP?.trim();
+  const defaults = ["Google Chrome", "Brave Browser", "Chromium"];
+  return preferred ? [preferred, ...defaults.filter((app) => app !== preferred)] : defaults;
+}
+
 async function tryAppleScript(toolName: string, args: Record<string, any>): Promise<any> {
   // Apple Events only supports navigation/tab operations
   const supportedTools = ["open_tab", "navigate", "get_active_tab", "get_tabs"];
@@ -231,28 +242,59 @@ async function tryAppleScript(toolName: string, args: Record<string, any>): Prom
     throw new Error(`Apple Events does not support: ${toolName}`);
   }
   
-  const { exec, execFile } = await import("child_process");
+  const { execFile } = await import("child_process");
   const { promisify } = await import("util");
-  const execAsync = promisify(exec);
   const execFileAsync = promisify(execFile);
+
+  async function runAppleScript(buildArgs: (appName: string) => string[]): Promise<{ stdout: string; appName: string }> {
+    const apps = cachedAppleScriptApp
+      ? [cachedAppleScriptApp, ...appleScriptApps().filter((app) => app !== cachedAppleScriptApp)]
+      : appleScriptApps();
+    let firstError: unknown = null;
+    for (const appName of apps) {
+      try {
+        const { stdout } = await execFileAsync("osascript", buildArgs(appName));
+        cachedAppleScriptApp = appName;
+        return { stdout, appName };
+      } catch (error) {
+        if (!firstError) firstError = error;
+        if (cachedAppleScriptApp === appName) cachedAppleScriptApp = null;
+      }
+    }
+    if (firstError instanceof Error) throw firstError;
+    throw new Error(String(firstError || "Apple Events failed"));
+  }
   
-  if (toolName === "open_tab" || toolName === "navigate") {
-    const url = args.url || "about:blank";
-    const script = `tell application "Google Chrome" to tell window 1 to make new tab with properties {URL:"${url}"}`;
-    await execAsync(`osascript -e '${script}'`);
+  if (toolName === "open_tab") {
+    const url = appleScriptStringLiteral(args.url || "about:blank");
+    await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to tell window 1 to make new tab with properties {URL:${url}}`,
+    ]);
     return { content: "Tab opened via Apple Events" };
+  }
+
+  if (toolName === "navigate") {
+    const url = appleScriptStringLiteral(args.url || "about:blank");
+    await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to set URL of active tab of front window to ${url}`,
+    ]);
+    return { content: "Tab navigated via Apple Events" };
   }
   
   if (toolName === "get_active_tab") {
-    const script = `tell application "Google Chrome" to return URL of active tab of front window`;
-    const { stdout } = await execAsync(`osascript -e '${script}'`);
+    const { stdout } = await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to return URL of active tab of front window`,
+    ]);
     return { content: stdout.trim() };
   }
 
   if (toolName === "get_tabs") {
-    const { stdout } = await execFileAsync("osascript", [
+    const { stdout } = await runAppleScript((appName) => [
       "-e",
-      'tell application "Google Chrome"',
+      `tell application ${appleScriptStringLiteral(appName)}`,
       "-e",
       "set rows to {}",
       "-e",
@@ -287,8 +329,8 @@ async function tryAppleScript(toolName: string, args: Record<string, any>): Prom
       .map((line) => line.trim())
       .filter(Boolean);
     const tabs = rows.map((line) => {
-      const [id, windowId, index, active, title, ...urlParts] = line.split("tab");
-      const url = urlParts.join("tab");
+      const [id, windowId, index, active, title, ...urlParts] = line.split("\t");
+      const url = urlParts.join("\t");
       return {
         id: Number(id),
         windowId: Number(windowId),
