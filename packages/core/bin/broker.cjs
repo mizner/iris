@@ -7,11 +7,20 @@ const os = require("os");
 const path = require("path");
 
 const BASE_DIR = path.join(os.homedir(), ".iris");
-const SOCKET_PATH = path.join(BASE_DIR, "broker.sock");
+const SOCKET_PATH = (process.env.IRIS_BROKER_SOCK || "").trim() || path.join(BASE_DIR, "broker.sock");
 
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
 const DEFAULT_LEASE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_PING_INTERVAL_MS = 20000;
+const DEFAULT_PONG_TIMEOUT_MS = 45000;
+
+function readMsEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  if (Number.isFinite(value) && value >= 0) return value;
+  return fallback;
+}
+
 const LEASE_TTL_MS = (() => {
   const raw = process.env.OPENCODE_BROWSER_CLAIM_TTL_MS;
   const value = Number(raw);
@@ -20,6 +29,8 @@ const LEASE_TTL_MS = (() => {
 })();
 const LEASE_SWEEP_MS =
   LEASE_TTL_MS > 0 ? Math.min(Math.max(10000, Math.floor(LEASE_TTL_MS / 2)), 60000) : 0;
+const PING_INTERVAL_MS = readMsEnv("IRIS_PING_INTERVAL_MS", DEFAULT_PING_INTERVAL_MS);
+const PONG_TIMEOUT_MS = readMsEnv("IRIS_PONG_TIMEOUT_MS", DEFAULT_PONG_TIMEOUT_MS);
 
 function nowMs() {
   return Date.now();
@@ -57,9 +68,9 @@ function wantsTab(toolName) {
 }
 
 // --- State ---
-let host = null; // { socket }
+const hosts = new Map(); // socket -> { pid, connectedAt, helloAt, lastPongAt }
 let nextExtId = 0;
-const extPending = new Map(); // extId -> { pluginSocket, pluginRequestId, sessionId }
+const extPending = new Map(); // extId -> { resolve, reject, sessionId, host, timeout }
 
 const clients = new Set();
 
@@ -232,18 +243,29 @@ async function prepareSocketPath() {
   return true;
 }
 
+function healthyHosts() {
+  const now = nowMs();
+  return [...hosts.entries()].filter(([socket, info]) => !socket.destroyed && now - info.lastPongAt <= PONG_TIMEOUT_MS);
+}
+
+function selectHostSocket() {
+  const selected = healthyHosts().sort((a, b) => b[1].helloAt - a[1].helloAt)[0];
+  return selected ? selected[0] : null;
+}
+
 function ensureHost() {
-  if (host && host.socket && !host.socket.destroyed) return;
+  const hostSocket = selectHostSocket();
+  if (hostSocket) return hostSocket;
   throw new Error("Chrome extension is not connected (native host offline)");
 }
 
 function callExtension(tool, args, sessionId) {
-  ensureHost();
+  const hostSocket = ensureHost();
   const extId = ++nextExtId;
 
   return new Promise((resolve, reject) => {
-    extPending.set(extId, { resolve, reject, sessionId });
-    writeJsonLine(host.socket, {
+    extPending.set(extId, { resolve, reject, sessionId, host: hostSocket });
+    writeJsonLine(hostSocket, {
       type: "to_extension",
       message: { type: "tool_request", id: extId, tool, args },
     });
@@ -324,7 +346,13 @@ function handleClientMessage(socket, client, msg) {
     client.sessionId = msg.sessionId;
     if (client.sessionId) touchSession(client.sessionId);
     if (client.role === "native-host") {
-      host = { socket };
+      const now = nowMs();
+      hosts.set(socket, {
+        pid: msg.pid ?? null,
+        connectedAt: nowIso(),
+        helloAt: now,
+        lastPongAt: now,
+      });
       // allow host to see current state
       writeJsonLine(socket, { type: "host_ready", claims: listClaims() });
     }
@@ -332,7 +360,10 @@ function handleClientMessage(socket, client, msg) {
   }
 
   if (msg && msg.type === "from_extension") {
+    const info = hosts.get(socket);
+    if (info) info.lastPongAt = nowMs();
     const message = msg.message;
+    if (message && message.type === "pong") return;
     if (message && message.type === "tool_response" && typeof message.id === "number") {
       const pending = extPending.get(message.id);
       if (!pending) return;
@@ -371,7 +402,13 @@ function handleClientMessage(socket, client, msg) {
             : null;
           replyOk({
             broker: true,
-            hostConnected: !!host && !!host.socket && !host.socket.destroyed,
+            hostConnected: healthyHosts().length > 0,
+            hostCount: hosts.size,
+            hosts: [...hosts.values()].map((info) => ({
+              pid: info.pid,
+              connectedAt: info.connectedAt,
+              lastPongAgoMs: nowMs() - info.lastPongAt,
+            })),
             claims: listClaims(),
             leaseTtlMs: LEASE_TTL_MS,
             session: sessionInfo,
@@ -423,6 +460,17 @@ function handleClientMessage(socket, client, msg) {
           return;
         }
 
+        if (msg.op === "extension_reload") {
+          let sent = 0;
+          for (const [hostSocket] of healthyHosts()) {
+            writeJsonLine(hostSocket, { type: "to_extension", message: { type: "reload" } });
+            sent += 1;
+          }
+          if (!sent) throw new Error("Chrome extension is not connected (native host offline)");
+          replyOk({ ok: sent > 0, sent });
+          return;
+        }
+
         throw new Error(`Unknown op: ${msg.op}`);
       } catch (e) {
         replyErr(e);
@@ -450,10 +498,11 @@ async function start() {
 
     socket.on("close", () => {
       clients.delete(client);
-      if (client.role === "native-host" && host && host.socket === socket) {
-        host = null;
-        // fail pending extension requests
+      if (client.role === "native-host") {
+        hosts.delete(socket);
+        // fail pending extension requests for this host
         for (const [extId, pending] of extPending.entries()) {
+          if (pending.host !== socket) continue;
           extPending.delete(extId);
           if (pending.timeout) clearTimeout(pending.timeout);
           pending.reject(new Error("Native host disconnected"));
@@ -468,7 +517,7 @@ async function start() {
   });
 
   server.listen(SOCKET_PATH, () => {
-    // Make socket group-readable; ignore errors
+    // Restrict the socket to the owning user.
     try {
       fs.chmodSync(SOCKET_PATH, 0o600);
     } catch {}
@@ -487,6 +536,28 @@ async function start() {
 
 if (LEASE_TTL_MS > 0 && LEASE_SWEEP_MS > 0) {
   const timer = setInterval(cleanupStaleClaims, LEASE_SWEEP_MS);
+  if (typeof timer.unref === "function") timer.unref();
+}
+
+if (PING_INTERVAL_MS > 0) {
+  const timer = setInterval(() => {
+    const now = nowMs();
+    for (const [hostSocket, info] of hosts.entries()) {
+      if (hostSocket.destroyed) {
+        hosts.delete(hostSocket);
+        continue;
+      }
+      if (now - info.lastPongAt > PONG_TIMEOUT_MS) {
+        console.error(`[browser-broker] dropping unresponsive host pid=${info.pid}`);
+        hosts.delete(hostSocket);
+        hostSocket.destroy();
+        continue;
+      }
+      try {
+        writeJsonLine(hostSocket, { type: "to_extension", message: { type: "ping", id: ++nextExtId } });
+      } catch {}
+    }
+  }, PING_INTERVAL_MS);
   if (typeof timer.unref === "function") timer.unref();
 }
 

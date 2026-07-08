@@ -9,7 +9,9 @@
  *   install   - Install extension + native host
  *   migrate   - Copy legacy runtime state from ~/.opencode-browser to ~/.iris
  *   uninstall - Remove native host registration
- *   status    - Show installation status
+ *   status    - Show installation and live status
+ *   doctor    - Diagnose broker/extension connectivity
+ *   reconnect - Restart the local broker/native-host pipeline
  */
 
 import {
@@ -21,6 +23,7 @@ import {
   readdirSync,
   unlinkSync,
   chmodSync,
+  openSync,
 } from "fs";
 import { homedir, platform } from "os";
 import { join, dirname } from "path";
@@ -247,6 +250,10 @@ function createJsonLineParser(onMessage) {
 }
 
 async function getBrokerStatus(timeoutMs = 2000) {
+  return await brokerRequestOnce("status", timeoutMs);
+}
+
+async function brokerRequestOnce(op, timeoutMs = 2000) {
   return await new Promise((resolve) => {
     let done = false;
     const socket = createConnection(BROKER_SOCKET);
@@ -270,7 +277,7 @@ async function getBrokerStatus(timeoutMs = 2000) {
     });
 
     socket.once("connect", () => {
-      socket.write(JSON.stringify({ type: "request", id: 1, op: "status" }) + "\n");
+      socket.write(JSON.stringify({ type: "request", id: 1, op }) + "\n");
     });
 
     socket.on(
@@ -287,6 +294,17 @@ async function getBrokerStatus(timeoutMs = 2000) {
       })
     );
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function spawnBroker() {
+  ensureDir(BASE_DIR);
+  const out = openSync(join(BASE_DIR, "broker.log"), "a");
+  const child = spawn(process.execPath, [BROKER_DST], { detached: true, stdio: ["ignore", "ignore", out] });
+  child.unref();
 }
 
 function copyDirRecursive(srcDir, destDir) {
@@ -438,6 +456,10 @@ ${color("cyan", "Browser automation runtime (native messaging + per-tab ownershi
     await uninstall();
   } else if (command === "status") {
     await status();
+  } else if (command === "doctor") {
+    await doctor();
+  } else if (command === "reconnect") {
+    await reconnect();
   } else if (command === "agent-install") {
     await agentInstall();
   } else if (command === "agent-gateway") {
@@ -449,6 +471,8 @@ ${color("bright", "Usage:")}
   iris update
   iris migrate
   iris status
+  iris doctor
+  iris reconnect
   iris uninstall
   iris agent-install
   iris agent-gateway
@@ -465,6 +489,10 @@ ${color("bright", "Agent Mode:")}
   1. Run: iris agent-install
   2. Set OPENCODE_BROWSER_BACKEND=agent
   3. Optionally run: iris agent-gateway
+
+${color("bright", "Connection Recovery:")}
+  iris doctor
+  iris reconnect
 `);
   }
 
@@ -845,11 +873,19 @@ Find it at ${color("cyan", "chrome://extensions")}:
     }
   }
 
-  header("Update Complete!");
+  const brokerStatus = await getBrokerStatus();
+  if (brokerStatus.ok && brokerStatus.data?.hostConnected) {
+    const reload = await brokerRequestOnce("extension_reload");
+    if (reload.ok) {
+      success("Sent reload to the extension — new code active after it reconnects (~5-30s)");
+    } else {
+      warn(`Could not hot-reload extension (${reload.error || "unknown error"}). Reload it once manually in chrome://extensions`);
+    }
+  } else {
+    warn("Extension not connected — reload it once manually in chrome://extensions");
+  }
 
-  log(`
- Reload the extension in ${color("cyan", "chrome://extensions")} and restart OpenCode.
- `);
+  header("Update Complete!");
 }
 
 async function migrate() {
@@ -952,6 +988,142 @@ async function status() {
   if (!foundAny) {
     warn("No native host manifest found. Run: iris install");
   }
+
+  header("Live");
+  const live = await getBrokerStatus();
+  if (!live.ok) {
+    warn(`Broker: not reachable (${live.error || "unknown error"})`);
+    warn("Extension: NOT connected");
+    warn("Claims: unknown");
+    warn("VERDICT: Run: node packages/core/bin/cli.js reconnect");
+    return;
+  }
+
+  success("Broker: running");
+  const hostCount = Number(live.data?.hostCount || 0);
+  if (live.data?.hostConnected) {
+    success(`Extension: connected (hosts: ${hostCount})`);
+  } else {
+    warn(`Extension: NOT connected (hosts: ${hostCount})`);
+  }
+  const claimCount = Array.isArray(live.data?.claims) ? live.data.claims.length : 0;
+  success(`Claims: ${claimCount}`);
+  if (live.data?.hostConnected) {
+    success("VERDICT: no action needed");
+  } else {
+    warn("VERDICT: Open Chrome; the extension reconnects within ~30s. If it stays down: iris reconnect");
+  }
+}
+
+function processTable() {
+  try {
+    return execSync("ps -axo pid,ppid,lstart,command | grep -E '[.]iris/(broker|native-host)' ", {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString("utf8")
+      .trim();
+  } catch {
+    return "";
+  }
+}
+
+async function doctor() {
+  header("Doctor");
+
+  const live = await getBrokerStatus();
+  if (live.ok) {
+    success("Broker: running");
+    const hostCount = Number(live.data?.hostCount || 0);
+    if (live.data?.hostConnected) {
+      success(`Extension: connected (hosts: ${hostCount})`);
+    } else {
+      warn(`Extension: NOT connected (hosts: ${hostCount})`);
+    }
+    const claims = Array.isArray(live.data?.claims) ? live.data.claims.length : 0;
+    success(`Claims: ${claims}`);
+    const hosts = Array.isArray(live.data?.hosts) ? live.data.hosts : [];
+    if (hosts.length) {
+      for (const host of hosts) {
+        success(`Host pid=${host.pid ?? "unknown"} connectedAt=${host.connectedAt} lastPongAgoMs=${host.lastPongAgoMs}`);
+      }
+    } else {
+      warn("Hosts: none");
+    }
+  } else {
+    warn(`Broker: not reachable (${live.error || "unknown error"})`);
+    warn("Extension: NOT connected");
+  }
+
+  header("Processes");
+  const ps = processTable();
+  if (ps) {
+    log(ps);
+  } else {
+    warn("No .iris broker/native-host processes found");
+  }
+
+  header("Socket");
+  success(`Socket file present: ${existsSync(BROKER_SOCKET)}`);
+
+  header("Verdict");
+  if (!live.ok) {
+    warn("VERDICT: run node packages/core/bin/cli.js reconnect");
+  } else if (!live.data?.hostConnected) {
+    warn("VERDICT: open Chrome and wait ~30s; if it stays down, run iris reconnect");
+  } else {
+    success("VERDICT: no action needed");
+  }
+}
+
+async function reconnect() {
+  header("Reconnect");
+
+  for (const pattern of [join(BASE_DIR, "broker.cjs"), join(BASE_DIR, "native-host.cjs")]) {
+    try {
+      execSync(`pkill -f ${shellQuote(pattern)}`, { stdio: "ignore" });
+    } catch {}
+  }
+
+  try {
+    if (existsSync(BROKER_SOCKET)) unlinkSync(BROKER_SOCKET);
+  } catch {}
+
+  spawnBroker();
+  success("Started fresh broker");
+
+  const brokerDeadline = Date.now() + 5000;
+  let brokerLive = false;
+  while (Date.now() < brokerDeadline) {
+    const live = await getBrokerStatus(500);
+    if (live.ok && live.data?.broker) {
+      brokerLive = true;
+      break;
+    }
+    await sleep(250);
+  }
+
+  if (!brokerLive) {
+    warn("Broker did not answer within 5s");
+    return;
+  }
+  success("Broker is running");
+
+  const hostDeadline = Date.now() + 40000;
+  let nextProgressAt = Date.now();
+  while (Date.now() < hostDeadline) {
+    const live = await getBrokerStatus(1000);
+    if (live.ok && live.data?.hostConnected) {
+      success("Extension connected");
+      return;
+    }
+    if (Date.now() >= nextProgressAt) {
+      warn("Waiting for Chrome extension host...");
+      nextProgressAt = Date.now() + 5000;
+    }
+    await sleep(1000);
+  }
+
+  warn("Broker is running, but extension did not connect within 40s. Open Chrome and run iris doctor.");
 }
 
 async function agentInstall() {

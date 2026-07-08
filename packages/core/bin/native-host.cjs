@@ -42,7 +42,8 @@ function writeJsonLine(socket, msg) {
 function maybeStartBroker() {
   try {
     if (!fs.existsSync(BROKER_PATH)) return;
-    const child = spawn(process.execPath, [BROKER_PATH], { detached: true, stdio: "ignore" });
+    const out = fs.openSync(path.join(BASE_DIR, "broker.log"), "a");
+    const child = spawn(process.execPath, [BROKER_PATH], { detached: true, stdio: ["ignore", "ignore", out] });
     child.unref();
   } catch {
     // ignore
@@ -134,7 +135,7 @@ function handleGetConfig(id) {
     process.exit(1);
   });
 
-  writeJsonLine(broker, { type: "hello", role: "native-host" });
+  writeJsonLine(broker, { type: "hello", role: "native-host", pid: process.pid });
 
   process.stdin.on("data", (chunk) =>
     onStdinData(chunk, (message) => {

@@ -19,6 +19,8 @@ let connectionAttempts = 0
 let nativePermissionHintLogged = false
 let reconnectTimer = null
 let connectPromise = null
+let lastInboundAt = 0
+let sawPingOnPort = false
 
 // Debugger state management for console/error capture
 const debuggerState = new Map()
@@ -561,8 +563,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === KEEPALIVE_ALARM) {
-    if (!isConnected) connect().catch(() => {})
+  if (alarm.name !== KEEPALIVE_ALARM) return
+  if (!isConnected) {
+    connect().catch(() => {})
+    return
+  }
+  const silentMs = Date.now() - lastInboundAt
+  // Broker pings keep the service worker warm; old brokers fall back to config probes without reconnect loops.
+  if (sawPingOnPort && silentMs > 50000) {
+    console.warn("[OpenCode] No broker traffic for", silentMs, "ms; reconnecting")
+    connect().catch(() => {})
+  } else if (!sawPingOnPort && silentMs > 60000) {
+    syncConfigFromNativeHost()
   }
 })
 
@@ -637,9 +649,10 @@ async function connectOnce() {
       scheduleReconnect(Math.min(15000, 1000 + connectionAttempts * 500))
     })
 
-    isConnected = true
-    connectionAttempts = 0
-    updateBadge(true)
+    isConnected = false
+    lastInboundAt = Date.now()
+    sawPingOnPort = false
+    updateBadge(false)
     syncConfigFromNativeHost().catch(() => {})
   } catch (e) {
     isConnected = false
@@ -666,43 +679,35 @@ function send(message) {
 
 async function handleMessage(message) {
   if (!message || typeof message !== "object") return
+  lastInboundAt = Date.now()
+  if (!isConnected) {
+    isConnected = true
+    connectionAttempts = 0
+    updateBadge(true)
+  }
 
   if (message.type === "tool_request") {
     await handleToolRequest(message)
   } else if (message.type === "ping") {
+    sawPingOnPort = true
     send({ type: "pong" })
   } else if (message.type === "config_response") {
     const cfg = message.config || {}
     const allowlist = normalizeAllowlist(cfg.profileEmails)
     await chrome.storage.local.set({ [ALLOWLIST_STORAGE_KEY]: allowlist })
     profileVerified = false // re-verify on next tool call with fresh allowlist
+  } else if (message.type === "reload") {
+    try {
+      chrome.runtime.reload()
+    } catch {}
   }
 }
 
 async function syncConfigFromNativeHost() {
   if (!port) return
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, 3000)
-    const handler = (message) => {
-      if (message && message.type === "config_response") {
-        port.onMessage.removeListener(handler)
-        clearTimeout(timeout)
-        const cfg = message.config || {}
-        const allowlist = normalizeAllowlist(cfg.profileEmails)
-        chrome.storage.local.set({ [ALLOWLIST_STORAGE_KEY]: allowlist })
-        profileVerified = false // re-verify on next tool call with fresh allowlist
-        resolve()
-      }
-    }
-    port.onMessage.addListener(handler)
-    try {
-      port.postMessage({ type: "get_config", id: crypto.randomUUID() })
-    } catch {
-      clearTimeout(timeout)
-      port.onMessage.removeListener(handler)
-      resolve()
-    }
-  })
+  try {
+    port.postMessage({ type: "get_config", id: crypto.randomUUID() })
+  } catch {}
 }
 async function handleToolRequest(request) {
   const { id, tool, args } = request

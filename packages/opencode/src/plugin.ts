@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin";
 import { BASE_DIR, SOCKET_PATH as DEFAULT_SOCKET_PATH } from "../../core/src/paths.ts";
 import net from "net";
 import { createAgentBackend, type AgentBackend } from "./agent-backend.js";
-import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
+import { existsSync, mkdirSync, openSync, readFileSync, statSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -103,7 +103,8 @@ function maybeStartBroker(): void {
   if (!existsSync(brokerPath)) return;
 
   try {
-    const child = spawn(process.execPath, [brokerPath], { detached: true, stdio: "ignore" });
+    const out = openSync(join(RUNTIME_DIR, "broker.log"), "a");
+    const child = spawn(process.execPath, [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
     child.unref();
   } catch {
     // ignore
