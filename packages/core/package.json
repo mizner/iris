@@ -1,6 +1,6 @@
 {
   "name": "@mizner/iris",
-  "version": "4.7.0",
+  "version": "4.8.0",
   "description": "Harness-agnostic browser runtime for Iris.",
   "type": "module",
   "engines": {

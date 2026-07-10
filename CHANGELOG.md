@@ -1,7 +1,7 @@
 # Changelog
 
 
-## Unreleased
+## 4.8.0
 
 - Added `browser_press` with CDP `Input.dispatchKeyEvent` when the debugger is attached and DOM `KeyboardEvent` fallback; `browser_type` now emits per-character key events.
 - Broker default-tab policy prefers the active Chrome tab (when claimable) before opening a blank tab; covered by broker integration tests.

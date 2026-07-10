@@ -2,7 +2,7 @@
   "name": "iris-monorepo",
   "private": true,
   "workspaces": ["packages/*"],
-  "version": "4.7.0",
+  "version": "4.8.0",
   "description": "Open-source Chrome extension and local browser automation runtime for OpenCode.",
   "type": "module",
   "engines": {
