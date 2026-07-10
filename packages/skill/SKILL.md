@@ -51,6 +51,7 @@ CLI:
 - `browser_navigate` - Navigate a tab to a URL.
 - `browser_click` - Click an element by selector.
 - `browser_type` - Type into an input or editable element.
+- `browser_press` - Press a key (Enter/Tab/Escape/arrows/char) with optional modifiers and focus selector.
 - `browser_select` - Choose an option in a native `<select>`.
 - `browser_scroll` - Scroll the page or an element.
 - `browser_wait` - Sleep for a specified duration.

@@ -1016,6 +1016,21 @@ async function status() {
   } else {
     warn("VERDICT: Open Chrome; the extension reconnects within ~30s. If it stays down: iris reconnect");
   }
+
+  header("Runtime files");
+  const artifacts = compareRuntimeArtifacts();
+  let drift = false;
+  for (const a of artifacts) {
+    if (a.status === "CURRENT") {
+      success(`${a.name}: CURRENT`);
+    } else {
+      drift = true;
+      warn(`${a.name}: ${a.status}`);
+    }
+  }
+  if (drift) {
+    warn("Runtime: STALE — run iris update");
+  }
 }
 
 function processTable() {
@@ -1028,6 +1043,33 @@ function processTable() {
   } catch {
     return "";
   }
+}
+
+function fileSha256(path) {
+  if (!existsSync(path)) return null;
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function runtimeArtifactPairs() {
+  return [
+    { name: "extension/background.js", src: join(PACKAGE_ROOT, "extension", "background.js"), dst: join(EXTENSION_DIR, "background.js") },
+    { name: "extension/manifest.json", src: join(PACKAGE_ROOT, "extension", "manifest.json"), dst: join(EXTENSION_DIR, "manifest.json") },
+    { name: "broker.cjs", src: join(PACKAGE_ROOT, "bin", "broker.cjs"), dst: BROKER_DST },
+    { name: "native-host.cjs", src: join(PACKAGE_ROOT, "bin", "native-host.cjs"), dst: NATIVE_HOST_DST },
+    { name: "browser-cli.cjs", src: join(PACKAGE_ROOT, "bin", "browser-cli.cjs"), dst: BROWSER_CLI_DST },
+  ];
+}
+
+/** @returns {{ name: string, status: "CURRENT"|"STALE"|"MISSING_SRC"|"MISSING_DST", srcHash: string|null, dstHash: string|null }[]} */
+function compareRuntimeArtifacts() {
+  return runtimeArtifactPairs().map(({ name, src, dst }) => {
+    const srcHash = fileSha256(src);
+    const dstHash = fileSha256(dst);
+    if (!srcHash) return { name, status: "MISSING_SRC", srcHash, dstHash };
+    if (!dstHash) return { name, status: "MISSING_DST", srcHash, dstHash };
+    if (srcHash !== dstHash) return { name, status: "STALE", srcHash, dstHash };
+    return { name, status: "CURRENT", srcHash, dstHash };
+  });
 }
 
 async function doctor() {
@@ -1068,11 +1110,25 @@ async function doctor() {
   header("Socket");
   success(`Socket file present: ${existsSync(BROKER_SOCKET)}`);
 
+  header("Runtime files");
+  const artifacts = compareRuntimeArtifacts();
+  let drift = false;
+  for (const a of artifacts) {
+    if (a.status === "CURRENT") {
+      success(`${a.name}: CURRENT`);
+    } else {
+      drift = true;
+      warn(`${a.name}: ${a.status} (run: node packages/core/bin/cli.js update)`);
+    }
+  }
+
   header("Verdict");
   if (!live.ok) {
     warn("VERDICT: run node packages/core/bin/cli.js reconnect");
   } else if (!live.data?.hostConnected) {
     warn("VERDICT: open Chrome and wait ~30s; if it stays down, run iris reconnect");
+  } else if (drift) {
+    warn("VERDICT: runtime files STALE — run node packages/core/bin/cli.js update (then reload extension if hot-reload fails)");
   } else {
     success("VERDICT: no action needed");
   }

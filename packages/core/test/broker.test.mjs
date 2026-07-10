@@ -238,3 +238,155 @@ test("extension reload fans out to every healthy host", async (t) => {
   assert.equal(response.ok, true);
   assert.deepEqual(response.data, { ok: true, sent: 2 });
 });
+
+test("stale host is unhealthy in status before the socket is reaped", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(601, { pong: false });
+  const plugin = broker.makePlugin();
+
+  // PONG_TIMEOUT_MS=400 in startBroker env. Poll the window after lastPong
+  // goes stale but before the next interval tick destroys the socket.
+  // Unique request ids required: nextMessage returns the first cached match.
+  let sawUnhealthyWhileRegistered = false;
+  let requestId = 1;
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const status = await broker.request(plugin, requestId, "status");
+    requestId += 1;
+    assert.equal(status.ok, true);
+    if (status.data.hostConnected === false && status.data.hostCount === 1) {
+      assert.ok(status.data.hosts[0].lastPongAgoMs > 400);
+      sawUnhealthyWhileRegistered = true;
+      break;
+    }
+    if (status.data.hostCount === 0) {
+      break; // destroyed first; fail below — window missed
+    }
+    await wait(25);
+  }
+
+  assert.equal(
+    sawUnhealthyWhileRegistered,
+    true,
+    "expected hostConnected=false with hostCount=1 while socket still registered (healthyHosts pong filter)",
+  );
+});
+
+test("wantsTab tool without tabId uses active tab before creating one", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(701, { pong: true });
+  const plugin = broker.makePlugin("session-active-tab");
+
+  host.socket.on(
+    "data",
+    createJsonLineParser((message) => {
+      if (message?.type !== "to_extension" || message.message?.type !== "tool_request") return;
+      const { id, tool } = message.message;
+      if (tool === "get_active_tab") {
+        host.write({
+          type: "from_extension",
+          message: {
+            type: "tool_response",
+            id,
+            result: { tabId: 42, content: { tabId: 42, url: "https://example.com", title: "Example" } },
+          },
+        });
+      } else if (tool === "click") {
+        host.write({
+          type: "from_extension",
+          message: { type: "tool_response", id, result: { tabId: 42, content: "Clicked #go" } },
+        });
+      } else if (tool === "open_tab") {
+        host.write({
+          type: "from_extension",
+          message: { type: "tool_response", id, result: { tabId: 99, content: { tabId: 99 } } },
+        });
+      } else {
+        host.write({
+          type: "from_extension",
+          message: { type: "tool_response", id, error: { content: `unexpected tool ${tool}` } },
+        });
+      }
+    })
+  );
+
+  plugin.write({
+    type: "request",
+    id: 1,
+    op: "tool",
+    tool: "click",
+    args: { selector: "#go" },
+    sessionId: "session-active-tab",
+  });
+  const response = await plugin.nextMessage((m) => m.type === "response" && m.id === 1, 5000);
+  assert.equal(response.ok, true);
+
+  const openTabRequests = host.messages.filter(
+    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "open_tab"
+  );
+  assert.equal(openTabRequests.length, 0, "must not open a new tab when active tab is claimable");
+
+  const getActive = host.messages.filter(
+    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "get_active_tab"
+  );
+  assert.ok(getActive.length >= 1);
+
+  const clickReq = host.messages.filter(
+    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "click"
+  );
+  assert.equal(clickReq.length, 1);
+  assert.equal(clickReq[0].message.args.tabId, 42);
+});
+
+test("wantsTab tool creates tab when active tab is owned by another session", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(702, { pong: true });
+
+  const pluginA = broker.makePlugin("session-a");
+  await broker.request(pluginA, 1, "claim_tab", { tabId: 42 });
+
+  const pluginB = broker.makePlugin("session-b");
+  host.socket.on(
+    "data",
+    createJsonLineParser((message) => {
+      if (message?.type !== "to_extension" || message.message?.type !== "tool_request") return;
+      const { id, tool, args } = message.message;
+      if (tool === "get_active_tab") {
+        host.write({
+          type: "from_extension",
+          message: { type: "tool_response", id, result: { tabId: 42, content: { tabId: 42 } } },
+        });
+      } else if (tool === "open_tab") {
+        host.write({
+          type: "from_extension",
+          message: { type: "tool_response", id, result: { tabId: 77, content: { tabId: 77 } } },
+        });
+      } else if (tool === "click") {
+        host.write({
+          type: "from_extension",
+          message: { type: "tool_response", id, result: { tabId: args.tabId, content: "Clicked" } },
+        });
+      }
+    })
+  );
+
+  pluginB.write({
+    type: "request",
+    id: 2,
+    op: "tool",
+    tool: "click",
+    args: { selector: "#x" },
+    sessionId: "session-b",
+  });
+  const response = await pluginB.nextMessage((m) => m.type === "response" && m.id === 2, 5000);
+  assert.equal(response.ok, true);
+
+  const openTabRequests = host.messages.filter(
+    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "open_tab"
+  );
+  assert.ok(openTabRequests.length >= 1, "must open a new tab when active is foreign-owned");
+  const clickReq = host.messages.filter(
+    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "click"
+  );
+  assert.ok(clickReq.some((m) => m.message.args.tabId === 77));
+});

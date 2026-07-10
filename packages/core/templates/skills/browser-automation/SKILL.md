@@ -100,6 +100,8 @@ Fill a form:
 browser_query selector="input,textarea,select,button" mode=list limit=50
 browser_type selector="label:Email" text="user@example.com"
 browser_query selector="label:Email" mode=value
+browser_press key="Enter"
+browser_press key="Escape" selector="input.search"
 browser_click selector="text:Submit"
 browser_query mode=page_text pattern="Success|Error"
 ```

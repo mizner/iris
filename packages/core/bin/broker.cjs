@@ -292,6 +292,31 @@ async function ensureSessionTab(sessionId) {
   return tabId;
 }
 
+async function resolveDefaultTabId(sessionId) {
+  if (!sessionId) throw new Error("Missing sessionId for tab resolution");
+  try {
+    const active = await callExtension("get_active_tab", {}, sessionId);
+    const activeId =
+      active && typeof active.tabId === "number"
+        ? active.tabId
+        : active && active.content && typeof active.content.tabId === "number"
+          ? active.content.tabId
+          : null;
+    if (typeof activeId === "number") {
+      const claim = checkClaim(activeId, sessionId);
+      if (claim.ok) {
+        touchClaim(activeId, sessionId);
+        setDefaultTab(sessionId, activeId);
+        return activeId;
+      }
+      // owned by another session — do not steal; fall through to create
+    }
+  } catch {
+    // extension error — fall through to create
+  }
+  return await ensureSessionTab(sessionId);
+}
+
 async function handleTool(pluginSocket, req) {
   const { tool, args = {}, sessionId } = req;
   if (!tool) throw new Error("Missing tool");
@@ -310,7 +335,7 @@ async function handleTool(pluginSocket, req) {
       if (Number.isFinite(defaultTabId)) {
         tabId = defaultTabId;
       } else if (!isCloseTool) {
-        tabId = await ensureSessionTab(sessionId);
+        tabId = await resolveDefaultTabId(sessionId);
       } else {
         throw new Error("No tab owned by this session. Open a new tab first.");
       }

@@ -36708,6 +36708,32 @@ function createAgentBackend(sessionId) {
           return { content: `Waited ${ms}ms` };
         });
       }
+      case "press": {
+        return await withTab(args.tabId, async () => {
+          if (!args.key)
+            throw new Error("key is required");
+          const payload = { key: String(args.key) };
+          if (typeof args.selector === "string" && args.selector.trim())
+            payload.selector = args.selector.trim();
+          const mods = Array.isArray(args.modifiers) ? args.modifiers.map(String) : [];
+          if (mods.length) {
+            const norm = mods.map((m) => {
+              if (/^(control|ctrl)$/i.test(m))
+                return "Control";
+              if (/^alt$/i.test(m))
+                return "Alt";
+              if (/^(meta|command|cmd)$/i.test(m))
+                return "Meta";
+              if (/^shift$/i.test(m))
+                return "Shift";
+              return m;
+            });
+            payload.key = [...norm, payload.key].join("+");
+          }
+          await agentCommand("press", payload);
+          return { content: `Pressed ${args.key}` };
+        });
+      }
       default:
         throw new Error(`Unsupported tool for agent backend: ${tool3}`);
     }
@@ -37275,6 +37301,22 @@ var plugin = async (ctx) => {
         async execute({ selector, text, clear, index, tabId, timeoutMs, pollMs }, ctx2) {
           const data = await toolRequest("type", { selector, text, clear, index, tabId, timeoutMs, pollMs });
           return toolResultText(data, `Typed "${text}" into ${selector}`);
+        }
+      }),
+      browser_press: tool({
+        description: "Press a keyboard key (Enter, Tab, Escape, arrows, or a character), optionally with modifiers and a focus selector.",
+        args: {
+          key: schema.string(),
+          modifiers: schema.array(schema.string()).optional(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ key, modifiers, selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("press", { key, modifiers, selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Pressed ${key}`);
         }
       }),
       browser_select: tool({

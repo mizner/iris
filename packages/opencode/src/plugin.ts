@@ -634,6 +634,24 @@ const plugin: Plugin = async (ctx) => {
         },
       }),
 
+      browser_press: tool({
+        description:
+          "Press a keyboard key (Enter, Tab, Escape, arrows, or a character), optionally with modifiers and a focus selector.",
+        args: {
+          key: schema.string(),
+          modifiers: schema.array(schema.string()).optional(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+        },
+        async execute({ key, modifiers, selector, index, tabId, timeoutMs, pollMs }, ctx) {
+          const data = await toolRequest("press", { key, modifiers, selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Pressed ${key}`);
+        },
+      }),
+
       browser_select: tool({
         description: "Select an option in a native select element",
         args: {

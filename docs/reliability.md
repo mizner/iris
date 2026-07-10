@@ -20,6 +20,7 @@ The reliability goal is intentionally boring: one broker per user, a native host
 - The Chrome native messaging manifest should point at `~/.iris/host-wrapper.sh`.
 - `browser_status` or `~/.iris/browser-cli.cjs status` returning `broker: true` and `hostConnected: false` means the broker is up but has no healthy native-host connection.
 - `node packages/core/bin/cli.js doctor` is the standard diagnostic entry point. `node packages/core/bin/cli.js reconnect` is the standard repair path.
+- `iris doctor` hashes package sources against `~/.iris` runtime copies (extension, broker, native-host, browser-cli). `STALE` means run `node packages/core/bin/cli.js update` even if `hostConnected` is true.
 
 ## Optional Process Supervision
 

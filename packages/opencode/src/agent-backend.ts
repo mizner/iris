@@ -850,6 +850,26 @@ export function createAgentBackend(sessionId: string): AgentBackend {
           return { content: `Waited ${ms}ms` };
         });
       }
+      case "press": {
+        return await withTab(args.tabId, async () => {
+          if (!args.key) throw new Error("key is required");
+          const payload: Record<string, any> = { key: String(args.key) };
+          if (typeof args.selector === "string" && args.selector.trim()) payload.selector = args.selector.trim();
+          const mods = Array.isArray(args.modifiers) ? args.modifiers.map(String) : [];
+          if (mods.length) {
+            const norm = mods.map((m) => {
+              if (/^(control|ctrl)$/i.test(m)) return "Control";
+              if (/^alt$/i.test(m)) return "Alt";
+              if (/^(meta|command|cmd)$/i.test(m)) return "Meta";
+              if (/^shift$/i.test(m)) return "Shift";
+              return m;
+            });
+            payload.key = [...norm, payload.key].join("+");
+          }
+          await agentCommand("press", payload);
+          return { content: `Pressed ${args.key}` };
+        });
+      }
       default:
         throw new Error(`Unsupported tool for agent backend: ${tool}`);
     }

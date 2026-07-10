@@ -677,10 +677,18 @@ function send(message) {
   }
 }
 
+function isBrokerSourcedMessage(message) {
+  const t = message?.type
+  return t === "ping" || t === "tool_request" || t === "reload"
+}
+
 async function handleMessage(message) {
   if (!message || typeof message !== "object") return
   lastInboundAt = Date.now()
-  if (!isConnected) {
+  if (message.type === "ping") {
+    sawPingOnPort = true
+  }
+  if (!isConnected && isBrokerSourcedMessage(message)) {
     isConnected = true
     connectionAttempts = 0
     updateBadge(true)
@@ -689,7 +697,6 @@ async function handleMessage(message) {
   if (message.type === "tool_request") {
     await handleToolRequest(message)
   } else if (message.type === "ping") {
-    sawPingOnPort = true
     send({ type: "pong" })
   } else if (message.type === "config_response") {
     const cfg = message.config || {}
@@ -738,6 +745,7 @@ async function executeTool(toolName, args) {
     navigate: toolNavigate,
     click: toolClick,
     type: toolType,
+    press: toolPress,
     select: toolSelect,
     screenshot: toolScreenshot,
     snapshot: toolSnapshot,
@@ -1254,6 +1262,12 @@ async function pageOps(command, args) {
     if (isTextInput) {
       if (shouldClear) setNativeValue(match.chosen, "")
       setNativeValue(match.chosen, (match.chosen.value || "") + text)
+      for (const ch of String(text)) {
+        const opts = { key: ch, bubbles: true, cancelable: true }
+        match.chosen.dispatchEvent(new KeyboardEvent("keydown", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keypress", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keyup", opts))
+      }
       match.chosen.dispatchEvent(new Event("input", { bubbles: true }))
       match.chosen.dispatchEvent(new Event("change", { bubbles: true }))
       return { ok: true, selectorUsed: match.selectorUsed }
@@ -1266,11 +1280,61 @@ async function pageOps(command, args) {
       } catch {
         match.chosen.textContent = (match.chosen.textContent || "") + text
       }
+      for (const ch of String(text)) {
+        const opts = { key: ch, bubbles: true, cancelable: true }
+        match.chosen.dispatchEvent(new KeyboardEvent("keydown", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keypress", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keyup", opts))
+      }
       match.chosen.dispatchEvent(new Event("input", { bubbles: true }))
       return { ok: true, selectorUsed: match.selectorUsed }
     }
 
     return { ok: false, error: `Element is not typable: ${match.selectorUsed} (${tag.toLowerCase()})` }
+  }
+
+  if (command === "focus") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    try {
+      match.chosen.scrollIntoView({ block: "center", inline: "center" })
+      match.chosen.focus()
+    } catch {}
+    return { ok: true, selectorUsed: match.selectorUsed }
+  }
+
+  if (command === "press") {
+    const key = safeString(options.key)
+    if (!key) return { ok: false, error: "key is required" }
+    const modifiers = Array.isArray(options.modifiers) ? options.modifiers.map(safeString).filter(Boolean) : []
+    let selectorUsed = ""
+    if (selectors.length) {
+      const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+      if (!match.chosen) {
+        return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+      }
+      try {
+        match.chosen.scrollIntoView({ block: "center", inline: "center" })
+        match.chosen.focus()
+      } catch {}
+      selectorUsed = match.selectorUsed
+    }
+    const mod = {
+      altKey: modifiers.some((m) => /^alt$/i.test(m)),
+      ctrlKey: modifiers.some((m) => /^(control|ctrl)$/i.test(m)),
+      metaKey: modifiers.some((m) => /^(meta|command|cmd)$/i.test(m)),
+      shiftKey: modifiers.some((m) => /^shift$/i.test(m)),
+    }
+    const target = document.activeElement || document.body
+    const opts = { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, bubbles: true, cancelable: true, ...mod }
+    try {
+      target.dispatchEvent(new KeyboardEvent("keydown", opts))
+      target.dispatchEvent(new KeyboardEvent("keypress", opts))
+      target.dispatchEvent(new KeyboardEvent("keyup", opts))
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) }
+    }
+    return { ok: true, key, selectorUsed, method: "dom" }
   }
 
   if (command === "select") {
@@ -1636,6 +1700,62 @@ async function toolType({ selector, text, tabId, clear = false, index = 0, timeo
   if (!result?.ok) throw new Error(result?.error || "Type failed")
   const used = result.selectorUsed || selector
   return { tabId: tab.id, content: `Typed "${text}" into ${used}` }
+}
+
+function cdpKeyModifiers(modList) {
+  let bits = 0
+  for (const m of modList) {
+    if (/^alt$/i.test(m)) bits |= 1
+    else if (/^(control|ctrl)$/i.test(m)) bits |= 2
+    else if (/^(meta|command|cmd)$/i.test(m)) bits |= 4
+    else if (/^shift$/i.test(m)) bits |= 8
+  }
+  return bits
+}
+
+function cdpKeyFields(key) {
+  const k = String(key)
+  const vk = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8 }[k]
+  let code = k
+  if (k.length === 1 && /[a-zA-Z]/.test(k)) code = `Key${k.toUpperCase()}`
+  else if (k.length === 1 && /[0-9]/.test(k)) code = `Digit${k}`
+  const out = { key: k, code }
+  if (vk != null) {
+    out.windowsVirtualKeyCode = vk
+    out.nativeVirtualKeyCode = vk
+  }
+  return out
+}
+
+async function toolPress({ key, modifiers, selector, tabId, index = 0, timeoutMs, pollMs } = {}) {
+  if (!key || typeof key !== "string" || !key.trim()) throw new Error("key is required")
+  const tab = await getTabById(tabId)
+  const modList = Array.isArray(modifiers) ? modifiers.map(String) : []
+
+  if (selector) {
+    const focusResult = await runInPage(tab.id, "focus", { selector, index, timeoutMs, pollMs })
+    if (!focusResult?.ok) throw new Error(focusResult?.error || "Focus failed")
+  }
+
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    const fields = cdpKeyFields(key.trim())
+    const mods = cdpKeyModifiers(modList)
+    await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: mods, ...fields })
+    await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: mods, ...fields })
+    return { tabId: tab.id, content: `Pressed ${key.trim()}` }
+  }
+
+  const result = await runInPage(tab.id, "press", {
+    key: key.trim(),
+    modifiers: modList,
+    selector,
+    index,
+    timeoutMs,
+    pollMs,
+  })
+  if (!result?.ok) throw new Error(result?.error || "Press failed")
+  return { tabId: tab.id, content: `Pressed ${key.trim()}` }
 }
 
 async function toolSelect({ selector, value, label, optionIndex, tabId, index = 0, timeoutMs, pollMs }) {
