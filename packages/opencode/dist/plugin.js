@@ -12356,6 +12356,7 @@ var REQUEST_TIMEOUT_MS = 60000;
 var DEFAULT_PAGE_TEXT_LIMIT = 20000;
 var DEFAULT_LIST_LIMIT = 50;
 var DEFAULT_POLL_MS = 200;
+var SUPPORTED_AGENT_TOOLS = "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press";
 var DEFAULT_DOWNLOADS_DIR = join2(BASE_DIR, "downloads");
 function createJsonLineParser(onMessage) {
   let buffer = "";
@@ -13113,7 +13114,7 @@ function createAgentBackend(sessionId) {
         });
       }
       default:
-        throw new Error(`Unsupported tool for agent backend: ${tool3}`);
+        throw new Error(`Unsupported tool for agent backend: ${tool3}. Supported: ${SUPPORTED_AGENT_TOOLS}`);
     }
   }
   async function status() {
@@ -13242,6 +13243,7 @@ async function sleep2(ms) {
 }
 var BACKEND_MODE = (process.env.IRIS_BACKEND ?? process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension").toLowerCase().trim();
 var USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);
+var USE_ROUTER_FALLBACKS = !["off", "false"].includes((process.env.IRIS_FALLBACK ?? "").toLowerCase().trim());
 var socket = null;
 var sessionId = Math.random().toString(36).slice(2);
 var reqId = 0;
@@ -13435,9 +13437,21 @@ async function tryAppleScript(toolName, args) {
   }
   throw new Error(`Apple Events failed for: ${toolName}`);
 }
+function labelRouterPlane(result, plane) {
+  const prefix = `[${plane}] `;
+  if (typeof result === "string")
+    return `${prefix}${result}`;
+  if (result !== null && typeof result === "object") {
+    if ("content" in result && typeof result.content === "string") {
+      return { ...result, content: `${prefix}${result.content}` };
+    }
+    return { ...result, plane };
+  }
+  return { content: result, plane };
+}
 async function routerRequest(toolName, args) {
   const errors3 = [];
-  if (!USE_AGENT_BACKEND) {
+  if (!USE_AGENT_BACKEND || !USE_ROUTER_FALLBACKS) {
     try {
       const result = await brokerRequest("tool", { tool: toolName, args });
       logRouter(`SUCCESS[extension]: ${toolName}`);
@@ -13449,22 +13463,22 @@ async function routerRequest(toolName, args) {
     }
   }
   const appleScriptTools = ["open_tab", "navigate", "get_active_tab", "get_tabs"];
-  if (appleScriptTools.includes(toolName)) {
+  if (USE_ROUTER_FALLBACKS && appleScriptTools.includes(toolName)) {
     try {
       const result = await tryAppleScript(toolName, args);
       logRouter(`SUCCESS[applescript]: ${toolName}`);
-      return result;
+      return labelRouterPlane(result, "applescript");
     } catch (err) {
       const msg = err?.message || String(err);
       errors3.push(`applescript: ${msg}`);
       logRouter(`FAIL[applescript]: ${toolName} - ${msg}`);
     }
   }
-  if (agentBackend) {
+  if (USE_ROUTER_FALLBACKS && agentBackend) {
     try {
       const result = await agentBackend.requestTool(toolName, args);
       logRouter(`SUCCESS[agent]: ${toolName}`);
-      return result;
+      return labelRouterPlane(result, "agent-browser");
     } catch (err) {
       const msg = err?.message || String(err);
       errors3.push(`agent: ${msg}`);

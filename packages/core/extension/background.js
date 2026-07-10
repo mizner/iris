@@ -376,6 +376,46 @@ function redactHeaders(headers) {
   return out
 }
 
+const NETWORK_BODY_SECRET_KEY =
+  /(?:^|[_-])(?:password|secret|token|authorization|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|cookie)$/i
+
+function redactNetworkBody(text) {
+  if (typeof text !== "string") return { text: "", redacted: false }
+  const trimmed = text.trim()
+  const looksLikeJson =
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  if (!looksLikeJson) return { text, redacted: false }
+
+  let value
+  try {
+    value = JSON.parse(trimmed)
+  } catch {
+    return { text, redacted: false }
+  }
+
+  let redacted = false
+  const scrub = (entry) => {
+    if (!entry || typeof entry !== "object") return
+    if (Array.isArray(entry)) {
+      for (const item of entry) scrub(item)
+      return
+    }
+
+    for (const [key, child] of Object.entries(entry)) {
+      const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/\s+/g, "_")
+      if (NETWORK_BODY_SECRET_KEY.test(normalizedKey)) {
+        entry[key] = "[redacted]"
+        redacted = true
+      } else {
+        scrub(child)
+      }
+    }
+  }
+
+  scrub(value)
+  return { text: redacted ? JSON.stringify(value) : text, redacted }
+}
+
 function getOrCreateNetworkRecord(network, requestId) {
   let record = network.requests.get(requestId)
   if (!record) {
@@ -1231,6 +1271,22 @@ async function pageOps(command, args) {
   const pattern = typeof options.pattern === "string" ? options.pattern : null
   const flags = typeof options.flags === "string" ? options.flags : "i"
 
+  if (command === "rect") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+
+    try {
+      match.chosen.scrollIntoView({ block: "center", inline: "center" })
+    } catch {}
+
+    const rect = elementRect(match.chosen)
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), rect.viewportWidth - 1)
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), rect.viewportHeight - 1)
+    return { ok: true, selectorUsed: match.selectorUsed, x, y }
+  }
+
   if (command === "click") {
     const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
     if (!match.chosen) {
@@ -1684,6 +1740,17 @@ async function toolNavigate({ url, tabId }) {
 async function toolClick({ selector, tabId, index = 0, timeoutMs, pollMs }) {
   if (!selector) throw new Error("Selector is required")
   const tab = await getTabById(tabId)
+
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
+    if (!point?.ok) throw new Error(point?.error || "Click failed")
+    const mouse = { x: point.x, y: point.y, button: "left", clickCount: 1 }
+    await sendDebuggerCommand(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", ...mouse })
+    await sendDebuggerCommand(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", ...mouse })
+    const used = point.selectorUsed || selector
+    return { tabId: tab.id, content: `Clicked ${used}` }
+  }
 
   const result = await runInPage(tab.id, "click", { selector, index, timeoutMs, pollMs })
   if (!result?.ok) throw new Error(result?.error || "Click failed")
@@ -2395,9 +2462,11 @@ async function toolNetworkGet({ tabId, requestId, index, includeBody = false, ma
       const body = await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.getResponseBody", { requestId: id })
       const limit = clampNumber(maxBodyBytes, 0, 5_000_000, 200000)
       const rawBody = typeof body?.body === "string" ? body.body : ""
-      out.body = rawBody.slice(0, limit)
+      const redactedBody = body?.base64Encoded ? { text: rawBody, redacted: false } : redactNetworkBody(rawBody)
+      out.body = redactedBody.text.slice(0, limit)
       out.base64Encoded = !!body?.base64Encoded
-      out.bodyTruncated = rawBody.length > limit
+      out.bodyTruncated = redactedBody.text.length > limit
+      if (redactedBody.redacted) out.bodyRedacted = true
     } catch (error) {
       out.bodyError = error?.message || String(error)
     }

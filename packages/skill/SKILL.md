@@ -118,7 +118,7 @@ browser_wait_for state="networkidle" networkIdleMs=500 timeoutMs=15000
 browser_network_list filter="/api/" limit=50
 ```
 
-Headers are redacted by default. Only request bodies with `browser_network_get includeBody=true` when the task genuinely needs them, and avoid dumping secrets into logs.
+Headers are redacted by default. Response bodies are opt-in with `browser_network_get includeBody=true`, and sensitive JSON fields are redacted before return; still avoid dumping secrets into logs.
 
 Report:
 

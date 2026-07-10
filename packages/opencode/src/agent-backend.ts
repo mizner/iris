@@ -25,6 +25,8 @@ const DEFAULT_PAGE_TEXT_LIMIT = 20000;
 const DEFAULT_LIST_LIMIT = 50;
 const DEFAULT_POLL_MS = 200;
 
+const SUPPORTED_AGENT_TOOLS =
+  "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press";
 const DEFAULT_DOWNLOADS_DIR = join(BASE_DIR, "downloads");
 
 export type AgentBackend = {
@@ -871,7 +873,7 @@ export function createAgentBackend(sessionId: string): AgentBackend {
         });
       }
       default:
-        throw new Error(`Unsupported tool for agent backend: ${tool}`);
+        throw new Error(`Unsupported tool for agent backend: ${tool}. Supported: ${SUPPORTED_AGENT_TOOLS}`);
     }
   }
 

@@ -132,6 +132,9 @@ const BACKEND_MODE = (
   .toLowerCase()
   .trim();
 const USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);
+const USE_ROUTER_FALLBACKS = !["off", "false"].includes(
+  (process.env.IRIS_FALLBACK ?? "").toLowerCase().trim()
+);
 
 let socket: net.Socket | null = null;
 let sessionId = Math.random().toString(36).slice(2);
@@ -351,11 +354,23 @@ async function tryAppleScript(toolName: string, args: Record<string, any>): Prom
   throw new Error(`Apple Events failed for: ${toolName}`);
 }
 
+function labelRouterPlane(result: unknown, plane: "applescript" | "agent-browser"): unknown {
+  const prefix = `[${plane}] `;
+  if (typeof result === "string") return `${prefix}${result}`;
+  if (result !== null && typeof result === "object") {
+    if ("content" in result && typeof result.content === "string") {
+      return { ...result, content: `${prefix}${result.content}` };
+    }
+    return { ...result, plane };
+  }
+  return { content: result, plane };
+}
+
 async function routerRequest(toolName: string, args: Record<string, any>): Promise<any> {
   const errors: string[] = [];
   
   // Try 1: Extension (broker)
-  if (!USE_AGENT_BACKEND) {
+  if (!USE_AGENT_BACKEND || !USE_ROUTER_FALLBACKS) {
     try {
       const result = await brokerRequest("tool", { tool: toolName, args });
       logRouter(`SUCCESS[extension]: ${toolName}`);
@@ -369,11 +384,11 @@ async function routerRequest(toolName: string, args: Record<string, any>): Promi
   
   // Try 2: Apple Events (for navigation/tab ops only)
   const appleScriptTools = ["open_tab", "navigate", "get_active_tab", "get_tabs"];
-  if (appleScriptTools.includes(toolName)) {
+  if (USE_ROUTER_FALLBACKS && appleScriptTools.includes(toolName)) {
     try {
       const result = await tryAppleScript(toolName, args);
       logRouter(`SUCCESS[applescript]: ${toolName}`);
-      return result;
+      return labelRouterPlane(result, "applescript");
     } catch (err: any) {
       const msg = err?.message || String(err);
       errors.push(`applescript: ${msg}`);
@@ -382,11 +397,11 @@ async function routerRequest(toolName: string, args: Record<string, any>): Promi
   }
   
   // Try 3: Agent Browser
-  if (agentBackend) {
+  if (USE_ROUTER_FALLBACKS && agentBackend) {
     try {
       const result = await agentBackend.requestTool(toolName, args);
       logRouter(`SUCCESS[agent]: ${toolName}`);
-      return result;
+      return labelRouterPlane(result, "agent-browser");
     } catch (err: any) {
       const msg = err?.message || String(err);
       errors.push(`agent: ${msg}`);

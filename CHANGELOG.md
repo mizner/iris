@@ -9,6 +9,11 @@
 - Extension badge turns green only on broker-sourced traffic (`ping` / `tool_request` / `reload`), not local `config_response`.
 - Broker test isolates pong-freshness in `healthyHosts()` before socket reap.
 - Fixed root `tool-test` import to `@mizner/iris-opencode` after package layout cleanup.
+- Redact sensitive JSON fields in `browser_network_get` response bodies; prefer list without bodies.
+- CDP-first `browser_click` via `Input.dispatchMouseEvent` when debugger is attached; DOM fallback otherwise.
+- Label AppleScript/agent-browser router successes with plane markers; `IRIS_FALLBACK=off` disables non-extension planes.
+- Agent-backend unsupported-tool errors list the supported tool subset.
+- Add `test:skill-tools` check that skill docs cover all plugin `browser_*` tools.
 
 ## 4.7.0
 
