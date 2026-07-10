@@ -1,4 +1,4 @@
-import plugin from "../dist/plugin.js";
+import plugin from "@mizner/iris-opencode";
 
 const toolName = process.argv[2] ?? "browser_status";
 const rawArgs = process.argv[3];

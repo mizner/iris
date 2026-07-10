@@ -155,6 +155,16 @@ Example MCP config:
 
 Set `IRIS_BROKER_SOCK` only if you intentionally run the broker somewhere other than `~/.iris/broker.sock`.
 
+## Claude Code Setup
+
+Register Iris as a user-scope Claude Code MCP server:
+
+```bash
+claude mcp add --scope user iris -- node /absolute/path/to/iris/packages/mcp/dist/server.js
+```
+
+The OpenCode plugin and Claude MCP server can coexist; both talk to the same local Iris broker.
+
 ## CLI Usage
 
 The runtime installer places a small CLI at `~/.iris/browser-cli.cjs`:
@@ -207,7 +217,7 @@ node packages/core/bin/cli.js update
 
 Build targets:
 
-- `bun run build` builds the OpenCode adapter, MCP adapter, and root compatibility plugin.
+- `bun run build` builds the OpenCode adapter and MCP adapter.
 - `bun run --cwd packages/opencode build` builds only the OpenCode adapter.
 - `bun run --cwd packages/mcp build` builds only the MCP adapter.
 - `bun run check:runtime` syntax-checks the runtime JavaScript files.
@@ -230,12 +240,24 @@ The local broker is not running or the socket is stale. Run:
 
 ```bash
 node packages/core/bin/cli.js status
-node packages/core/bin/cli.js update
+node packages/core/bin/cli.js doctor
+node packages/core/bin/cli.js reconnect
 ```
 
 `broker: true` and `hostConnected: false`
 
-The broker is running, but Chrome has not connected through native messaging. Reload the unpacked extension from `~/.iris/extension`, click the Iris extension once, and check Chrome's extension service worker logs.
+The broker is running, but no healthy native host is connected. Run:
+
+```bash
+node packages/core/bin/cli.js doctor
+node packages/core/bin/cli.js reconnect
+```
+
+Open Chrome in the target profile and wait about 30 seconds. Manual reload from `chrome://extensions` is now the last resort, not the first step.
+
+Runtime update did not activate new extension code
+
+`node packages/core/bin/cli.js update` copies the runtime files and asks the broker to hot-reload the extension when a healthy host is connected. If the extension is offline during update, open Chrome and run `iris reconnect`; reload the unpacked extension manually only if doctor still reports `hostConnected: false`.
 
 Duplicate broker processes
 
@@ -250,6 +272,17 @@ node packages/core/bin/cli.js update
 ```
 
 The installer writes `~/.iris/host-wrapper.sh` with a stable Node path when possible.
+
+Environment variables
+
+- `IRIS_BROKER_SOCK` overrides the broker socket path.
+- `IRIS_CLAIM_TTL_MS` controls tab-claim expiry; legacy `OPENCODE_BROWSER_CLAIM_TTL_MS` is still honored.
+- `IRIS_PING_INTERVAL_MS` and `IRIS_PONG_TIMEOUT_MS` tune broker keepalive timing.
+- `IRIS_NODE` overrides the Node binary used in the native host wrapper; legacy `OPENCODE_BROWSER_NODE` is still honored.
+- `IRIS_EXTENSION_ID` overrides extension ID discovery; legacy `OPENCODE_BROWSER_EXTENSION_ID` is still honored.
+- `IRIS_BACKEND` selects the adapter backend; legacy `OPENCODE_BROWSER_BACKEND` and `OPENCODE_BROWSER_MODE` are still honored.
+- `IRIS_MAX_UPLOAD_BYTES` caps file uploads through the extension path; legacy `OPENCODE_BROWSER_MAX_UPLOAD_BYTES` is still honored.
+- `IRIS_BROWSER_APP` selects the AppleScript browser app before the default Chrome, Brave, and Chromium order.
 
 ## License
 

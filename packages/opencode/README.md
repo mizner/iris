@@ -43,7 +43,7 @@ If the package is published in your environment:
 - `browser_get_tabs`, `browser_get_active_tab`
 - `browser_list_claims`, `browser_claim_tab`, `browser_release_tab`
 - `browser_open_tab`, `browser_close_tab`, `browser_navigate`
-- `browser_click`, `browser_type`, `browser_select`, `browser_scroll`, `browser_wait`
+- `browser_click`, `browser_type`, `browser_press`, `browser_select`, `browser_scroll`, `browser_wait`
 - `browser_query`, `browser_snapshot`, `browser_screenshot`
 - `browser_download`, `browser_list_downloads`, `browser_set_file_input`
 - `browser_highlight`, `browser_console`, `browser_errors`

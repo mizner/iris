@@ -42,8 +42,9 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
   process.stderr.write(
     "Usage: browser-cli.cjs <tool|status> [json-args | --key value ...]\n" +
     "\nTools: open_tab, navigate, snapshot, query, get_tabs, get_active_tab,\n" +
-    "       click, type, select, scroll, screenshot, close_tab, wait,\n" +
-    "       console, errors, download, highlight, set_file_input,\n" +
+    "       click, type, select, scroll, screenshot, close_tab, wait, wait_for,\n" +
+    "       console, errors, network_start, network_stop, network_list, network_get,\n" +
+    "       download, highlight, set_file_input,\n" +
     "       get_profile_status, get_webmcp_status\n" +
     "\nOps:   status, list_claims, claim_tab, release_tab\n"
   );

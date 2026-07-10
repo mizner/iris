@@ -12335,7 +12335,7 @@ function tool(input) {
   return input;
 }
 tool.schema = exports_external;
-// ../core/src/paths.ts
+// node_modules/@mizner/iris/src/paths.ts
 import { homedir } from "os";
 import { join } from "path";
 var BASE_DIR = join(homedir(), ".iris");
@@ -12356,6 +12356,7 @@ var REQUEST_TIMEOUT_MS = 60000;
 var DEFAULT_PAGE_TEXT_LIMIT = 20000;
 var DEFAULT_LIST_LIMIT = 50;
 var DEFAULT_POLL_MS = 200;
+var SUPPORTED_AGENT_TOOLS = "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press";
 var DEFAULT_DOWNLOADS_DIR = join2(BASE_DIR, "downloads");
 function createJsonLineParser(onMessage) {
   let buffer = "";
@@ -13086,8 +13087,34 @@ function createAgentBackend(sessionId) {
           return { content: `Waited ${ms}ms` };
         });
       }
+      case "press": {
+        return await withTab(args.tabId, async () => {
+          if (!args.key)
+            throw new Error("key is required");
+          const payload = { key: String(args.key) };
+          if (typeof args.selector === "string" && args.selector.trim())
+            payload.selector = args.selector.trim();
+          const mods = Array.isArray(args.modifiers) ? args.modifiers.map(String) : [];
+          if (mods.length) {
+            const norm = mods.map((m) => {
+              if (/^(control|ctrl)$/i.test(m))
+                return "Control";
+              if (/^alt$/i.test(m))
+                return "Alt";
+              if (/^(meta|command|cmd)$/i.test(m))
+                return "Meta";
+              if (/^shift$/i.test(m))
+                return "Shift";
+              return m;
+            });
+            payload.key = [...norm, payload.key].join("+");
+          }
+          await agentCommand("press", payload);
+          return { content: `Pressed ${args.key}` };
+        });
+      }
       default:
-        throw new Error(`Unsupported tool for agent backend: ${tool3}`);
+        throw new Error(`Unsupported tool for agent backend: ${tool3}. Supported: ${SUPPORTED_AGENT_TOOLS}`);
     }
   }
   async function status() {
@@ -13119,7 +13146,7 @@ function createAgentBackend(sessionId) {
 }
 
 // src/plugin.ts
-import { existsSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2, statSync } from "fs";
+import { existsSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
 import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath } from "url";
@@ -13146,7 +13173,7 @@ var SOCKET_PATH2 = process.env.IRIS_BROKER_SOCK?.trim() || SOCKET_PATH;
 var RUNTIME_DIR = process.env.IRIS_BROKER_SOCK?.trim() ? dirname2(SOCKET_PATH2) : BASE_DIR;
 var DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024;
 var MAX_UPLOAD_BYTES = (() => {
-  const raw = process.env.OPENCODE_BROWSER_MAX_UPLOAD_BYTES;
+  const raw = process.env.IRIS_MAX_UPLOAD_BYTES ?? process.env.OPENCODE_BROWSER_MAX_UPLOAD_BYTES;
   const value = raw ? Number(raw) : NaN;
   if (Number.isFinite(value) && value > 0)
     return value;
@@ -13164,7 +13191,7 @@ function buildFileUploadPayload(filePath, fileName, mimeType) {
   if (!stats.isFile())
     throw new Error(`Not a file: ${absPath}`);
   if (stats.size > MAX_UPLOAD_BYTES) {
-    throw new Error(`File too large (${stats.size} bytes). Max is ${MAX_UPLOAD_BYTES} bytes (OPENCODE_BROWSER_MAX_UPLOAD_BYTES). ` + `For larger uploads, use OPENCODE_BROWSER_BACKEND=agent.`);
+    throw new Error(`File too large (${stats.size} bytes). Max is ${MAX_UPLOAD_BYTES} bytes (IRIS_MAX_UPLOAD_BYTES / OPENCODE_BROWSER_MAX_UPLOAD_BYTES). ` + `For larger uploads, use IRIS_BACKEND=agent.`);
   }
   const base643 = readFileSync2(absPath).toString("base64");
   const name = typeof fileName === "string" && fileName.trim() ? fileName.trim() : basename2(absPath);
@@ -13199,7 +13226,8 @@ function maybeStartBroker() {
   if (!existsSync(brokerPath))
     return;
   try {
-    const child = spawn2(process.execPath, [brokerPath], { detached: true, stdio: "ignore" });
+    const out = openSync(join3(RUNTIME_DIR, "broker.log"), "a");
+    const child = spawn2(process.execPath, [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
     child.unref();
   } catch {}
 }
@@ -13213,8 +13241,9 @@ async function connectToBroker() {
 async function sleep2(ms) {
   return await new Promise((r) => setTimeout(r, ms));
 }
-var BACKEND_MODE = (process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension").toLowerCase().trim();
+var BACKEND_MODE = (process.env.IRIS_BACKEND ?? process.env.OPENCODE_BROWSER_BACKEND ?? process.env.OPENCODE_BROWSER_MODE ?? "extension").toLowerCase().trim();
 var USE_AGENT_BACKEND = ["agent", "agent-browser", "agentbrowser"].includes(BACKEND_MODE);
+var USE_ROUTER_FALLBACKS = !["off", "false"].includes((process.env.IRIS_FALLBACK ?? "").toLowerCase().trim());
 var socket = null;
 var sessionId = Math.random().toString(36).slice(2);
 var reqId = 0;
@@ -13291,6 +13320,7 @@ function toolResultText(data, fallback) {
   return fallback;
 }
 var ROUTER_LOG_PATH = join3(RUNTIME_DIR, "router.log");
+var cachedAppleScriptApp = null;
 function logRouter(message) {
   const timestamp = new Date().toISOString();
   const line = `[${timestamp}] ${message}
@@ -13299,30 +13329,68 @@ function logRouter(message) {
     __require("fs").appendFileSync(ROUTER_LOG_PATH, line);
   } catch {}
 }
+function appleScriptStringLiteral(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+function appleScriptApps() {
+  const preferred = process.env.IRIS_BROWSER_APP?.trim();
+  const defaults = ["Google Chrome", "Brave Browser", "Chromium"];
+  return preferred ? [preferred, ...defaults.filter((app) => app !== preferred)] : defaults;
+}
 async function tryAppleScript(toolName, args) {
   const supportedTools = ["open_tab", "navigate", "get_active_tab", "get_tabs"];
   if (!supportedTools.includes(toolName)) {
     throw new Error(`Apple Events does not support: ${toolName}`);
   }
-  const { exec, execFile } = await import("child_process");
+  const { execFile } = await import("child_process");
   const { promisify } = await import("util");
-  const execAsync = promisify(exec);
   const execFileAsync = promisify(execFile);
-  if (toolName === "open_tab" || toolName === "navigate") {
-    const url2 = args.url || "about:blank";
-    const script = `tell application "Google Chrome" to tell window 1 to make new tab with properties {URL:"${url2}"}`;
-    await execAsync(`osascript -e '${script}'`);
+  async function runAppleScript(buildArgs) {
+    const apps = cachedAppleScriptApp ? [cachedAppleScriptApp, ...appleScriptApps().filter((app) => app !== cachedAppleScriptApp)] : appleScriptApps();
+    let firstError = null;
+    for (const appName of apps) {
+      try {
+        const { stdout } = await execFileAsync("osascript", buildArgs(appName));
+        cachedAppleScriptApp = appName;
+        return { stdout, appName };
+      } catch (error45) {
+        if (!firstError)
+          firstError = error45;
+        if (cachedAppleScriptApp === appName)
+          cachedAppleScriptApp = null;
+      }
+    }
+    if (firstError instanceof Error)
+      throw firstError;
+    throw new Error(String(firstError || "Apple Events failed"));
+  }
+  if (toolName === "open_tab") {
+    const url2 = appleScriptStringLiteral(args.url || "about:blank");
+    await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to tell window 1 to make new tab with properties {URL:${url2}}`
+    ]);
     return { content: "Tab opened via Apple Events" };
   }
+  if (toolName === "navigate") {
+    const url2 = appleScriptStringLiteral(args.url || "about:blank");
+    await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to set URL of active tab of front window to ${url2}`
+    ]);
+    return { content: "Tab navigated via Apple Events" };
+  }
   if (toolName === "get_active_tab") {
-    const script = `tell application "Google Chrome" to return URL of active tab of front window`;
-    const { stdout } = await execAsync(`osascript -e '${script}'`);
+    const { stdout } = await runAppleScript((appName) => [
+      "-e",
+      `tell application ${appleScriptStringLiteral(appName)} to return URL of active tab of front window`
+    ]);
     return { content: stdout.trim() };
   }
   if (toolName === "get_tabs") {
-    const { stdout } = await execFileAsync("osascript", [
+    const { stdout } = await runAppleScript((appName) => [
       "-e",
-      'tell application "Google Chrome"',
+      `tell application ${appleScriptStringLiteral(appName)}`,
       "-e",
       "set rows to {}",
       "-e",
@@ -13354,8 +13422,8 @@ async function tryAppleScript(toolName, args) {
     ]);
     const rows = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const tabs = rows.map((line) => {
-      const [id, windowId, index, active, title, ...urlParts] = line.split("tab");
-      const url2 = urlParts.join("tab");
+      const [id, windowId, index, active, title, ...urlParts] = line.split("\t");
+      const url2 = urlParts.join("\t");
       return {
         id: Number(id),
         windowId: Number(windowId),
@@ -13369,9 +13437,21 @@ async function tryAppleScript(toolName, args) {
   }
   throw new Error(`Apple Events failed for: ${toolName}`);
 }
+function labelRouterPlane(result, plane) {
+  const prefix = `[${plane}] `;
+  if (typeof result === "string")
+    return `${prefix}${result}`;
+  if (result !== null && typeof result === "object") {
+    if ("content" in result && typeof result.content === "string") {
+      return { ...result, content: `${prefix}${result.content}` };
+    }
+    return { ...result, plane };
+  }
+  return { content: result, plane };
+}
 async function routerRequest(toolName, args) {
   const errors3 = [];
-  if (!USE_AGENT_BACKEND) {
+  if (!USE_AGENT_BACKEND || !USE_ROUTER_FALLBACKS) {
     try {
       const result = await brokerRequest("tool", { tool: toolName, args });
       logRouter(`SUCCESS[extension]: ${toolName}`);
@@ -13383,22 +13463,22 @@ async function routerRequest(toolName, args) {
     }
   }
   const appleScriptTools = ["open_tab", "navigate", "get_active_tab", "get_tabs"];
-  if (appleScriptTools.includes(toolName)) {
+  if (USE_ROUTER_FALLBACKS && appleScriptTools.includes(toolName)) {
     try {
       const result = await tryAppleScript(toolName, args);
       logRouter(`SUCCESS[applescript]: ${toolName}`);
-      return result;
+      return labelRouterPlane(result, "applescript");
     } catch (err) {
       const msg = err?.message || String(err);
       errors3.push(`applescript: ${msg}`);
       logRouter(`FAIL[applescript]: ${toolName} - ${msg}`);
     }
   }
-  if (agentBackend) {
+  if (USE_ROUTER_FALLBACKS && agentBackend) {
     try {
       const result = await agentBackend.requestTool(toolName, args);
       logRouter(`SUCCESS[agent]: ${toolName}`);
-      return result;
+      return labelRouterPlane(result, "agent-browser");
     } catch (err) {
       const msg = err?.message || String(err);
       errors3.push(`agent: ${msg}`);
@@ -13522,6 +13602,14 @@ var plugin = async (ctx) => {
           return toolResultText(data, "ok");
         }
       }),
+      browser_get_active_tab: tool({
+        description: "Return the active browser tab",
+        args: {},
+        async execute(args, ctx2) {
+          const data = await toolRequest("get_active_tab", {});
+          return toolResultText(data, "ok");
+        }
+      }),
       browser_list_claims: tool({
         description: "List tab ownership claims",
         args: {},
@@ -13613,6 +13701,22 @@ var plugin = async (ctx) => {
           return toolResultText(data, `Typed "${text}" into ${selector}`);
         }
       }),
+      browser_press: tool({
+        description: "Press a keyboard key (Enter, Tab, Escape, arrows, or a character), optionally with modifiers and a focus selector.",
+        args: {
+          key: schema.string(),
+          modifiers: schema.array(schema.string()).optional(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ key, modifiers, selector, index, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("press", { key, modifiers, selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Pressed ${key}`);
+        }
+      }),
       browser_select: tool({
         description: "Select an option in a native select element",
         args: {
@@ -13632,12 +13736,36 @@ var plugin = async (ctx) => {
         }
       }),
       browser_screenshot: tool({
-        description: "Take a screenshot of the current page. Returns base64 image data URL.",
+        description: "Take a screenshot of the current page. Supports visible, full-page, selector, and manual clip captures. Returns base64 image data URL.",
         args: {
-          tabId: schema.number().optional()
+          tabId: schema.number().optional(),
+          fullPage: schema.boolean().optional(),
+          selector: schema.string().optional(),
+          index: schema.number().optional(),
+          x: schema.number().optional(),
+          y: schema.number().optional(),
+          width: schema.number().optional(),
+          height: schema.number().optional(),
+          format: schema.string().optional(),
+          quality: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
         },
-        async execute({ tabId }, ctx2) {
-          const data = await toolRequest("screenshot", { tabId });
+        async execute({ tabId, fullPage, selector, index, x, y, width, height, format, quality, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("screenshot", {
+            tabId,
+            fullPage,
+            selector,
+            index,
+            x,
+            y,
+            width,
+            height,
+            format,
+            quality,
+            timeoutMs,
+            pollMs
+          });
           return toolResultText(data, "Screenshot failed");
         }
       }),
@@ -13675,6 +13803,38 @@ var plugin = async (ctx) => {
         async execute({ ms, tabId }, ctx2) {
           const data = await toolRequest("wait", { ms, tabId });
           return toolResultText(data, "Waited");
+        }
+      }),
+      browser_wait_for: tool({
+        description: "Wait for a selector, text, page-text regex, URL pattern, or network idle condition.",
+        args: {
+          selector: schema.string().optional(),
+          text: schema.string().optional(),
+          pattern: schema.string().optional(),
+          urlPattern: schema.string().optional(),
+          state: schema.string().optional(),
+          networkIdleMs: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+          index: schema.number().optional(),
+          flags: schema.string().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ selector, text, pattern, urlPattern, state, networkIdleMs, timeoutMs, pollMs, index, flags, tabId }, ctx2) {
+          const data = await toolRequest("wait_for", {
+            selector,
+            text,
+            pattern,
+            urlPattern,
+            state,
+            networkIdleMs,
+            timeoutMs,
+            pollMs,
+            index,
+            flags,
+            tabId
+          });
+          return toolResultText(data, "Wait condition failed");
         }
       }),
       browser_query: tool({
@@ -13828,6 +13988,74 @@ var plugin = async (ctx) => {
         async execute({ tabId, clear }, ctx2) {
           const data = await toolRequest("errors", { tabId, clear });
           return toolResultText(data, "[]");
+        }
+      }),
+      browser_network_start: tool({
+        description: "Start capturing network requests for a tab using the Chrome debugger API. Headers are redacted in later output.",
+        args: {
+          tabId: schema.number().optional(),
+          clear: schema.boolean().optional(),
+          maxEntries: schema.number().optional()
+        },
+        async execute({ tabId, clear, maxEntries }, ctx2) {
+          const data = await toolRequest("network_start", { tabId, clear, maxEntries });
+          return toolResultText(data, "Network capture started");
+        }
+      }),
+      browser_network_stop: tool({
+        description: "Stop network capture for a tab while keeping captured records available until cleared.",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("network_stop", { tabId });
+          return toolResultText(data, "Network capture stopped");
+        }
+      }),
+      browser_network_list: tool({
+        description: "List captured network requests for a tab. Headers are omitted unless includeHeaders is true.",
+        args: {
+          tabId: schema.number().optional(),
+          limit: schema.number().optional(),
+          includeHeaders: schema.boolean().optional(),
+          filter: schema.string().optional(),
+          clear: schema.boolean().optional()
+        },
+        async execute({ tabId, limit, includeHeaders, filter, clear }, ctx2) {
+          const data = await toolRequest("network_list", { tabId, limit, includeHeaders, filter, clear });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_network_get: tool({
+        description: "Get details for a captured network request. Response body is omitted unless includeBody is true.",
+        args: {
+          tabId: schema.number().optional(),
+          requestId: schema.string().optional(),
+          index: schema.number().optional(),
+          includeBody: schema.boolean().optional(),
+          maxBodyBytes: schema.number().optional()
+        },
+        async execute({ tabId, requestId, index, includeBody, maxBodyBytes }, ctx2) {
+          const data = await toolRequest("network_get", { tabId, requestId, index, includeBody, maxBodyBytes });
+          return toolResultText(data, "{}");
+        }
+      }),
+      browser_profile_status: tool({
+        description: "Return Iris profile gating status for the active Chrome profile.",
+        args: {},
+        async execute(args, ctx2) {
+          const data = await toolRequest("get_profile_status", {});
+          return toolResultText(data, "{}");
+        }
+      }),
+      browser_webmcp_status: tool({
+        description: "Detect WebMCP/native model context signals on the current page.",
+        args: {
+          tabId: schema.number().optional()
+        },
+        async execute({ tabId }, ctx2) {
+          const data = await toolRequest("get_webmcp_status", { tabId });
+          return toolResultText(data, "{}");
         }
       })
     }

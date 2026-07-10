@@ -51,18 +51,26 @@ CLI:
 - `browser_navigate` - Navigate a tab to a URL.
 - `browser_click` - Click an element by selector.
 - `browser_type` - Type into an input or editable element.
+- `browser_press` - Press a key (Enter/Tab/Escape/arrows/char) with optional modifiers and focus selector.
 - `browser_select` - Choose an option in a native `<select>`.
 - `browser_scroll` - Scroll the page or an element.
 - `browser_wait` - Sleep for a specified duration.
+- `browser_wait_for` - Wait for a selector, text, page-text regex, URL pattern, or network idle.
 - `browser_query` - Read page text, attributes, properties, or selector matches.
 - `browser_snapshot` - Capture the accessibility tree snapshot.
-- `browser_screenshot` - Capture a screenshot.
+- `browser_screenshot` - Capture a visible, full-page, selector, or clipped screenshot.
 - `browser_download` - Download a file by URL or click path.
 - `browser_list_downloads` - List recent downloads.
 - `browser_set_file_input` - Populate a file input from a local path.
 - `browser_highlight` - Visually mark an element for debugging.
 - `browser_console` - Read console log entries.
 - `browser_errors` - Read JavaScript errors from the page.
+- `browser_network_start` - Start debugger-backed network capture for a tab.
+- `browser_network_list` - List captured requests with redacted headers.
+- `browser_network_get` - Inspect one captured request; response bodies are opt-in.
+- `browser_network_stop` - Stop network capture while retaining records until cleared.
+- `browser_profile_status` - Return Iris profile gating status.
+- `browser_webmcp_status` - Detect WebMCP/native model context signals on the current page.
 
 ## Selector Strategy
 
@@ -92,6 +100,25 @@ After every action, verify with a cheap read:
 browser_click selector="text:Submit" timeoutMs=3000
 browser_query mode=page_text pattern="Success|Error|Dashboard"
 ```
+
+Prefer condition-based waits over fixed sleeps:
+
+```text
+browser_wait_for selector="text:Dashboard" state="visible" timeoutMs=10000
+browser_wait_for urlPattern="/settings" timeoutMs=10000
+browser_wait_for state="networkidle" networkIdleMs=500 timeoutMs=15000
+```
+
+For web app debugging, start network capture before the action that matters:
+
+```text
+browser_network_start clear=true
+browser_click selector="text:Save" timeoutMs=5000
+browser_wait_for state="networkidle" networkIdleMs=500 timeoutMs=15000
+browser_network_list filter="/api/" limit=50
+```
+
+Headers are redacted by default. Response bodies are opt-in with `browser_network_get includeBody=true`, and sensitive JSON fields are redacted before return; still avoid dumping secrets into logs.
 
 Report:
 

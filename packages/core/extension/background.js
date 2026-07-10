@@ -19,10 +19,13 @@ let connectionAttempts = 0
 let nativePermissionHintLogged = false
 let reconnectTimer = null
 let connectPromise = null
+let lastInboundAt = 0
+let sawPingOnPort = false
 
 // Debugger state management for console/error capture
 const debuggerState = new Map()
 const MAX_LOG_ENTRIES = 1000
+const MAX_NETWORK_ENTRIES = 1000
 
 function normalizeAllowlist(value) {
   if (!Array.isArray(value)) return []
@@ -148,11 +151,8 @@ async function injectWebMCPToken(origin, token) {
   }
 }
 
-async function toolGetWebMCPStatus() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-  if (!tab?.id) {
-    return { detected: false, error: "No active tab" }
-  }
+async function toolGetWebMCPStatus({ tabId } = {}) {
+  const tab = await getTabById(tabId)
   
   try {
     const results = await chrome.scripting.executeScript({
@@ -289,20 +289,259 @@ async function ensureDebuggerAttached(tabId) {
     }
   }
 
-  if (debuggerState.has(tabId)) return debuggerState.get(tabId)
+  let state = debuggerState.get(tabId)
+  if (!state) {
+    state = {
+      attached: false,
+      consoleMessages: [],
+      pageErrors: [],
+      enabledDomains: new Set(),
+      network: null,
+    }
+    debuggerState.set(tabId, state)
+  }
 
-  const state = { attached: false, consoleMessages: [], pageErrors: [] }
-  debuggerState.set(tabId, state)
+  if (state.attached) {
+    await ensureDebuggerDomain(tabId, state, "Runtime")
+    return state
+  }
+
+  state.enabledDomains = new Set()
+  if (state.network) state.network.enabled = false
 
   try {
     await chrome.debugger.attach({ tabId }, "1.3")
-    await chrome.debugger.sendCommand({ tabId }, "Runtime.enable")
     state.attached = true
+    await ensureDebuggerDomain(tabId, state, "Runtime")
   } catch (e) {
-    console.warn("[OpenCode] Failed to attach debugger:", e.message || e)
+    state.unavailableReason = e?.message || String(e)
+    console.warn("[Iris] Failed to attach debugger:", e.message || e)
   }
 
   return state
+}
+
+async function ensureDebuggerDomain(tabId, state, domain) {
+  if (!state.enabledDomains) state.enabledDomains = new Set()
+  if (state.enabledDomains.has(domain)) return
+  await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`)
+  state.enabledDomains.add(domain)
+}
+
+async function sendDebuggerCommand(tabId, method, params = {}) {
+  const state = await ensureDebuggerAttached(tabId)
+  if (!state.attached) {
+    throw new Error(state.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+  return await chrome.debugger.sendCommand({ tabId }, method, params)
+}
+
+function makeNetworkState(maxEntries = MAX_NETWORK_ENTRIES) {
+  return {
+    enabled: false,
+    maxEntries: clampNumber(maxEntries, 1, 5000, MAX_NETWORK_ENTRIES),
+    requests: new Map(),
+    order: [],
+    startedAt: Date.now(),
+    lastEventAt: Date.now(),
+  }
+}
+
+function getNetworkState(state, options = {}) {
+  if (!state.network) state.network = makeNetworkState(options.maxEntries)
+  if (Number.isFinite(options.maxEntries)) {
+    state.network.maxEntries = clampNumber(options.maxEntries, 1, 5000, MAX_NETWORK_ENTRIES)
+  }
+  return state.network
+}
+
+function redactHeaders(headers) {
+  if (!headers || typeof headers !== "object") return {}
+  const out = {}
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase()
+    if (
+      lower === "authorization" ||
+      lower === "proxy-authorization" ||
+      lower === "cookie" ||
+      lower === "set-cookie" ||
+      lower.includes("api-key") ||
+      lower.includes("token")
+    ) {
+      out[key] = "[redacted]"
+    } else {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+const NETWORK_BODY_SECRET_KEY =
+  /(?:^|[_-])(?:password|secret|token|authorization|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|cookie)$/i
+
+function redactNetworkBody(text) {
+  if (typeof text !== "string") return { text: "", redacted: false }
+  const trimmed = text.trim()
+  const looksLikeJson =
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  if (!looksLikeJson) return { text, redacted: false }
+
+  let value
+  try {
+    value = JSON.parse(trimmed)
+  } catch {
+    return { text, redacted: false }
+  }
+
+  let redacted = false
+  const scrub = (entry) => {
+    if (!entry || typeof entry !== "object") return
+    if (Array.isArray(entry)) {
+      for (const item of entry) scrub(item)
+      return
+    }
+
+    for (const [key, child] of Object.entries(entry)) {
+      const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/\s+/g, "_")
+      if (NETWORK_BODY_SECRET_KEY.test(normalizedKey)) {
+        entry[key] = "[redacted]"
+        redacted = true
+      } else {
+        scrub(child)
+      }
+    }
+  }
+
+  scrub(value)
+  return { text: redacted ? JSON.stringify(value) : text, redacted }
+}
+
+function getOrCreateNetworkRecord(network, requestId) {
+  let record = network.requests.get(requestId)
+  if (!record) {
+    record = {
+      requestId,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      finished: false,
+      failed: false,
+    }
+    network.requests.set(requestId, record)
+    network.order.push(requestId)
+  }
+
+  while (network.order.length > network.maxEntries) {
+    const oldest = network.order.shift()
+    if (oldest) network.requests.delete(oldest)
+  }
+
+  network.lastEventAt = Date.now()
+  record.updatedAt = network.lastEventAt
+  return record
+}
+
+function handleNetworkEvent(state, method, params = {}) {
+  const network = state.network
+  if (!network?.enabled) return
+  const requestId = params.requestId
+  if (!requestId) return
+
+  const record = getOrCreateNetworkRecord(network, requestId)
+
+  if (method === "Network.requestWillBeSent") {
+    record.url = params.request?.url || record.url
+    record.method = params.request?.method || record.method
+    record.type = params.type || record.type
+    record.documentURL = params.documentURL || record.documentURL
+    record.frameId = params.frameId || record.frameId
+    record.loaderId = params.loaderId || record.loaderId
+    record.initiator = params.initiator || record.initiator
+    record.timestamp = params.timestamp
+    record.wallTime = params.wallTime
+    record.requestHeaders = redactHeaders(params.request?.headers)
+    record.finished = false
+    record.failed = false
+  }
+
+  if (method === "Network.responseReceived") {
+    record.url = params.response?.url || record.url
+    record.type = params.type || record.type
+    record.status = params.response?.status
+    record.statusText = params.response?.statusText
+    record.mimeType = params.response?.mimeType
+    record.protocol = params.response?.protocol
+    record.remoteIPAddress = params.response?.remoteIPAddress
+    record.remotePort = params.response?.remotePort
+    record.fromDiskCache = !!params.response?.fromDiskCache
+    record.fromServiceWorker = !!params.response?.fromServiceWorker
+    record.encodedDataLength = params.response?.encodedDataLength
+    record.responseHeaders = redactHeaders(params.response?.headers)
+    record.responseTimestamp = params.timestamp
+  }
+
+  if (method === "Network.loadingFinished") {
+    record.finished = true
+    record.failed = false
+    record.finishedAt = Date.now()
+    record.encodedDataLength = params.encodedDataLength ?? record.encodedDataLength
+  }
+
+  if (method === "Network.loadingFailed") {
+    record.finished = true
+    record.failed = true
+    record.finishedAt = Date.now()
+    record.errorText = params.errorText
+    record.canceled = !!params.canceled
+    record.blockedReason = params.blockedReason
+    record.corsErrorStatus = params.corsErrorStatus
+  }
+}
+
+async function ensureNetworkEnabled(tabId, options = {}) {
+  const state = await ensureDebuggerAttached(tabId)
+  if (!state.attached) {
+    throw new Error(state.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+
+  const network = getNetworkState(state, options)
+  if (options.clear) {
+    network.requests.clear()
+    network.order = []
+    network.startedAt = Date.now()
+    network.lastEventAt = Date.now()
+  }
+
+  if (!network.enabled) {
+    await ensureDebuggerDomain(tabId, state, "Network")
+    network.enabled = true
+  }
+
+  return { state, network }
+}
+
+function serializeNetworkRecord(record, includeHeaders = false) {
+  const out = {
+    requestId: record.requestId,
+    url: record.url,
+    method: record.method,
+    type: record.type,
+    status: record.status,
+    statusText: record.statusText,
+    mimeType: record.mimeType,
+    finished: !!record.finished,
+    failed: !!record.failed,
+    errorText: record.errorText,
+    encodedDataLength: record.encodedDataLength,
+    fromDiskCache: !!record.fromDiskCache,
+    fromServiceWorker: !!record.fromServiceWorker,
+    startedAt: record.startedAt,
+    updatedAt: record.updatedAt,
+  }
+  if (includeHeaders) {
+    out.requestHeaders = record.requestHeaders || {}
+    out.responseHeaders = record.responseHeaders || {}
+  }
+  return out
 }
 
 if (chrome.debugger?.onEvent) {
@@ -336,6 +575,10 @@ if (chrome.debugger?.onEvent) {
         timestamp: Date.now(),
       })
     }
+
+    if (method.startsWith("Network.")) {
+      handleNetworkEvent(state, method, params)
+    }
   })
 }
 
@@ -344,6 +587,8 @@ if (chrome.debugger?.onDetach) {
     if (debuggerState.has(source.tabId)) {
       const state = debuggerState.get(source.tabId)
       state.attached = false
+      state.enabledDomains = new Set()
+      if (state.network) state.network.enabled = false
     }
   })
 }
@@ -358,8 +603,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === KEEPALIVE_ALARM) {
-    if (!isConnected) connect().catch(() => {})
+  if (alarm.name !== KEEPALIVE_ALARM) return
+  if (!isConnected) {
+    connect().catch(() => {})
+    return
+  }
+  const silentMs = Date.now() - lastInboundAt
+  // Broker pings keep the service worker warm; old brokers fall back to config probes without reconnect loops.
+  if (sawPingOnPort && silentMs > 50000) {
+    console.warn("[Iris] No broker traffic for", silentMs, "ms; reconnecting")
+    connect().catch(() => {})
+  } else if (!sawPingOnPort && silentMs > 60000) {
+    syncConfigFromNativeHost()
   }
 })
 
@@ -401,7 +656,7 @@ async function connectOnce() {
     updateBadge(false)
     if (!nativePermissionHintLogged) {
       nativePermissionHintLogged = true
-      console.log(`[OpenCode] Native messaging permission not granted. ${PERMISSION_HINT}`)
+      console.log(`[Iris] Native messaging permission not granted. ${PERMISSION_HINT}`)
     }
     return
   }
@@ -413,7 +668,7 @@ async function connectOnce() {
 
     port.onMessage.addListener((message) => {
       handleMessage(message).catch((e) => {
-        console.error("[OpenCode] Message handler error:", e)
+        console.error("[Iris] Message handler error:", e)
       })
     })
 
@@ -426,22 +681,23 @@ async function connectOnce() {
       if (err?.message) {
         connectionAttempts++
         if (connectionAttempts === 1) {
-          console.log("[OpenCode] Native host not available. Run: iris install")
+          console.log("[Iris] Native host not available. Run: iris install")
         } else if (connectionAttempts % 20 === 0) {
-          console.log("[OpenCode] Still waiting for native host...")
+          console.log("[Iris] Still waiting for native host...")
         }
       }
       scheduleReconnect(Math.min(15000, 1000 + connectionAttempts * 500))
     })
 
-    isConnected = true
-    connectionAttempts = 0
-    updateBadge(true)
+    isConnected = false
+    lastInboundAt = Date.now()
+    sawPingOnPort = false
+    updateBadge(false)
     syncConfigFromNativeHost().catch(() => {})
   } catch (e) {
     isConnected = false
     updateBadge(false)
-    console.error("[OpenCode] connectNative failed:", e)
+    console.error("[Iris] connectNative failed:", e)
     scheduleReconnect(5000)
   }
 }
@@ -461,8 +717,22 @@ function send(message) {
   }
 }
 
+function isBrokerSourcedMessage(message) {
+  const t = message?.type
+  return t === "ping" || t === "tool_request" || t === "reload"
+}
+
 async function handleMessage(message) {
   if (!message || typeof message !== "object") return
+  lastInboundAt = Date.now()
+  if (message.type === "ping") {
+    sawPingOnPort = true
+  }
+  if (!isConnected && isBrokerSourcedMessage(message)) {
+    isConnected = true
+    connectionAttempts = 0
+    updateBadge(true)
+  }
 
   if (message.type === "tool_request") {
     await handleToolRequest(message)
@@ -473,33 +743,18 @@ async function handleMessage(message) {
     const allowlist = normalizeAllowlist(cfg.profileEmails)
     await chrome.storage.local.set({ [ALLOWLIST_STORAGE_KEY]: allowlist })
     profileVerified = false // re-verify on next tool call with fresh allowlist
+  } else if (message.type === "reload") {
+    try {
+      chrome.runtime.reload()
+    } catch {}
   }
 }
 
 async function syncConfigFromNativeHost() {
   if (!port) return
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, 3000)
-    const handler = (message) => {
-      if (message && message.type === "config_response") {
-        port.onMessage.removeListener(handler)
-        clearTimeout(timeout)
-        const cfg = message.config || {}
-        const allowlist = normalizeAllowlist(cfg.profileEmails)
-        chrome.storage.local.set({ [ALLOWLIST_STORAGE_KEY]: allowlist })
-        profileVerified = false // re-verify on next tool call with fresh allowlist
-        resolve()
-      }
-    }
-    port.onMessage.addListener(handler)
-    try {
-      port.postMessage({ type: "get_config", id: crypto.randomUUID() })
-    } catch {
-      clearTimeout(timeout)
-      port.onMessage.removeListener(handler)
-      resolve()
-    }
-  })
+  try {
+    port.postMessage({ type: "get_config", id: crypto.randomUUID() })
+  } catch {}
 }
 async function handleToolRequest(request) {
   const { id, tool, args } = request
@@ -530,18 +785,24 @@ async function executeTool(toolName, args) {
     navigate: toolNavigate,
     click: toolClick,
     type: toolType,
+    press: toolPress,
     select: toolSelect,
     screenshot: toolScreenshot,
     snapshot: toolSnapshot,
     query: toolQuery,
     scroll: toolScroll,
     wait: toolWait,
+    wait_for: toolWaitFor,
     download: toolDownload,
     list_downloads: toolListDownloads,
     set_file_input: toolSetFileInput,
     highlight: toolHighlight,
     console: toolConsole,
     errors: toolErrors,
+    network_start: toolNetworkStart,
+    network_stop: toolNetworkStop,
+    network_list: toolNetworkList,
+    network_get: toolNetworkGet,
     get_profile_status: toolGetProfileStatus,
     get_webmcp_status: toolGetWebMCPStatus,
   }
@@ -936,6 +1197,71 @@ async function pageOps(command, args) {
     }
   }
 
+  function matchesPattern(value, pattern, flags) {
+    if (!pattern) return false
+    try {
+      return new RegExp(pattern, flags || "").test(value)
+    } catch {
+      return safeString(value).includes(pattern)
+    }
+  }
+
+  function elementRect(el) {
+    const rect = el.getBoundingClientRect()
+    return {
+      x: rect.x,
+      y: rect.y,
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+      pageX: rect.left + window.scrollX,
+      pageY: rect.top + window.scrollY,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    }
+  }
+
+  function waitCondition(selectors, state, text, urlPattern, pattern, flags, index) {
+    const targetState = safeString(state || "").toLowerCase()
+    const hasSelector = selectors.length > 0
+
+    if (hasSelector) {
+      const match = resolveMatchesOnce(selectors, index)
+      const visible = match.matches.filter(isVisible)
+      if (targetState === "hidden") {
+        return { ok: true, matched: !match.matches.length || visible.length === 0, selectorUsed: match.selectorUsed }
+      }
+      if (targetState === "detached") {
+        return { ok: true, matched: match.matches.length === 0, selectorUsed: match.selectorUsed }
+      }
+      if (targetState === "attached") {
+        return { ok: true, matched: match.matches.length > 0, selectorUsed: match.selectorUsed }
+      }
+      return { ok: true, matched: visible.length > 0, selectorUsed: match.selectorUsed }
+    }
+
+    if (typeof text === "string" && text) {
+      const pageText = safeString(document.body?.innerText || "")
+      return { ok: true, matched: pageText.includes(text) }
+    }
+
+    if (typeof pattern === "string" && pattern) {
+      const pageText = safeString(document.body?.innerText || "")
+      return { ok: true, matched: matchesPattern(pageText, pattern, flags) }
+    }
+
+    if (typeof urlPattern === "string" && urlPattern) {
+      return { ok: true, matched: matchesPattern(location.href, urlPattern, flags) || location.href.includes(urlPattern) }
+    }
+
+    return { ok: false, error: "selector, text, pattern, or urlPattern is required" }
+  }
+
   const mode = typeof options.mode === "string" && options.mode ? options.mode : "text"
   const selectors = normalizeSelectorList(options.selector)
   const index = Number.isFinite(options.index) ? options.index : 0
@@ -944,6 +1270,22 @@ async function pageOps(command, args) {
   const limit = Number.isFinite(options.limit) ? options.limit : mode === "page_text" ? 20000 : 50
   const pattern = typeof options.pattern === "string" ? options.pattern : null
   const flags = typeof options.flags === "string" ? options.flags : "i"
+
+  if (command === "rect") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+
+    try {
+      match.chosen.scrollIntoView({ block: "center", inline: "center" })
+    } catch {}
+
+    const rect = elementRect(match.chosen)
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), rect.viewportWidth - 1)
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), rect.viewportHeight - 1)
+    return { ok: true, selectorUsed: match.selectorUsed, x, y }
+  }
 
   if (command === "click") {
     const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
@@ -976,6 +1318,12 @@ async function pageOps(command, args) {
     if (isTextInput) {
       if (shouldClear) setNativeValue(match.chosen, "")
       setNativeValue(match.chosen, (match.chosen.value || "") + text)
+      for (const ch of String(text)) {
+        const opts = { key: ch, bubbles: true, cancelable: true }
+        match.chosen.dispatchEvent(new KeyboardEvent("keydown", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keypress", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keyup", opts))
+      }
       match.chosen.dispatchEvent(new Event("input", { bubbles: true }))
       match.chosen.dispatchEvent(new Event("change", { bubbles: true }))
       return { ok: true, selectorUsed: match.selectorUsed }
@@ -988,11 +1336,61 @@ async function pageOps(command, args) {
       } catch {
         match.chosen.textContent = (match.chosen.textContent || "") + text
       }
+      for (const ch of String(text)) {
+        const opts = { key: ch, bubbles: true, cancelable: true }
+        match.chosen.dispatchEvent(new KeyboardEvent("keydown", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keypress", opts))
+        match.chosen.dispatchEvent(new KeyboardEvent("keyup", opts))
+      }
       match.chosen.dispatchEvent(new Event("input", { bubbles: true }))
       return { ok: true, selectorUsed: match.selectorUsed }
     }
 
     return { ok: false, error: `Element is not typable: ${match.selectorUsed} (${tag.toLowerCase()})` }
+  }
+
+  if (command === "focus") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    try {
+      match.chosen.scrollIntoView({ block: "center", inline: "center" })
+      match.chosen.focus()
+    } catch {}
+    return { ok: true, selectorUsed: match.selectorUsed }
+  }
+
+  if (command === "press") {
+    const key = safeString(options.key)
+    if (!key) return { ok: false, error: "key is required" }
+    const modifiers = Array.isArray(options.modifiers) ? options.modifiers.map(safeString).filter(Boolean) : []
+    let selectorUsed = ""
+    if (selectors.length) {
+      const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+      if (!match.chosen) {
+        return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+      }
+      try {
+        match.chosen.scrollIntoView({ block: "center", inline: "center" })
+        match.chosen.focus()
+      } catch {}
+      selectorUsed = match.selectorUsed
+    }
+    const mod = {
+      altKey: modifiers.some((m) => /^alt$/i.test(m)),
+      ctrlKey: modifiers.some((m) => /^(control|ctrl)$/i.test(m)),
+      metaKey: modifiers.some((m) => /^(meta|command|cmd)$/i.test(m)),
+      shiftKey: modifiers.some((m) => /^shift$/i.test(m)),
+    }
+    const target = document.activeElement || document.body
+    const opts = { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, bubbles: true, cancelable: true, ...mod }
+    try {
+      target.dispatchEvent(new KeyboardEvent("keydown", opts))
+      target.dispatchEvent(new KeyboardEvent("keypress", opts))
+      target.dispatchEvent(new KeyboardEvent("keyup", opts))
+    } catch (e) {
+      return { ok: false, error: e?.message || String(e) }
+    }
+    return { ok: true, key, selectorUsed, method: "dom" }
   }
 
   if (command === "select") {
@@ -1116,6 +1514,14 @@ async function pageOps(command, args) {
     return { ok: true, selectorUsed: match.selectorUsed, count: dt.files.length, names }
   }
 
+  if (command === "element_rect") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+    return { ok: true, selectorUsed: match.selectorUsed, rect: elementRect(match.chosen) }
+  }
+
   if (command === "scroll") {
     const scrollX = Number.isFinite(options.x) ? options.x : 0
     const scrollY = Number.isFinite(options.y) ? options.y : 0
@@ -1133,6 +1539,25 @@ async function pageOps(command, args) {
     return { ok: true }
   }
 
+  if (command === "wait_for") {
+    const endAt = Date.now() + timeoutMs
+    const state = options.state || (selectors.length ? "visible" : "")
+    const text = typeof options.text === "string" ? options.text : null
+    const urlPattern = typeof options.urlPattern === "string" ? options.urlPattern : null
+
+    while (true) {
+      const result = waitCondition(selectors, state, text, urlPattern, pattern, flags, index)
+      if (!result.ok) return result
+      if (result.matched) {
+        return { ok: true, matched: true, selectorUsed: result.selectorUsed || null }
+      }
+      if (Date.now() >= endAt) {
+        return { ok: false, error: "Timed out waiting for condition" }
+      }
+      await new Promise((r) => setTimeout(r, pollMs))
+    }
+  }
+
   if (command === "highlight") {
     const duration = Number.isFinite(options.duration) ? options.duration : 3000
     const color = typeof options.color === "string" ? options.color : "#ff0000"
@@ -1147,12 +1572,12 @@ async function pageOps(command, args) {
     const rect = el.getBoundingClientRect()
 
     // Remove any existing highlight overlay
-    const existing = document.getElementById("__opc_highlight_overlay")
+    const existing = document.getElementById("__iris_highlight_overlay")
     if (existing) existing.remove()
 
     // Create overlay
     const overlay = document.createElement("div")
-    overlay.id = "__opc_highlight_overlay"
+    overlay.id = "__iris_highlight_overlay"
     overlay.style.cssText = `
       position: fixed;
       top: ${rect.top}px;
@@ -1316,6 +1741,17 @@ async function toolClick({ selector, tabId, index = 0, timeoutMs, pollMs }) {
   if (!selector) throw new Error("Selector is required")
   const tab = await getTabById(tabId)
 
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
+    if (!point?.ok) throw new Error(point?.error || "Click failed")
+    const mouse = { x: point.x, y: point.y, button: "left", clickCount: 1 }
+    await sendDebuggerCommand(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", ...mouse })
+    await sendDebuggerCommand(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", ...mouse })
+    const used = point.selectorUsed || selector
+    return { tabId: tab.id, content: `Clicked ${used}` }
+  }
+
   const result = await runInPage(tab.id, "click", { selector, index, timeoutMs, pollMs })
   if (!result?.ok) throw new Error(result?.error || "Click failed")
   const used = result.selectorUsed || selector
@@ -1331,6 +1767,62 @@ async function toolType({ selector, text, tabId, clear = false, index = 0, timeo
   if (!result?.ok) throw new Error(result?.error || "Type failed")
   const used = result.selectorUsed || selector
   return { tabId: tab.id, content: `Typed "${text}" into ${used}` }
+}
+
+function cdpKeyModifiers(modList) {
+  let bits = 0
+  for (const m of modList) {
+    if (/^alt$/i.test(m)) bits |= 1
+    else if (/^(control|ctrl)$/i.test(m)) bits |= 2
+    else if (/^(meta|command|cmd)$/i.test(m)) bits |= 4
+    else if (/^shift$/i.test(m)) bits |= 8
+  }
+  return bits
+}
+
+function cdpKeyFields(key) {
+  const k = String(key)
+  const vk = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8 }[k]
+  let code = k
+  if (k.length === 1 && /[a-zA-Z]/.test(k)) code = `Key${k.toUpperCase()}`
+  else if (k.length === 1 && /[0-9]/.test(k)) code = `Digit${k}`
+  const out = { key: k, code }
+  if (vk != null) {
+    out.windowsVirtualKeyCode = vk
+    out.nativeVirtualKeyCode = vk
+  }
+  return out
+}
+
+async function toolPress({ key, modifiers, selector, tabId, index = 0, timeoutMs, pollMs } = {}) {
+  if (!key || typeof key !== "string" || !key.trim()) throw new Error("key is required")
+  const tab = await getTabById(tabId)
+  const modList = Array.isArray(modifiers) ? modifiers.map(String) : []
+
+  if (selector) {
+    const focusResult = await runInPage(tab.id, "focus", { selector, index, timeoutMs, pollMs })
+    if (!focusResult?.ok) throw new Error(focusResult?.error || "Focus failed")
+  }
+
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    const fields = cdpKeyFields(key.trim())
+    const mods = cdpKeyModifiers(modList)
+    await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: mods, ...fields })
+    await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: mods, ...fields })
+    return { tabId: tab.id, content: `Pressed ${key.trim()}` }
+  }
+
+  const result = await runInPage(tab.id, "press", {
+    key: key.trim(),
+    modifiers: modList,
+    selector,
+    index,
+    timeoutMs,
+    pollMs,
+  })
+  if (!result?.ok) throw new Error(result?.error || "Press failed")
+  return { tabId: tab.id, content: `Pressed ${key.trim()}` }
 }
 
 async function toolSelect({ selector, value, label, optionIndex, tabId, index = 0, timeoutMs, pollMs }) {
@@ -1349,10 +1841,98 @@ async function toolSelect({ selector, value, label, optionIndex, tabId, index = 
   return { tabId: tab.id, content: `Selected ${summary || "option"} in ${used}` }
 }
 
-async function toolScreenshot({ tabId }) {
+function normalizeScreenshotFormat(value) {
+  const format = typeof value === "string" ? value.trim().toLowerCase() : "png"
+  if (format === "jpeg" || format === "jpg") return "jpeg"
+  if (format === "webp") return "webp"
+  return "png"
+}
+
+function screenshotMime(format) {
+  if (format === "jpeg") return "image/jpeg"
+  if (format === "webp") return "image/webp"
+  return "image/png"
+}
+
+async function getElementScreenshotClip(tabId, selector, index = 0, timeoutMs, pollMs) {
+  const result = await runInPage(tabId, "element_rect", { selector, index, timeoutMs, pollMs })
+  if (!result?.ok) throw new Error(result?.error || "Failed to resolve screenshot element")
+  const rect = result.rect || {}
+  const width = Math.max(1, Math.ceil(rect.width || 0))
+  const height = Math.max(1, Math.ceil(rect.height || 0))
+  return {
+    x: Math.max(0, Math.floor(rect.pageX || 0)),
+    y: Math.max(0, Math.floor(rect.pageY || 0)),
+    width,
+    height,
+    scale: 1,
+  }
+}
+
+async function toolScreenshot({
+  tabId,
+  fullPage = false,
+  selector,
+  index = 0,
+  x,
+  y,
+  width,
+  height,
+  format,
+  quality,
+  timeoutMs,
+  pollMs,
+} = {}) {
   const tab = await getTabById(tabId)
-  const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
-  return { tabId: tab.id, content: png }
+  const screenshotFormat = normalizeScreenshotFormat(format)
+  const hasManualClip = [x, y, width, height].every((value) => Number.isFinite(value))
+  const hasSelectorClip = typeof selector === "string" && selector.trim()
+
+  if (!fullPage && !hasManualClip && !hasSelectorClip && screenshotFormat === "png" && !Number.isFinite(quality)) {
+    const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
+    return { tabId: tab.id, content: png }
+  }
+
+  const debuggerStateForTab = await ensureDebuggerAttached(tab.id)
+  if (!debuggerStateForTab.attached) {
+    throw new Error(debuggerStateForTab.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+  await ensureDebuggerDomain(tab.id, debuggerStateForTab, "Page")
+
+  let clip = null
+  if (hasSelectorClip) {
+    clip = await getElementScreenshotClip(tab.id, selector.trim(), index, timeoutMs, pollMs)
+  } else if (hasManualClip) {
+    clip = {
+      x: Math.max(0, Number(x)),
+      y: Math.max(0, Number(y)),
+      width: Math.max(1, Number(width)),
+      height: Math.max(1, Number(height)),
+      scale: 1,
+    }
+  } else if (fullPage) {
+    const metrics = await sendDebuggerCommand(tab.id, "Page.getLayoutMetrics")
+    const size = metrics?.contentSize || {}
+    clip = {
+      x: 0,
+      y: 0,
+      width: Math.max(1, Math.ceil(size.width || 1)),
+      height: Math.max(1, Math.ceil(size.height || 1)),
+      scale: 1,
+    }
+  }
+
+  const params = {
+    format: screenshotFormat,
+    captureBeyondViewport: !!clip,
+  }
+  if (clip) params.clip = clip
+  if (Number.isFinite(quality) && screenshotFormat !== "png") {
+    params.quality = clampNumber(quality, 0, 100, 80)
+  }
+
+  const result = await sendDebuggerCommand(tab.id, "Page.captureScreenshot", params)
+  return { tabId: tab.id, content: `data:${screenshotMime(screenshotFormat)};base64,${result.data}` }
 }
 
 async function toolSnapshot({ tabId }) {
@@ -1454,8 +2034,11 @@ async function toolSnapshot({ tabId }) {
         }
 
         if (el.shadowRoot) {
-          const r = build(el.shadowRoot.host, depth + 1, uid)
-          uid = r.nextUid
+          for (const child of el.shadowRoot.children) {
+            const r = build(child, depth + 1, uid)
+            nodes.push(...r.nodes)
+            uid = r.nextUid
+          }
         }
 
         for (const child of el.children) {
@@ -1558,6 +2141,66 @@ async function toolScroll({ x = 0, y = 0, selector, tabId, timeoutMs, pollMs }) 
 async function toolWait({ ms = 1000, tabId }) {
   await new Promise((resolve) => setTimeout(resolve, ms))
   return { tabId, content: `Waited ${ms}ms` }
+}
+
+async function toolWaitFor({
+  selector,
+  text,
+  pattern,
+  urlPattern,
+  state,
+  networkIdleMs,
+  timeoutMs,
+  pollMs,
+  tabId,
+  index = 0,
+  flags,
+} = {}) {
+  const tab = await getTabById(tabId)
+  const timeout = clampNumber(timeoutMs, 0, 120000, 10000)
+  const poll = clampNumber(pollMs, 50, 5000, 200)
+  const wantsNetworkIdle =
+    state === "networkidle" ||
+    state === "network_idle" ||
+    Number.isFinite(networkIdleMs)
+
+  if (wantsNetworkIdle) {
+    const idleMs = clampNumber(networkIdleMs, 100, 30000, 500)
+    const { network } = await ensureNetworkEnabled(tab.id)
+    const startAt = Date.now()
+    const endAt = startAt + timeout
+
+    while (true) {
+      const now = Date.now()
+      const active = [...network.requests.values()].some((record) => {
+        return record.startedAt >= startAt && !record.finished && !record.failed
+      })
+      const quietFor = now - Math.max(network.lastEventAt || startAt, startAt)
+      if (!active && quietFor >= idleMs) {
+        return {
+          tabId: tab.id,
+          content: JSON.stringify({ ok: true, state: "networkidle", idleMs, quietFor }, null, 2),
+        }
+      }
+      if (now >= endAt) throw new Error("Timed out waiting for network idle")
+      await new Promise((resolve) => setTimeout(resolve, poll))
+    }
+  }
+
+  const result = await runInPage(tab.id, "wait_for", {
+    selector,
+    text,
+    pattern,
+    urlPattern,
+    state,
+    timeoutMs: timeout,
+    pollMs: poll,
+    index,
+    flags,
+  })
+
+  if (!result?.ok) throw new Error(result?.error || "Wait condition failed")
+  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -1721,6 +2364,117 @@ async function toolHighlight({ selector, tabId, index = 0, duration, color, show
   }
 }
 
+async function toolNetworkStart({ tabId, clear = true, maxEntries } = {}) {
+  const tab = await getTabById(tabId)
+  const { network } = await ensureNetworkEnabled(tab.id, { clear, maxEntries })
+  return {
+    tabId: tab.id,
+    content: JSON.stringify(
+      {
+        ok: true,
+        enabled: network.enabled,
+        startedAt: network.startedAt,
+        count: network.order.length,
+        maxEntries: network.maxEntries,
+      },
+      null,
+      2
+    ),
+  }
+}
+
+async function toolNetworkStop({ tabId } = {}) {
+  const tab = await getTabById(tabId)
+  const state = await ensureDebuggerAttached(tab.id)
+  const network = state.network
+  if (state.attached && network?.enabled) {
+    try {
+      await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.disable")
+    } catch {}
+    network.enabled = false
+    state.enabledDomains?.delete?.("Network")
+  }
+  return {
+    tabId: tab.id,
+    content: JSON.stringify({ ok: true, enabled: false, count: network?.order?.length || 0 }, null, 2),
+  }
+}
+
+async function toolNetworkList({ tabId, limit = 100, includeHeaders = false, filter, clear = false } = {}) {
+  const tab = await getTabById(tabId)
+  const { network } = await ensureNetworkEnabled(tab.id, { clear: false })
+  const maxItems = clampNumber(limit, 1, 1000, 100)
+  const filterText = typeof filter === "string" && filter.trim() ? filter.trim().toLowerCase() : null
+  let records = network.order.map((id) => network.requests.get(id)).filter(Boolean)
+
+  if (filterText) {
+    records = records.filter((record) => {
+      const haystack = `${record.url || ""} ${record.method || ""} ${record.status || ""} ${record.type || ""}`.toLowerCase()
+      return haystack.includes(filterText)
+    })
+  }
+
+  const items = records.slice(-maxItems).map((record) => serializeNetworkRecord(record, includeHeaders))
+  const out = {
+    enabled: network.enabled,
+    startedAt: network.startedAt,
+    count: records.length,
+    items,
+  }
+
+  if (clear) {
+    network.requests.clear()
+    network.order = []
+    network.startedAt = Date.now()
+    network.lastEventAt = Date.now()
+  }
+
+  return { tabId: tab.id, content: JSON.stringify(out, null, 2) }
+}
+
+async function toolNetworkGet({ tabId, requestId, index, includeBody = false, maxBodyBytes = 200000 } = {}) {
+  const tab = await getTabById(tabId)
+  const { network } = await ensureNetworkEnabled(tab.id, { clear: false })
+  let id = typeof requestId === "string" && requestId ? requestId : null
+
+  if (!id && Number.isFinite(index)) {
+    id = network.order[index]
+  }
+  if (!id) {
+    id = network.order[network.order.length - 1]
+  }
+  if (!id) throw new Error("No network requests captured")
+
+  const record = network.requests.get(id)
+  if (!record) throw new Error(`Unknown requestId: ${id}`)
+
+  const out = serializeNetworkRecord(record, true)
+  out.initiator = record.initiator
+  out.documentURL = record.documentURL
+  out.frameId = record.frameId
+  out.loaderId = record.loaderId
+  out.protocol = record.protocol
+  out.remoteIPAddress = record.remoteIPAddress
+  out.remotePort = record.remotePort
+
+  if (includeBody) {
+    try {
+      const body = await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.getResponseBody", { requestId: id })
+      const limit = clampNumber(maxBodyBytes, 0, 5_000_000, 200000)
+      const rawBody = typeof body?.body === "string" ? body.body : ""
+      const redactedBody = body?.base64Encoded ? { text: rawBody, redacted: false } : redactNetworkBody(rawBody)
+      out.body = redactedBody.text.slice(0, limit)
+      out.base64Encoded = !!body?.base64Encoded
+      out.bodyTruncated = redactedBody.text.length > limit
+      if (redactedBody.redacted) out.bodyRedacted = true
+    } catch (error) {
+      out.bodyError = error?.message || String(error)
+    }
+  }
+
+  return { tabId: tab.id, content: JSON.stringify(out, null, 2) }
+}
+
 async function toolConsole({ tabId, clear = false, filter } = {}) {
   const tab = await getTabById(tabId)
   const state = await ensureDebuggerAttached(tab.id)
@@ -1790,9 +2544,9 @@ chrome.action.onClicked.addListener(async () => {
   if (!permissionResult.granted) {
     updateBadge(false)
     if (permissionResult.error) {
-      console.warn("[OpenCode] Permission request failed:", permissionResult.error)
+      console.warn("[Iris] Permission request failed:", permissionResult.error)
     } else {
-      console.warn("[OpenCode] Permission request denied.")
+      console.warn("[Iris] Permission request denied.")
     }
     return
   }
@@ -1800,7 +2554,7 @@ chrome.action.onClicked.addListener(async () => {
   if (permissionResult.requested) {
     const requestedPermissions = permissionResult.permissions.join(", ") || "none"
     const requestedOrigins = permissionResult.origins.join(", ") || "none"
-    console.log(`[OpenCode] Requested permissions -> permissions: ${requestedPermissions}; origins: ${requestedOrigins}`)
+    console.log(`[Iris] Requested permissions -> permissions: ${requestedPermissions}; origins: ${requestedOrigins}`)
   }
 
   await connect()

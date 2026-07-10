@@ -1,5 +1,5 @@
 import net from "net";
-import { BASE_DIR } from "../../core/src/paths.ts";
+import { BASE_DIR } from "@mizner/iris/paths";
 import { mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
@@ -25,6 +25,8 @@ const DEFAULT_PAGE_TEXT_LIMIT = 20000;
 const DEFAULT_LIST_LIMIT = 50;
 const DEFAULT_POLL_MS = 200;
 
+const SUPPORTED_AGENT_TOOLS =
+  "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press";
 const DEFAULT_DOWNLOADS_DIR = join(BASE_DIR, "downloads");
 
 export type AgentBackend = {
@@ -850,8 +852,28 @@ export function createAgentBackend(sessionId: string): AgentBackend {
           return { content: `Waited ${ms}ms` };
         });
       }
+      case "press": {
+        return await withTab(args.tabId, async () => {
+          if (!args.key) throw new Error("key is required");
+          const payload: Record<string, any> = { key: String(args.key) };
+          if (typeof args.selector === "string" && args.selector.trim()) payload.selector = args.selector.trim();
+          const mods = Array.isArray(args.modifiers) ? args.modifiers.map(String) : [];
+          if (mods.length) {
+            const norm = mods.map((m) => {
+              if (/^(control|ctrl)$/i.test(m)) return "Control";
+              if (/^alt$/i.test(m)) return "Alt";
+              if (/^(meta|command|cmd)$/i.test(m)) return "Meta";
+              if (/^shift$/i.test(m)) return "Shift";
+              return m;
+            });
+            payload.key = [...norm, payload.key].join("+");
+          }
+          await agentCommand("press", payload);
+          return { content: `Pressed ${args.key}` };
+        });
+      }
       default:
-        throw new Error(`Unsupported tool for agent backend: ${tool}`);
+        throw new Error(`Unsupported tool for agent backend: ${tool}. Supported: ${SUPPORTED_AGENT_TOOLS}`);
     }
   }
 
