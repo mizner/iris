@@ -2461,9 +2461,10 @@ async function toolNetworkGet({ tabId, requestId, index, includeBody = false, ma
       const rawBody = typeof body?.body === "string" ? body.body : ""
       const redactedBody = redactNetworkBody(rawBody, { base64Encoded: !!body?.base64Encoded })
       out.body = redactedBody.text.slice(0, limit)
-      out.base64Encoded = !!body?.base64Encoded
+      out.base64Encoded = !!redactedBody.base64Encoded
       out.bodyTruncated = redactedBody.text.length > limit
       if (redactedBody.redacted) out.bodyRedacted = true
+
     } catch (error) {
       out.bodyError = error?.message || String(error)
     }

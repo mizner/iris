@@ -2,8 +2,9 @@
  * Pure network redaction helpers shared by the extension service worker and Node tests.
  */
 
+/** Anchored secret key names (after camelCase → snake normalization). */
 export const NETWORK_BODY_SECRET_KEY =
-  /(?:^|[_-])(?:password|passwd|secret|token|authorization|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|cookie|credential|session)$/i;
+  /(?:^|[_-])(?:password|passwd|secret|token|authorization|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|cookie|credential|session(?:_?id)?)$/i;
 
 /**
  * @param {unknown} name
@@ -52,6 +53,27 @@ function normalizeSecretKey(key) {
 }
 
 /**
+ * Body keys: anchored secret names + session_id style (aligned with header session policy without matching tokenCount).
+ * @param {string} key
+ * @returns {boolean}
+ */
+export function isSensitiveBodyKey(key) {
+  const normalized = normalizeSecretKey(String(key));
+  if (NETWORK_BODY_SECRET_KEY.test(normalized)) return true;
+  const lower = normalized.toLowerCase();
+  // session_id / user_session_id / sessionId — not session_count / sessions_total
+  if (
+    lower === "session" ||
+    lower === "sessionid" ||
+    /(?:^|[_-])session[_-]?id$/.test(lower) ||
+    /(?:^|[_-])session$/.test(lower)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * @param {unknown} value
  * @returns {{ value: unknown, redacted: boolean }}
  */
@@ -64,7 +86,7 @@ function scrubJsonValue(value) {
       return;
     }
     for (const [key, child] of Object.entries(entry)) {
-      if (NETWORK_BODY_SECRET_KEY.test(normalizeSecretKey(key))) {
+      if (isSensitiveBodyKey(key)) {
         entry[key] = "[redacted]";
         redacted = true;
       } else {
@@ -77,7 +99,7 @@ function scrubJsonValue(value) {
 }
 
 /**
- * @param {string} text
+ * @param {string} text decoded or raw body text to inspect
  * @returns {{ text: string, redacted: boolean } | null}
  */
 function scrubJsonBody(text) {
@@ -94,7 +116,8 @@ function scrubJsonBody(text) {
   }
 
   const { value, redacted } = scrubJsonValue(parsed);
-  return { text: redacted ? JSON.stringify(value) : text, redacted };
+  // Always return decoded UTF-8 JSON text (not the original base64 input).
+  return { text: redacted ? JSON.stringify(value) : trimmed, redacted };
 }
 
 /**
@@ -105,7 +128,6 @@ function scrubFormBody(text) {
   const trimmed = text.trim();
   if (!trimmed.includes("=")) return null;
   if (/^\s*[\[{]/.test(trimmed)) return null;
-  // form-ish: key=value pairs joined by &
   if (!/^[^=\s]+=.*/.test(trimmed) && !trimmed.includes("&")) return null;
 
   const parts = trimmed.split("&");
@@ -122,15 +144,15 @@ function scrubFormBody(text) {
     } catch {
       // keep raw key
     }
-    if (NETWORK_BODY_SECRET_KEY.test(normalizeSecretKey(key))) {
+    if (isSensitiveBodyKey(key)) {
       redacted = true;
       return `${rawKey}=${encodeURIComponent("[redacted]")}`;
     }
     return `${rawKey}=${rawVal}`;
   });
 
-  if (!redacted) return { text, redacted: false };
-  return { text: out.join("&"), redacted: true };
+  // Return the (possibly decoded) form text, not a base64 original.
+  return { text: redacted ? out.join("&") : trimmed, redacted };
 }
 
 /**
@@ -163,32 +185,38 @@ function tryDecodeBase64Utf8(text) {
 /**
  * @param {unknown} text
  * @param {{ base64Encoded?: boolean }} [opts]
- * @returns {{ text: string, redacted: boolean }}
+ * @returns {{ text: string, redacted: boolean, base64Encoded: boolean }}
+ *   `base64Encoded` is true only when `text` is still the original base64 payload (not decoded UTF-8).
  */
 export function redactNetworkBody(text, opts = {}) {
-  const base64Encoded = !!opts.base64Encoded;
-  if (typeof text !== "string") return { text: "", redacted: false };
+  const inputWasBase64 = !!opts.base64Encoded;
+  if (typeof text !== "string") {
+    return { text: "", redacted: false, base64Encoded: false };
+  }
 
   let work = text;
-  let decodedFromBase64 = false;
-  if (base64Encoded) {
+  if (inputWasBase64) {
     const decoded = tryDecodeBase64Utf8(text);
-    if (decoded == null) return { text, redacted: false };
+    if (decoded == null) {
+      return { text, redacted: false, base64Encoded: true };
+    }
     work = decoded;
-    decodedFromBase64 = true;
   }
 
   const jsonResult = scrubJsonBody(work);
   if (jsonResult) {
-    return jsonResult;
+    return { text: jsonResult.text, redacted: jsonResult.redacted, base64Encoded: false };
   }
 
   const formResult = scrubFormBody(work);
-  if (formResult && formResult.redacted) {
-    return formResult;
+  if (formResult) {
+    // form path always returns decoded/plain form text
+    return { text: formResult.text, redacted: formResult.redacted, base64Encoded: false };
   }
 
-  // base64 that is not JSON/form: keep original base64 bytes on the wire
-  if (decodedFromBase64) return { text, redacted: false };
-  return { text: work, redacted: false };
+  // Not JSON/form: keep original base64 bytes if input was base64
+  if (inputWasBase64) {
+    return { text, redacted: false, base64Encoded: true };
+  }
+  return { text: work, redacted: false, base64Encoded: false };
 }
