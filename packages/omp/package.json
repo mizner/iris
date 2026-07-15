@@ -1,7 +1,7 @@
 {
-  "name": "@mizner/iris-mcp",
+  "name": "@mizner/iris-omp",
   "version": "4.8.0",
-  "description": "MCP stdio adapter for Iris browser automation.",
+  "description": "Oh My Pi (OMP) extension adapter for Iris browser automation.",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -10,24 +10,25 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mizner/iris.git",
-    "directory": "packages/mcp"
-  },
-  "bin": {
-    "iris-mcp": "./dist/server.js"
+    "directory": "packages/omp"
   },
   "files": [
     "dist",
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/server.ts --target=node --outfile=dist/server.js",
+    "build": "bun build src/extension.ts --target=node --outfile=dist/extension.js",
     "prepublishOnly": "bun run build"
   },
   "publishConfig": {
     "access": "public"
   },
+  "omp": {
+    "extensions": [
+      "./dist/extension.js"
+    ]
+  },
   "devDependencies": {
-    "@mizner/iris-opencode": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@mizner/iris-opencode": "workspace:*"
   }
 }

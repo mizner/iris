@@ -1,6 +1,15 @@
 # Changelog
 
 
+## Unreleased
+
+- Add `@mizner/iris-omp` Oh My Pi extension adapter (native `browser_*` tools via iris-opencode).
+- Mask password/sensitive field values in `browser_snapshot` and page_text input dumps.
+- Harden network header/body redaction (form-urlencoded, base64 JSON, credential/session headers); extract `extension/lib/network-redact.mjs` with unit tests.
+- Stamp `data-iris-uid` on snapshot nodes; accept `uid=` / `ref=` locators for click/type.
+- OMP extension races tool execution against AbortSignal so cancelled turns do not wait full broker timeout.
+
+
 ## 4.8.0
 
 - Added `browser_press` with CDP `Input.dispatchKeyEvent` when the debugger is attached and DOM `KeyboardEvent` fallback; `browser_type` now emits per-character key events.

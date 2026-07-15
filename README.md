@@ -47,9 +47,11 @@ The extension path is preferred because it keeps latency low and gives Iris acce
 - `packages/core` - CLI, broker, native messaging host, extension files, and runtime installer.
 - `packages/opencode` - OpenCode plugin that exposes the `browser_*` tools.
 - `packages/mcp` - stdio MCP adapter for clients that speak MCP.
+- `packages/omp` - Oh My Pi (OMP) extension adapter for native `browser_*` tools.
 - `packages/skill` - portable agent skill/instructions for using Iris safely.
 - `.opencode/skills/browser-automation` - optional OpenCode skill template for browser automation patterns.
 - `docs/reliability.md` - operational notes for keeping the local runtime healthy.
+
 
 ## Requirements
 
@@ -164,6 +166,32 @@ claude mcp add --scope user iris -- node /absolute/path/to/iris/packages/mcp/dis
 ```
 
 The OpenCode plugin and Claude MCP server can coexist; both talk to the same local Iris broker.
+
+## OMP Setup
+
+Build the OMP extension and link it into your OMP profile:
+
+```bash
+bun run --cwd packages/omp build
+omp plugin link /absolute/path/to/iris/packages/omp
+```
+
+Restart OMP (or open a new session). Iris tools such as `browser_status`, `browser_get_tabs`, and `browser_click` should be available alongside OMP’s built-in `browser` tool (headless/CDP). Prefer Iris `browser_*` for real Chrome profiles; use built-in `browser` for disposable automation.
+
+Helpers:
+
+```text
+/iris status
+/iris health
+/iris reconnect
+```
+
+When published:
+
+```bash
+omp plugin install @mizner/iris-omp
+```
+
 
 ## CLI Usage
 

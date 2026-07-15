@@ -1054,6 +1054,8 @@ function runtimeArtifactPairs() {
   return [
     { name: "extension/background.js", src: join(PACKAGE_ROOT, "extension", "background.js"), dst: join(EXTENSION_DIR, "background.js") },
     { name: "extension/manifest.json", src: join(PACKAGE_ROOT, "extension", "manifest.json"), dst: join(EXTENSION_DIR, "manifest.json") },
+    { name: "extension/lib/network-redact.mjs", src: join(PACKAGE_ROOT, "extension", "lib", "network-redact.mjs"), dst: join(EXTENSION_DIR, "lib", "network-redact.mjs") },
+
     { name: "broker.cjs", src: join(PACKAGE_ROOT, "bin", "broker.cjs"), dst: BROKER_DST },
     { name: "native-host.cjs", src: join(PACKAGE_ROOT, "bin", "native-host.cjs"), dst: NATIVE_HOST_DST },
     { name: "browser-cli.cjs", src: join(PACKAGE_ROOT, "bin", "browser-cli.cjs"), dst: BROWSER_CLI_DST },

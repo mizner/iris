@@ -1,4 +1,26 @@
 import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
+
+// src/extension.ts
+import { readFileSync as readFileSync3 } from "node:fs";
+import { dirname as dirname3, join as join4 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// ../opencode/dist/plugin.js
+import { createRequire as createRequire2 } from "node:module";
+import { homedir } from "os";
+import { join } from "path";
+import net2 from "net";
+import net from "net";
+import { mkdirSync, readFileSync } from "fs";
+import { tmpdir } from "os";
+import { basename, dirname, isAbsolute, join as join2, resolve } from "path";
+import { spawn } from "child_process";
+import { createRequire as createRequire22 } from "module";
+import { existsSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
+import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "path";
+import { spawn as spawn2 } from "child_process";
+import { fileURLToPath } from "url";
 var __defProp = Object.defineProperty;
 var __returnValue = (v) => v;
 function __exportSetter(name, newValue) {
@@ -13,9 +35,7 @@ var __export = (target, all) => {
       set: __exportSetter.bind(all, name)
     });
 };
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/external.js
+var __require2 = /* @__PURE__ */ createRequire2(import.meta.url);
 var exports_external = {};
 __export(exports_external, {
   xid: () => xid2,
@@ -244,8 +264,6 @@ __export(exports_external, {
   $input: () => $input,
   $brand: () => $brand
 });
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/index.js
 var exports_core2 = {};
 __export(exports_core2, {
   version: () => version,
@@ -508,8 +526,6 @@ __export(exports_core2, {
   $ZodArray: () => $ZodArray,
   $ZodAny: () => $ZodAny
 });
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
   status: "aborted"
 });
@@ -576,7 +592,6 @@ function config(newConfig) {
     Object.assign(globalConfig, newConfig);
   return globalConfig;
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/util.js
 var exports_util = {};
 __export(exports_util, {
   unwrapMessage: () => unwrapMessage,
@@ -1204,8 +1219,6 @@ function uint8ArrayToHex(bytes) {
 class Class {
   constructor(..._args) {}
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/errors.js
 var initializer = (inst, def) => {
   inst.name = "$ZodError";
   Object.defineProperty(inst, "_zod", {
@@ -1347,8 +1360,6 @@ function prettifyError(error) {
   return lines.join(`
 `);
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/parse.js
 var _parse = (_Err) => (schema, value, _ctx, _params) => {
   const ctx = _ctx ? Object.assign(_ctx, { async: false }) : { async: false };
   const result = schema._zod.run({ value, issues: [] }, ctx);
@@ -1435,7 +1446,6 @@ var _safeDecodeAsync = (_Err) => async (schema, value, _ctx) => {
   return _safeParseAsync(_Err)(schema, value, _ctx);
 };
 var safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync($ZodRealError);
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/regexes.js
 var exports_regexes = {};
 __export(exports_regexes, {
   xid: () => xid,
@@ -1586,8 +1596,6 @@ var sha384_base64url = /* @__PURE__ */ fixedBase64url(64);
 var sha512_hex = /^[0-9a-fA-F]{128}$/;
 var sha512_base64 = /* @__PURE__ */ fixedBase64(86, "==");
 var sha512_base64url = /* @__PURE__ */ fixedBase64url(86);
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/checks.js
 var $ZodCheck = /* @__PURE__ */ $constructor("$ZodCheck", (inst, def) => {
   var _a;
   inst._zod ?? (inst._zod = {});
@@ -2128,7 +2136,6 @@ var $ZodCheckOverwrite = /* @__PURE__ */ $constructor("$ZodCheckOverwrite", (ins
   };
 });
 
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/doc.js
 class Doc {
   constructor(args = []) {
     this.content = [];
@@ -2165,15 +2172,11 @@ class Doc {
 `));
   }
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/versions.js
 var version = {
   major: 4,
   minor: 1,
   patch: 8
 };
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/schemas.js
 var $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
   var _a;
   inst ?? (inst = {});
@@ -3996,7 +3999,6 @@ function handleRefineResult(result, payload, input, inst) {
     payload.issues.push(issue(_iss));
   }
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/index.js
 var exports_locales = {};
 __export(exports_locales, {
   zhTW: () => zh_TW_default,
@@ -4046,8 +4048,6 @@ __export(exports_locales, {
   az: () => az_default,
   ar: () => ar_default
 });
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ar.js
 var error = () => {
   const Sizable = {
     string: { unit: "حرف", verb: "أن يحوي" },
@@ -4163,7 +4163,6 @@ function ar_default() {
     localeError: error()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/az.js
 var error2 = () => {
   const Sizable = {
     string: { unit: "simvol", verb: "olmalıdır" },
@@ -4278,7 +4277,6 @@ function az_default() {
     localeError: error2()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/be.js
 function getBelarusianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -4442,7 +4440,6 @@ function be_default() {
     localeError: error3()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ca.js
 var error4 = () => {
   const Sizable = {
     string: { unit: "caràcters", verb: "contenir" },
@@ -4559,7 +4556,6 @@ function ca_default() {
     localeError: error4()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/cs.js
 var error5 = () => {
   const Sizable = {
     string: { unit: "znaků", verb: "mít" },
@@ -4694,7 +4690,6 @@ function cs_default() {
     localeError: error5()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/da.js
 var error6 = () => {
   const Sizable = {
     string: { unit: "tegn", verb: "havde" },
@@ -4825,7 +4820,6 @@ function da_default() {
     localeError: error6()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/de.js
 var error7 = () => {
   const Sizable = {
     string: { unit: "Zeichen", verb: "zu haben" },
@@ -4941,7 +4935,6 @@ function de_default() {
     localeError: error7()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/en.js
 var parsedType = (data) => {
   const t = typeof data;
   switch (t) {
@@ -5058,7 +5051,6 @@ function en_default() {
     localeError: error8()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/eo.js
 var parsedType2 = (data) => {
   const t = typeof data;
   switch (t) {
@@ -5174,7 +5166,6 @@ function eo_default() {
     localeError: error9()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/es.js
 var error10 = () => {
   const Sizable = {
     string: { unit: "caracteres", verb: "tener" },
@@ -5322,7 +5313,6 @@ function es_default() {
     localeError: error10()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/fa.js
 var error11 = () => {
   const Sizable = {
     string: { unit: "کاراکتر", verb: "داشته باشد" },
@@ -5444,7 +5434,6 @@ function fa_default() {
     localeError: error11()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/fi.js
 var error12 = () => {
   const Sizable = {
     string: { unit: "merkkiä", subject: "merkkijonon" },
@@ -5566,7 +5555,6 @@ function fi_default() {
     localeError: error12()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/fr.js
 var error13 = () => {
   const Sizable = {
     string: { unit: "caractères", verb: "avoir" },
@@ -5682,7 +5670,6 @@ function fr_default() {
     localeError: error13()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/fr-CA.js
 var error14 = () => {
   const Sizable = {
     string: { unit: "caractères", verb: "avoir" },
@@ -5799,7 +5786,6 @@ function fr_CA_default() {
     localeError: error14()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/he.js
 var error15 = () => {
   const Sizable = {
     string: { unit: "אותיות", verb: "לכלול" },
@@ -5915,7 +5901,6 @@ function he_default() {
     localeError: error15()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/hu.js
 var error16 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "legyen" },
@@ -6031,7 +6016,6 @@ function hu_default() {
     localeError: error16()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/id.js
 var error17 = () => {
   const Sizable = {
     string: { unit: "karakter", verb: "memiliki" },
@@ -6147,7 +6131,6 @@ function id_default() {
     localeError: error17()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/is.js
 var parsedType3 = (data) => {
   const t = typeof data;
   switch (t) {
@@ -6264,7 +6247,6 @@ function is_default() {
     localeError: error18()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/it.js
 var error19 = () => {
   const Sizable = {
     string: { unit: "caratteri", verb: "avere" },
@@ -6380,7 +6362,6 @@ function it_default() {
     localeError: error19()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ja.js
 var error20 = () => {
   const Sizable = {
     string: { unit: "文字", verb: "である" },
@@ -6495,7 +6476,6 @@ function ja_default() {
     localeError: error20()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ka.js
 var parsedType4 = (data) => {
   const t = typeof data;
   switch (t) {
@@ -6620,7 +6600,6 @@ function ka_default() {
     localeError: error21()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/km.js
 var error22 = () => {
   const Sizable = {
     string: { unit: "តួអក្សរ", verb: "គួរមាន" },
@@ -6737,12 +6716,9 @@ function km_default() {
     localeError: error22()
   };
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/kh.js
 function kh_default() {
   return km_default();
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ko.js
 var error23 = () => {
   const Sizable = {
     string: { unit: "문자", verb: "to have" },
@@ -6863,7 +6839,6 @@ function ko_default() {
     localeError: error23()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/lt.js
 var parsedType5 = (data) => {
   const t = typeof data;
   return parsedTypeFromType(t, data);
@@ -7092,7 +7067,6 @@ function lt_default() {
     localeError: error24()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/mk.js
 var error25 = () => {
   const Sizable = {
     string: { unit: "знаци", verb: "да имаат" },
@@ -7209,7 +7183,6 @@ function mk_default() {
     localeError: error25()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ms.js
 var error26 = () => {
   const Sizable = {
     string: { unit: "aksara", verb: "mempunyai" },
@@ -7325,7 +7298,6 @@ function ms_default() {
     localeError: error26()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/nl.js
 var error27 = () => {
   const Sizable = {
     string: { unit: "tekens" },
@@ -7442,7 +7414,6 @@ function nl_default() {
     localeError: error27()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/no.js
 var error28 = () => {
   const Sizable = {
     string: { unit: "tegn", verb: "å ha" },
@@ -7558,7 +7529,6 @@ function no_default() {
     localeError: error28()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ota.js
 var error29 = () => {
   const Sizable = {
     string: { unit: "harf", verb: "olmalıdır" },
@@ -7674,7 +7644,6 @@ function ota_default() {
     localeError: error29()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ps.js
 var error30 = () => {
   const Sizable = {
     string: { unit: "توکي", verb: "ولري" },
@@ -7796,7 +7765,6 @@ function ps_default() {
     localeError: error30()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/pl.js
 var error31 = () => {
   const Sizable = {
     string: { unit: "znaków", verb: "mieć" },
@@ -7913,7 +7881,6 @@ function pl_default() {
     localeError: error31()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/pt.js
 var error32 = () => {
   const Sizable = {
     string: { unit: "caracteres", verb: "ter" },
@@ -8029,7 +7996,6 @@ function pt_default() {
     localeError: error32()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ru.js
 function getRussianPlural(count, one, few, many) {
   const absCount = Math.abs(count);
   const lastDigit = absCount % 10;
@@ -8193,7 +8159,6 @@ function ru_default() {
     localeError: error33()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/sl.js
 var error34 = () => {
   const Sizable = {
     string: { unit: "znakov", verb: "imeti" },
@@ -8310,7 +8275,6 @@ function sl_default() {
     localeError: error34()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/sv.js
 var error35 = () => {
   const Sizable = {
     string: { unit: "tecken", verb: "att ha" },
@@ -8428,7 +8392,6 @@ function sv_default() {
     localeError: error35()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ta.js
 var error36 = () => {
   const Sizable = {
     string: { unit: "எழுத்துக்கள்", verb: "கொண்டிருக்க வேண்டும்" },
@@ -8545,7 +8508,6 @@ function ta_default() {
     localeError: error36()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/th.js
 var error37 = () => {
   const Sizable = {
     string: { unit: "ตัวอักษร", verb: "ควรมี" },
@@ -8662,7 +8624,6 @@ function th_default() {
     localeError: error37()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/tr.js
 var parsedType6 = (data) => {
   const t = typeof data;
   switch (t) {
@@ -8777,7 +8738,6 @@ function tr_default() {
     localeError: error38()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/uk.js
 var error39 = () => {
   const Sizable = {
     string: { unit: "символів", verb: "матиме" },
@@ -8893,12 +8853,9 @@ function uk_default() {
     localeError: error39()
   };
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ua.js
 function ua_default() {
   return uk_default();
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/ur.js
 var error40 = () => {
   const Sizable = {
     string: { unit: "حروف", verb: "ہونا" },
@@ -9015,7 +8972,6 @@ function ur_default() {
     localeError: error40()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/vi.js
 var error41 = () => {
   const Sizable = {
     string: { unit: "ký tự", verb: "có" },
@@ -9131,7 +9087,6 @@ function vi_default() {
     localeError: error41()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/zh-CN.js
 var error42 = () => {
   const Sizable = {
     string: { unit: "字符", verb: "包含" },
@@ -9247,7 +9202,6 @@ function zh_CN_default() {
     localeError: error42()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/zh-TW.js
 var error43 = () => {
   const Sizable = {
     string: { unit: "字元", verb: "擁有" },
@@ -9364,7 +9318,6 @@ function zh_TW_default() {
     localeError: error43()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/locales/yo.js
 var error44 = () => {
   const Sizable = {
     string: { unit: "àmi", verb: "ní" },
@@ -9479,7 +9432,6 @@ function yo_default() {
     localeError: error44()
   };
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/registries.js
 var $output = Symbol("ZodOutput");
 var $input = Symbol("ZodInput");
 
@@ -9530,7 +9482,6 @@ function registry() {
   return new $ZodRegistry;
 }
 var globalRegistry = /* @__PURE__ */ registry();
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/api.js
 function _string(Class2, params) {
   return new Class2({
     type: "string",
@@ -10408,7 +10359,7 @@ function _stringFormat(Class2, format, fnOrRegex, _params = {}) {
   const inst = new Class2(def);
   return inst;
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/to-json-schema.js
+
 class JSONSchemaGenerator {
   constructor(params) {
     this.counter = 0;
@@ -11212,9 +11163,7 @@ function isTransforming(_schema, _ctx) {
   }
   throw new Error(`Unknown schema type: ${def.type}`);
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/core/json-schema.js
 var exports_json_schema = {};
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/iso.js
 var exports_iso = {};
 __export(exports_iso, {
   time: () => time2,
@@ -11254,8 +11203,6 @@ var ZodISODuration = /* @__PURE__ */ $constructor("ZodISODuration", (inst, def) 
 function duration2(params) {
   return _isoDuration(ZodISODuration, params);
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/errors.js
 var initializer2 = (inst, issues) => {
   $ZodError.init(inst, issues);
   inst.name = "ZodError";
@@ -11289,8 +11236,6 @@ var ZodError = $constructor("ZodError", initializer2);
 var ZodRealError = $constructor("ZodError", initializer2, {
   Parent: Error
 });
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/parse.js
 var parse3 = /* @__PURE__ */ _parse(ZodRealError);
 var parseAsync2 = /* @__PURE__ */ _parseAsync(ZodRealError);
 var safeParse2 = /* @__PURE__ */ _safeParse(ZodRealError);
@@ -11303,8 +11248,6 @@ var safeEncode2 = /* @__PURE__ */ _safeEncode(ZodRealError);
 var safeDecode2 = /* @__PURE__ */ _safeDecode(ZodRealError);
 var safeEncodeAsync2 = /* @__PURE__ */ _safeEncodeAsync(ZodRealError);
 var safeDecodeAsync2 = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/schemas.js
 var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   $ZodType.init(inst, def);
   inst.def = def;
@@ -12279,7 +12222,6 @@ function json(params) {
 function preprocess(fn, schema) {
   return pipe(transform(fn), schema);
 }
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/compat.js
 var ZodIssueCode = {
   invalid_type: "invalid_type",
   too_big: "too_big",
@@ -12303,7 +12245,6 @@ function getErrorMap() {
 }
 var ZodFirstPartyTypeKind;
 (function(ZodFirstPartyTypeKind2) {})(ZodFirstPartyTypeKind || (ZodFirstPartyTypeKind = {}));
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/coerce.js
 var exports_coerce = {};
 __export(exports_coerce, {
   string: () => string3,
@@ -12327,31 +12268,14 @@ function bigint3(params) {
 function date4(params) {
   return _coercedDate(ZodDate, params);
 }
-
-// ../../node_modules/@opencode-ai/plugin/node_modules/zod/v4/classic/external.js
 config(en_default());
-// ../../node_modules/@opencode-ai/plugin/dist/tool.js
 function tool(input) {
   return input;
 }
 tool.schema = exports_external;
-// ../core/src/paths.ts
-import { homedir } from "os";
-import { join } from "path";
 var BASE_DIR = join(homedir(), ".iris");
 var SOCKET_PATH = join(BASE_DIR, "broker.sock");
-
-// src/plugin.ts
-import net2 from "net";
-
-// src/agent-backend.ts
-import net from "net";
-import { mkdirSync, readFileSync } from "fs";
-import { tmpdir } from "os";
-import { basename, dirname, isAbsolute, join as join2, resolve } from "path";
-import { spawn } from "child_process";
-import { createRequire as createRequire2 } from "module";
-var agentRequire = createRequire2(import.meta.url);
+var agentRequire = createRequire22(import.meta.url);
 var REQUEST_TIMEOUT_MS = 60000;
 var DEFAULT_PAGE_TEXT_LIMIT = 20000;
 var DEFAULT_LIST_LIMIT = 50;
@@ -12382,7 +12306,7 @@ function writeJsonLine(socket, msg) {
 `);
 }
 async function sleep(ms) {
-  return await new Promise((resolve2) => setTimeout(resolve2, ms));
+  return await new Promise((resolve22) => setTimeout(resolve22, ms));
 }
 function parseEnvNumber(value) {
   if (!value)
@@ -12715,9 +12639,9 @@ function createAgentBackend(sessionId) {
   let agentReqId = 0;
   const agentPending = new Map;
   async function connectToAgent() {
-    return await new Promise((resolve2, reject) => {
+    return await new Promise((resolve22, reject) => {
       const socket = connection.type === "unix" ? net.createConnection(connection.path) : net.createConnection({ host: connection.host, port: connection.port });
-      socket.once("connect", () => resolve2(socket));
+      socket.once("connect", () => resolve22(socket));
       socket.once("error", (err) => reject(err));
     });
   }
@@ -12770,8 +12694,8 @@ function createAgentBackend(sessionId) {
   async function agentRequest(action, payload) {
     const socket = await ensureAgentSocket();
     const id = `a${++agentReqId}`;
-    return await new Promise((resolve2, reject) => {
-      agentPending.set(id, { resolve: resolve2, reject });
+    return await new Promise((resolve22, reject) => {
+      agentPending.set(id, { resolve: resolve22, reject });
       writeJsonLine(socket, { id, action, ...payload });
       setTimeout(() => {
         if (!agentPending.has(id))
@@ -13144,12 +13068,6 @@ function createAgentBackend(sessionId) {
     requestTool
   };
 }
-
-// src/plugin.ts
-import { existsSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
-import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "path";
-import { spawn as spawn2 } from "child_process";
-import { fileURLToPath } from "url";
 var __filename2 = fileURLToPath(import.meta.url);
 var __dirname2 = dirname2(__filename2);
 var PACKAGE_JSON_PATH = join3(__dirname2, "..", "package.json");
@@ -13326,7 +13244,7 @@ function logRouter(message) {
   const line = `[${timestamp}] ${message}
 `;
   try {
-    __require("fs").appendFileSync(ROUTER_LOG_PATH, line);
+    __require2("fs").appendFileSync(ROUTER_LOG_PATH, line);
   } catch {}
 }
 function appleScriptStringLiteral(value) {
@@ -13571,8 +13489,8 @@ var plugin = async (ctx) => {
             health.planes.extension = { available: false, last_error: err?.message || String(err) };
           }
           try {
-            const { exec } = __require("child_process");
-            const { promisify } = __require("util");
+            const { exec } = __require2("child_process");
+            const { promisify } = __require2("util");
             const execAsync = promisify(exec);
             const start = Date.now();
             await execAsync(`osascript -e 'tell application "Google Chrome" to return name of front window'`);
@@ -14062,6 +13980,240 @@ var plugin = async (ctx) => {
   };
 };
 var plugin_default = plugin;
+
+// src/extension.ts
+var __filename3 = fileURLToPath2(import.meta.url);
+var __dirname3 = dirname3(__filename3);
+var PACKAGE_JSON_PATH2 = join4(__dirname3, "..", "package.json");
+var cachedVersion2 = null;
+function getPackageVersion2() {
+  if (cachedVersion2)
+    return cachedVersion2;
+  try {
+    const pkg = JSON.parse(readFileSync3(PACKAGE_JSON_PATH2, "utf8"));
+    if (typeof pkg.version === "string") {
+      cachedVersion2 = pkg.version;
+      return cachedVersion2;
+    }
+  } catch {}
+  cachedVersion2 = "unknown";
+  return cachedVersion2;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function asZodNode(value) {
+  if (!isRecord(value))
+    return null;
+  return value;
+}
+function convertSchema(z, schema2, path) {
+  const root = asZodNode(schema2);
+  if (!root) {
+    throw new Error(`Unsupported Zod schema at ${path}: not an object`);
+  }
+  let cur = root;
+  let optional2 = false;
+  while (cur?.type === "optional") {
+    optional2 = true;
+    const next = cur.def?.innerType ?? cur._def?.innerType ?? cur.def?.type;
+    cur = asZodNode(next);
+    if (!cur) {
+      throw new Error(`Unsupported optional inner type at ${path}`);
+    }
+  }
+  let out;
+  switch (cur?.type) {
+    case "string":
+      out = z.string();
+      break;
+    case "number":
+      out = z.number();
+      break;
+    case "boolean":
+      out = z.boolean();
+      break;
+    case "array": {
+      const elRaw = cur.def?.element ?? cur._def?.type ?? cur.def?.type;
+      let el = asZodNode(elRaw);
+      if (el?.type === "optional") {
+        el = asZodNode(el.def?.innerType ?? el._def?.innerType ?? el.def?.type);
+      }
+      if (el?.type === "string")
+        out = z.array(z.string());
+      else if (el?.type === "number")
+        out = z.array(z.number());
+      else if (el?.type === "boolean")
+        out = z.array(z.boolean());
+      else {
+        throw new Error(`Unsupported array element type at ${path}: ${el?.type ?? "unknown"}`);
+      }
+      break;
+    }
+    default:
+      throw new Error(`Unsupported Zod type for OMP bridge at ${path}: ${cur?.type ?? "unknown"}`);
+  }
+  return optional2 ? out.optional() : out;
+}
+function toOmpZodObject(z, args, toolName) {
+  const shape = {};
+  for (const [key, schema2] of Object.entries(args || {})) {
+    try {
+      shape[key] = convertSchema(z, schema2, `${toolName}.${key}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed converting schema for ${toolName}.${key}: ${message}`);
+    }
+  }
+  return z.object(shape);
+}
+function normalizeOmpResult(result) {
+  if (typeof result === "string") {
+    return { content: [{ type: "text", text: result }] };
+  }
+  if (result == null) {
+    return { content: [{ type: "text", text: "" }] };
+  }
+  const text = JSON.stringify(result, null, 2);
+  if (isRecord(result)) {
+    return { content: [{ type: "text", text }], details: result };
+  }
+  return { content: [{ type: "text", text }], details: { value: result } };
+}
+function humanizeToolName(name) {
+  return name.split("_").filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+}
+function notify(ctx, message, level) {
+  if (ctx.hasUI && ctx.ui?.notify) {
+    ctx.ui.notify(message, level);
+  }
+}
+function resultToNotifyText(result) {
+  if (typeof result === "string")
+    return result.slice(0, 500);
+  try {
+    return JSON.stringify(result).slice(0, 500);
+  } catch {
+    return String(result).slice(0, 500);
+  }
+}
+var irisPluginPromise = Promise.resolve(plugin_default({})).then((plugin2) => {
+  if (!isRecord(plugin2) || !isRecord(plugin2.tool)) {
+    throw new Error("iris-opencode plugin did not return a tool map");
+  }
+  return { tool: plugin2.tool };
+});
+async function irisOmpExtension(pi) {
+  pi.setLabel("Iris (real Chrome)");
+  const { z } = pi.zod;
+  const plugin2 = await irisPluginPromise;
+  const browserTools = Object.entries(plugin2.tool).filter(([name]) => name.startsWith("browser_"));
+  let statusTool = null;
+  let healthTool = null;
+  for (const [name, tool2] of browserTools) {
+    if (name === "browser_status")
+      statusTool = tool2;
+    if (name === "browser_health")
+      healthTool = tool2;
+    if (name === "browser_version")
+      continue;
+    const parameters = toOmpZodObject(z, tool2.args, name);
+    pi.registerTool({
+      name,
+      label: humanizeToolName(name),
+      description: tool2.description || name,
+      parameters,
+      async execute(_toolCallId, params, signal) {
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "Cancelled" }], details: { cancelled: true } };
+        }
+        const run = tool2.execute(params ?? {}, {});
+        if (!signal) {
+          return normalizeOmpResult(await run);
+        }
+        const { promise: abortPromise, reject: rejectAbort } = Promise.withResolvers();
+        const onAbort = () => rejectAbort(new Error("Aborted"));
+        signal.addEventListener("abort", onAbort, { once: true });
+        try {
+          const result = await Promise.race([run, abortPromise]);
+          return normalizeOmpResult(result);
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+        }
+      }
+    });
+  }
+  pi.registerTool({
+    name: "browser_version",
+    label: "Browser Version",
+    description: "Return the installed @mizner/iris-omp extension version.",
+    parameters: z.object({}),
+    async execute() {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              name: "@mizner/iris-omp",
+              version: getPackageVersion2(),
+              via: "@mizner/iris-opencode"
+            })
+          }
+        ]
+      };
+    }
+  });
+  pi.registerCommand("iris", {
+    description: "Iris runtime helpers: /iris status | health | reconnect",
+    handler: async (args, ctx) => {
+      const sub = (args || "").trim().split(/\s+/)[0]?.toLowerCase() || "status";
+      const runTool = async (tool2, label) => {
+        if (!tool2) {
+          notify(ctx, `Iris ${label} tool unavailable`, "warning");
+          return;
+        }
+        try {
+          const raw = await tool2.execute({}, {});
+          notify(ctx, resultToNotifyText(raw), "info");
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          notify(ctx, message, "warning");
+        }
+      };
+      if (sub === "status") {
+        await runTool(statusTool, "status");
+        return;
+      }
+      if (sub === "health" || sub === "doctor") {
+        await runTool(healthTool, "health");
+        return;
+      }
+      if (sub === "reconnect") {
+        try {
+          const r = await pi.exec("iris", ["reconnect"]);
+          if (r.code !== 0) {
+            notify(ctx, `iris reconnect failed. Run: iris reconnect  (or: node packages/core/bin/cli.js reconnect)`, "warning");
+          } else {
+            notify(ctx, (r.stdout || "iris reconnect ok").slice(0, 500), "info");
+          }
+        } catch {
+          notify(ctx, "iris reconnect failed. Run: iris reconnect  (or: node packages/core/bin/cli.js reconnect)", "warning");
+        }
+        return;
+      }
+      notify(ctx, "Usage: /iris status | health | reconnect", "info");
+    }
+  });
+  pi.on("session_start", async (_event, ctx) => {
+    if (!statusTool)
+      return;
+    try {
+      await statusTool.execute({}, {});
+    } catch (err) {
+      notify(ctx, `Iris broker unavailable: ${err instanceof Error ? err.message : String(err)}. Real-Chrome browser_* tools will fail until iris doctor/reconnect.`, "warning");
+    }
+  });
+}
 export {
-  plugin_default as default
+  irisOmpExtension as default
 };

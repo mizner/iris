@@ -1,3 +1,5 @@
+import { redactHeaders, redactNetworkBody } from "./lib/network-redact.mjs"
+
 const NATIVE_HOST_NAME = "com.iris.host"
 const KEEPALIVE_ALARM = "keepalive"
 const PERMISSION_HINT = "Click the Iris extension icon and approve requested permissions."
@@ -355,66 +357,6 @@ function getNetworkState(state, options = {}) {
   return state.network
 }
 
-function redactHeaders(headers) {
-  if (!headers || typeof headers !== "object") return {}
-  const out = {}
-  for (const [key, value] of Object.entries(headers)) {
-    const lower = key.toLowerCase()
-    if (
-      lower === "authorization" ||
-      lower === "proxy-authorization" ||
-      lower === "cookie" ||
-      lower === "set-cookie" ||
-      lower.includes("api-key") ||
-      lower.includes("token")
-    ) {
-      out[key] = "[redacted]"
-    } else {
-      out[key] = value
-    }
-  }
-  return out
-}
-
-const NETWORK_BODY_SECRET_KEY =
-  /(?:^|[_-])(?:password|secret|token|authorization|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|cookie)$/i
-
-function redactNetworkBody(text) {
-  if (typeof text !== "string") return { text: "", redacted: false }
-  const trimmed = text.trim()
-  const looksLikeJson =
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))
-  if (!looksLikeJson) return { text, redacted: false }
-
-  let value
-  try {
-    value = JSON.parse(trimmed)
-  } catch {
-    return { text, redacted: false }
-  }
-
-  let redacted = false
-  const scrub = (entry) => {
-    if (!entry || typeof entry !== "object") return
-    if (Array.isArray(entry)) {
-      for (const item of entry) scrub(item)
-      return
-    }
-
-    for (const [key, child] of Object.entries(entry)) {
-      const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/\s+/g, "_")
-      if (NETWORK_BODY_SECRET_KEY.test(normalizedKey)) {
-        entry[key] = "[redacted]"
-        redacted = true
-      } else {
-        scrub(child)
-      }
-    }
-  }
-
-  scrub(value)
-  return { text: redacted ? JSON.stringify(value) : text, redacted }
-}
 
 function getOrCreateNetworkRecord(network, requestId) {
   let record = network.requests.get(requestId)
@@ -891,7 +833,9 @@ async function pageOps(command, args) {
     if (key === "role") return "role"
     if (key === "text") return "text"
     if (key === "id") return "id"
+    if (key === "uid" || key === "ref") return "uid"
     return null
+
   }
 
   function parseLocator(raw) {
@@ -1058,6 +1002,14 @@ async function pageOps(command, args) {
       return deepQuerySelectorAll(`#${escaped}`, document)
     }
 
+    if (locator.kind === "uid") {
+      let id = safeString(locator.value).trim()
+      if (!id) return []
+      if (!/^e\d+$/i.test(id) && /^\d+$/.test(id)) id = `e${id}`
+      const escaped = window.CSS && window.CSS.escape ? window.CSS.escape(id) : id.replace(/[^a-zA-Z0-9_-]/g, "\\$&")
+      return deepQuerySelectorAll(`[data-iris-uid="${escaped}"]`, document)
+    }
+
     return []
   }
 
@@ -1127,18 +1079,30 @@ async function pageOps(command, args) {
     else el.value = value
   }
 
+  function isSensitiveField(el) {
+    const type = String(el.type || "").toLowerCase()
+    if (type === "password" || type === "hidden") return true
+    const ac = String(el.getAttribute("autocomplete") || "").toLowerCase()
+    if (/password|one-time|otp|cc-|card|cvv|ssn|secret/.test(ac)) return true
+    const name = String(el.getAttribute("name") || el.id || "").toLowerCase()
+    if (/password|passwd|secret|otp|cvv|card.?number|ssn/.test(name)) return true
+    return false
+  }
+
   function getInputValues() {
     const out = []
     const nodes = document.querySelectorAll("input, textarea")
     nodes.forEach((el) => {
       try {
-        const name = el.getAttribute("aria-label") || el.getAttribute("name") || el.id || el.className || el.tagName
+        const label = el.getAttribute("aria-label") || el.getAttribute("name") || el.id || el.className || el.tagName
         const value = el.value
-        if (value != null && String(value).trim()) out.push(`${name}: ${value}`)
+        if (value == null || !String(value).trim()) return
+        out.push(`${label}: ${isSensitiveField(el) ? "[redacted]" : value}`)
       } catch {}
     })
     return out.join("\n")
   }
+
 
   function getPseudoText() {
     const out = []
@@ -2004,12 +1968,17 @@ async function toolSnapshot({ tabId }) {
         const shouldInclude = isInteractive || name.trim() || pt.before || pt.after
 
         if (shouldInclude) {
+          const uidStr = `e${uid}`
           const node = {
-            uid: `e${uid}`,
+            uid: uidStr,
             role: el.getAttribute("role") || el.tagName.toLowerCase(),
             name: name,
             tag: el.tagName.toLowerCase(),
           }
+
+          try {
+            el.setAttribute("data-iris-uid", uidStr)
+          } catch {}
 
           if (pt.before) node.before = pt.before
           if (pt.after) node.after = pt.after
@@ -2018,16 +1987,20 @@ async function toolSnapshot({ tabId }) {
 
           if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
             node.type = el.type
-            node.value = el.value
+            const type = String(el.type || "").toLowerCase()
+            const ac = String(el.getAttribute("autocomplete") || "").toLowerCase()
+            const fieldName = String(el.getAttribute("name") || el.id || "").toLowerCase()
+            const sensitive =
+              type === "password" ||
+              type === "hidden" ||
+              /password|one-time|otp|cc-|card|cvv|ssn|secret/.test(ac) ||
+              /password|passwd|secret|otp|cvv|card.?number|ssn/.test(fieldName)
+            node.value = sensitive ? "[redacted]" : el.value
             if (el.readOnly) node.readOnly = true
             if (el.disabled) node.disabled = true
           }
 
-          if (el.id) node.selector = `#${el.id}`
-          else if (el.className && typeof el.className === "string") {
-            const cls = el.className.trim().split(/\s+/).slice(0, 2).join(".")
-            if (cls) node.selector = `${el.tagName.toLowerCase()}.${cls}`
-          }
+          node.selector = `[data-iris-uid="${uidStr}"]`
 
           nodes.push(node)
           uid++
@@ -2069,7 +2042,31 @@ async function toolSnapshot({ tabId }) {
         pageText = safeText(document.body?.innerText || "").slice(0, 20000)
       } catch {}
 
+      // Clear prior snapshot stamps so eN renumbers cleanly each run
+      try {
+        document.querySelectorAll("[data-iris-uid]").forEach((el) => {
+          try {
+            el.removeAttribute("data-iris-uid")
+          } catch {}
+        })
+        // shadow roots: walk open shadows shallowly
+        const walk = (root) => {
+          root.querySelectorAll("*").forEach((el) => {
+            if (el.shadowRoot) {
+              el.shadowRoot.querySelectorAll("[data-iris-uid]").forEach((n) => {
+                try {
+                  n.removeAttribute("data-iris-uid")
+                } catch {}
+              })
+              walk(el.shadowRoot)
+            }
+          })
+        }
+        walk(document)
+      } catch {}
+
       const built = build(document.body).nodes.slice(0, 800)
+
 
       return {
         url: location.href,
@@ -2462,7 +2459,7 @@ async function toolNetworkGet({ tabId, requestId, index, includeBody = false, ma
       const body = await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.getResponseBody", { requestId: id })
       const limit = clampNumber(maxBodyBytes, 0, 5_000_000, 200000)
       const rawBody = typeof body?.body === "string" ? body.body : ""
-      const redactedBody = body?.base64Encoded ? { text: rawBody, redacted: false } : redactNetworkBody(rawBody)
+      const redactedBody = redactNetworkBody(rawBody, { base64Encoded: !!body?.base64Encoded })
       out.body = redactedBody.text.slice(0, limit)
       out.base64Encoded = !!body?.base64Encoded
       out.bodyTruncated = redactedBody.text.length > limit
