@@ -9,11 +9,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "bun run --cwd packages/opencode build && bun run --cwd packages/mcp build",
+    "build": "bun run --cwd packages/opencode build && bun run --cwd packages/mcp build && bun run --cwd packages/omp build",
     "check:extension": "node --check packages/core/extension/background.js",
     "check:runtime": "node --check packages/core/bin/broker.cjs packages/core/bin/browser-cli.cjs packages/core/bin/cli.js packages/core/bin/native-host.cjs packages/core/extension/background.js",
     "prepublishOnly": "bun run build",
-    "test": "node --test packages/core/test/ && node scripts/check-skill-tools.mjs",
+    "test": "node --test packages/core/test/ && node scripts/check-skill-tools.mjs && node --test packages/omp/test/load.test.mjs",
     "test:skill-tools": "node scripts/check-skill-tools.mjs",
     "runtime:install": "node packages/core/bin/cli.js install",
     "runtime:migrate": "node packages/core/bin/cli.js migrate",

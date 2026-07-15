@@ -43,6 +43,7 @@ Latency preference:
 | `packages/core/extension/manifest.json` | Chrome extension manifest |
 | `packages/opencode/src/plugin.ts` | OpenCode adapter and `browser_*` tool registration |
 | `packages/mcp/src/server.ts` | stdio MCP adapter |
+| `packages/omp/src/extension.ts` | OMP extension adapter |
 | `packages/skill/SKILL.md` | Portable agent skill |
 | `.opencode/skills/browser-automation/SKILL.md` | Optional OpenCode skill template |
 | `docs/reliability.md` | Generic runtime reliability notes |

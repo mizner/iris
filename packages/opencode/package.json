@@ -17,17 +17,25 @@
     ".": "./dist/plugin.js",
     "./plugin": "./dist/plugin.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "build": "bun build src/plugin.ts --target=node --outfile=dist/plugin.js"
+    "build": "bun build src/plugin.ts --target=node --outfile=dist/plugin.js",
+    "prepublishOnly": "bun run build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@mizner/iris": "workspace:*",
     "agent-browser": "^0.4.0"
   },
   "devDependencies": {
+    "@mizner/iris": "workspace:*",
     "@opencode-ai/plugin": "*",
     "bun-types": "*"
   }

@@ -24,8 +24,12 @@
     "bin",
     "extension",
     "src",
-    "templates"
+    "templates",
+    "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "runtime:install": "node bin/cli.js install",
     "runtime:migrate": "node bin/cli.js migrate",

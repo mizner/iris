@@ -1,6 +1,6 @@
 ---
 name: iris
-description: Use Iris when browser automation needs a real Chrome profile with persistent tabs, native messaging, downloads, console access, screenshots, and OpenCode/MCP/CLI adapters.
+description: Use Iris when browser automation needs a real Chrome profile with persistent tabs, native messaging, downloads, console access, screenshots, and OpenCode/OMP/MCP/CLI adapters.
 ---
 
 # Iris
@@ -10,6 +10,12 @@ Iris controls a real Chrome, Chromium, or Brave profile through a local broker, 
 Use Iris when a task needs real cookies, existing tabs, browser downloads, console logs, debugger-backed errors, or authenticated app state. Do not use Iris when a simple HTTP fetch or disposable headless browser is enough.
 
 ## Integration Modes
+
+OMP extension:
+
+- Prefer native Iris `browser_*` tools when the `@mizner/iris-omp` extension is loaded.
+- Do not confuse with OMP’s built-in `browser` tool (headless/CDP).
+- Start with `browser_status` or `browser_health`.
 
 OpenCode plugin:
 
@@ -24,6 +30,7 @@ MCP server:
 CLI:
 
 - Use `~/.iris/browser-cli.cjs` for shell scripts and quick diagnostics.
+
 
 ## Recommended Workflow
 
