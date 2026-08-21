@@ -3,6 +3,14 @@
 
 ## Unreleased
 
+## 4.9.0
+
+- Add `browser_hover` and `browser_drag`; extend `browser_click` with `button`, `clickCount`, and `modifiers`.
+- Show a green agent cursor overlay during pointer actions (auto-fades; no settings UI).
+- Add `browser_history` (`back` / `forward` / `reload`) and `browser_handle_dialog`.
+- Snapshot diffs: preserve `data-iris-uid` across calls; default to added/removed/changed after the first full snapshot (`full=true` restamps).
+- Toolbar badge shows claim count; clicking the Iris icon on a claimed tab releases it. Broker pings and claim changes push claim lists to the extension.
+
 - Add `@mizner/iris-omp` Oh My Pi extension adapter (native `browser_*` tools via iris-opencode).
 - Mask password/sensitive field values in `browser_snapshot` and page_text input dumps.
 - Harden network header/body redaction (form-urlencoded, base64 JSON, credential/session headers); extract `extension/lib/network-redact.mjs` with unit tests.

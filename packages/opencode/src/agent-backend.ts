@@ -26,7 +26,7 @@ const DEFAULT_LIST_LIMIT = 50;
 const DEFAULT_POLL_MS = 200;
 
 const SUPPORTED_AGENT_TOOLS =
-  "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press";
+  "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, hover, drag, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press, history";
 const DEFAULT_DOWNLOADS_DIR = join(BASE_DIR, "downloads");
 
 export type AgentBackend = {
@@ -729,13 +729,56 @@ export function createAgentBackend(sessionId: string): AgentBackend {
       case "click": {
         return await withTab(args.tabId, async () => {
           if (!args.selector) throw new Error("Selector is required");
+          const button = String(args.button || "left").toLowerCase();
+          if (button !== "left") {
+            throw new Error("Right/middle click is not supported with agent-browser backend");
+          }
           const indexValue = Number.isFinite(args.index) ? args.index : 0;
+          const dbl = Number(args.clickCount) >= 2;
           if (indexValue) {
-            await agentCommand("nth", { selector: args.selector, index: indexValue, subaction: "click" });
+            await agentCommand("nth", {
+              selector: args.selector,
+              index: indexValue,
+              subaction: dbl ? "click" : "click",
+            });
+            if (dbl) await agentCommand("nth", { selector: args.selector, index: indexValue, subaction: "click" });
+          } else if (dbl) {
+            await agentCommand("dblclick", { selector: args.selector });
           } else {
             await agentCommand("click", { selector: args.selector });
           }
           return { content: `Clicked ${args.selector}` };
+        });
+      }
+      case "hover": {
+        return await withTab(args.tabId, async () => {
+          if (!args.selector) throw new Error("Selector is required");
+          const indexValue = Number.isFinite(args.index) ? args.index : 0;
+          if (indexValue) {
+            await agentCommand("nth", { selector: args.selector, index: indexValue, subaction: "hover" });
+          } else {
+            await agentCommand("hover", { selector: args.selector });
+          }
+          return { content: `Hovered ${args.selector}` };
+        });
+      }
+      case "drag": {
+        return await withTab(args.tabId, async () => {
+          const source = args.fromSelector || args.selector;
+          if (!source) throw new Error("fromSelector is required");
+          if (!args.toSelector) throw new Error("toSelector is required");
+          await agentCommand("drag", { source, target: args.toSelector });
+          return { content: `Dragged ${source} to ${args.toSelector}` };
+        });
+      }
+      case "history": {
+        return await withTab(args.tabId, async () => {
+          const op = String(args.action || "").toLowerCase();
+          if (op === "back") await agentCommand("back", {});
+          else if (op === "forward") await agentCommand("forward", {});
+          else if (op === "reload") await agentCommand("reload", {});
+          else throw new Error("action must be back, forward, or reload");
+          return { content: { action: op, changed: true } };
         });
       }
       case "type": {

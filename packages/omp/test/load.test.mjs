@@ -25,7 +25,7 @@ function paramType(node) {
   return { optional: false, type: node.type ?? null };
 }
 
-test("OMP extension registers 34 browser_* tools with rebuilt schemas", async () => {
+test("OMP extension registers 38 browser_* tools with rebuilt schemas", async () => {
   const mod = await import(pathToFileURL(extensionPath).href);
   const factory = mod.default;
   assert.equal(typeof factory, "function");
@@ -59,10 +59,14 @@ test("OMP extension registers 34 browser_* tools with rebuilt schemas", async ()
   await factory(pi);
 
   const browserTools = registered.filter((n) => n.startsWith("browser_"));
-  assert.equal(browserTools.length, 34);
+  assert.equal(browserTools.length, 38);
   assert.ok(registered.includes("browser_status"));
   assert.ok(registered.includes("browser_version"));
   assert.ok(registered.includes("browser_click"));
+  assert.ok(registered.includes("browser_hover"));
+  assert.ok(registered.includes("browser_drag"));
+  assert.ok(registered.includes("browser_history"));
+  assert.ok(registered.includes("browser_handle_dialog"));
 
   // Empty-arg tools must still be z.object({})
   const status = toolDefs.get("browser_status");
@@ -76,7 +80,10 @@ test("OMP extension registers 34 browser_* tools with rebuilt schemas", async ()
   assert.ok(click);
   assert.equal(click.parameters?.type, "object");
   const clickShape = click.parameters?.shape ?? {};
-  assert.deepEqual(Object.keys(clickShape).sort(), ["index", "pollMs", "selector", "tabId", "timeoutMs"]);
+  assert.deepEqual(
+    Object.keys(clickShape).sort(),
+    ["button", "clickCount", "index", "modifiers", "pollMs", "selector", "tabId", "timeoutMs"]
+  );
   assert.deepEqual(paramType(clickShape.selector), { optional: false, type: "string" });
   assert.deepEqual(paramType(clickShape.tabId), { optional: true, type: "number" });
   assert.deepEqual(paramType(clickShape.index), { optional: true, type: "number" });

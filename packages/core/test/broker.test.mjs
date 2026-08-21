@@ -390,3 +390,58 @@ test("wantsTab tool creates tab when active tab is owned by another session", as
   );
   assert.ok(clickReq.some((m) => m.message.args.tabId === 77));
 });
+
+test("claim_tab broadcasts claims to the extension host", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(801, { pong: true });
+  const plugin = broker.makePlugin("session-claims");
+
+  const claimed = await broker.request(plugin, 1, "claim_tab", { tabId: 55 });
+  assert.equal(claimed.ok, true);
+
+  const update = await host.nextMessage(
+    (m) => m?.type === "to_extension" && m.message?.type === "claims" && m.message.claims.some((c) => c.tabId === 55),
+    2000
+  );
+  const owned = update.message.claims.find((c) => c.tabId === 55);
+  assert.ok(owned);
+  assert.equal(owned.sessionId, claimed.data.sessionId);
+});
+
+test("extension release_tab force-releases a claimed tab", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(802, { pong: true });
+  const plugin = broker.makePlugin("session-steal");
+
+  await broker.request(plugin, 1, "claim_tab", { tabId: 88 });
+  const before = host.messages.length;
+  host.write({ type: "from_extension", message: { type: "release_tab", tabId: 88 } });
+
+  const deadline = Date.now() + 2000;
+  let released = false;
+  while (Date.now() < deadline) {
+    const later = host.messages.slice(before);
+    released = later.some(
+      (m) => m?.type === "to_extension" && m.message?.type === "claims" && !m.message.claims.some((c) => c.tabId === 88)
+    );
+    if (released) break;
+    await wait(25);
+  }
+  assert.equal(released, true);
+
+  const status = await broker.request(plugin, 2, "status");
+  assert.equal(status.data.claims.length, 0);
+});
+
+test("ping payload includes current claims", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(803, { pong: true });
+  const plugin = broker.makePlugin("session-ping-claims");
+  await broker.request(plugin, 1, "claim_tab", { tabId: 91 });
+
+  const ping = await host.nextMessage(
+    (m) => m?.type === "to_extension" && m.message?.type === "ping" && Array.isArray(m.message.claims),
+    2000
+  );
+  assert.ok(ping.message.claims.some((c) => c.tabId === 91));
+});

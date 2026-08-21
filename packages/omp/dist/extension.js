@@ -12280,7 +12280,7 @@ var REQUEST_TIMEOUT_MS = 60000;
 var DEFAULT_PAGE_TEXT_LIMIT = 20000;
 var DEFAULT_LIST_LIMIT = 50;
 var DEFAULT_POLL_MS = 200;
-var SUPPORTED_AGENT_TOOLS = "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press";
+var SUPPORTED_AGENT_TOOLS = "get_tabs, list_downloads, open_tab, close_tab, navigate, download, click, hover, drag, type, select, set_file_input, screenshot, snapshot, query, scroll, wait, press, history";
 var DEFAULT_DOWNLOADS_DIR = join2(BASE_DIR, "downloads");
 function createJsonLineParser(onMessage) {
   let buffer = "";
@@ -12894,13 +12894,64 @@ function createAgentBackend(sessionId) {
         return await withTab(args.tabId, async () => {
           if (!args.selector)
             throw new Error("Selector is required");
+          const button = String(args.button || "left").toLowerCase();
+          if (button !== "left") {
+            throw new Error("Right/middle click is not supported with agent-browser backend");
+          }
           const indexValue = Number.isFinite(args.index) ? args.index : 0;
+          const dbl = Number(args.clickCount) >= 2;
           if (indexValue) {
-            await agentCommand("nth", { selector: args.selector, index: indexValue, subaction: "click" });
+            await agentCommand("nth", {
+              selector: args.selector,
+              index: indexValue,
+              subaction: dbl ? "click" : "click"
+            });
+            if (dbl)
+              await agentCommand("nth", { selector: args.selector, index: indexValue, subaction: "click" });
+          } else if (dbl) {
+            await agentCommand("dblclick", { selector: args.selector });
           } else {
             await agentCommand("click", { selector: args.selector });
           }
           return { content: `Clicked ${args.selector}` };
+        });
+      }
+      case "hover": {
+        return await withTab(args.tabId, async () => {
+          if (!args.selector)
+            throw new Error("Selector is required");
+          const indexValue = Number.isFinite(args.index) ? args.index : 0;
+          if (indexValue) {
+            await agentCommand("nth", { selector: args.selector, index: indexValue, subaction: "hover" });
+          } else {
+            await agentCommand("hover", { selector: args.selector });
+          }
+          return { content: `Hovered ${args.selector}` };
+        });
+      }
+      case "drag": {
+        return await withTab(args.tabId, async () => {
+          const source = args.fromSelector || args.selector;
+          if (!source)
+            throw new Error("fromSelector is required");
+          if (!args.toSelector)
+            throw new Error("toSelector is required");
+          await agentCommand("drag", { source, target: args.toSelector });
+          return { content: `Dragged ${source} to ${args.toSelector}` };
+        });
+      }
+      case "history": {
+        return await withTab(args.tabId, async () => {
+          const op = String(args.action || "").toLowerCase();
+          if (op === "back")
+            await agentCommand("back", {});
+          else if (op === "forward")
+            await agentCommand("forward", {});
+          else if (op === "reload")
+            await agentCommand("reload", {});
+          else
+            throw new Error("action must be back, forward, or reload");
+          return { content: { action: op, changed: true } };
         });
       }
       case "type": {
@@ -13589,8 +13640,57 @@ var plugin = async (ctx) => {
           return toolResultText(data, `Navigated to ${url2}`);
         }
       }),
+      browser_history: tool({
+        description: "Go back, forward, or reload the current tab.",
+        args: {
+          action: schema.string(),
+          tabId: schema.number().optional()
+        },
+        async execute({ action, tabId }, ctx2) {
+          const data = await toolRequest("history", { action, tabId });
+          return toolResultText(data, `History ${action}`);
+        }
+      }),
+      browser_handle_dialog: tool({
+        description: "Accept or dismiss a JavaScript alert/confirm/prompt/beforeunload dialog.",
+        args: {
+          accept: schema.boolean(),
+          promptText: schema.string().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ accept, promptText, tabId }, ctx2) {
+          const data = await toolRequest("handle_dialog", { accept, promptText, tabId });
+          return toolResultText(data, accept ? "Accepted dialog" : "Dismissed dialog");
+        }
+      }),
       browser_click: tool({
-        description: "Click an element on the page using a CSS selector",
+        description: "Click an element. Optional button (left/right/middle), clickCount (2 = double-click), and modifiers.",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+          button: schema.string().optional(),
+          clickCount: schema.number().optional(),
+          modifiers: schema.array(schema.string()).optional()
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs, button, clickCount, modifiers }, ctx2) {
+          const data = await toolRequest("click", {
+            selector,
+            index,
+            tabId,
+            timeoutMs,
+            pollMs,
+            button,
+            clickCount,
+            modifiers
+          });
+          return toolResultText(data, `Clicked ${selector}`);
+        }
+      }),
+      browser_hover: tool({
+        description: "Hover the pointer over an element (opens CSS menus, tooltips).",
         args: {
           selector: schema.string(),
           index: schema.number().optional(),
@@ -13599,8 +13699,34 @@ var plugin = async (ctx) => {
           pollMs: schema.number().optional()
         },
         async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx2) {
-          const data = await toolRequest("click", { selector, index, tabId, timeoutMs, pollMs });
-          return toolResultText(data, `Clicked ${selector}`);
+          const data = await toolRequest("hover", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Hovered ${selector}`);
+        }
+      }),
+      browser_drag: tool({
+        description: "Drag from one element to another (selector or uid locators).",
+        args: {
+          fromSelector: schema.string().optional(),
+          selector: schema.string().optional(),
+          toSelector: schema.string(),
+          fromIndex: schema.number().optional(),
+          toIndex: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional()
+        },
+        async execute({ fromSelector, selector, toSelector, fromIndex, toIndex, tabId, timeoutMs, pollMs }, ctx2) {
+          const data = await toolRequest("drag", {
+            fromSelector,
+            selector,
+            toSelector,
+            fromIndex,
+            toIndex,
+            tabId,
+            timeoutMs,
+            pollMs
+          });
+          return toolResultText(data, `Dragged to ${toSelector}`);
         }
       }),
       browser_type: tool({
@@ -13688,12 +13814,13 @@ var plugin = async (ctx) => {
         }
       }),
       browser_snapshot: tool({
-        description: "Get an accessibility tree snapshot of the page.",
+        description: "Capture an accessibility snapshot. First call (or full=true) returns all nodes; later calls return a uid-preserving diff.",
         args: {
-          tabId: schema.number().optional()
+          tabId: schema.number().optional(),
+          full: schema.boolean().optional()
         },
-        async execute({ tabId }, ctx2) {
-          const data = await toolRequest("snapshot", { tabId });
+        async execute({ tabId, full }, ctx2) {
+          const data = await toolRequest("snapshot", { tabId, full });
           return toolResultText(data, "Snapshot failed");
         }
       }),

@@ -1,4 +1,5 @@
 import { redactHeaders, redactNetworkBody } from "./lib/network-redact.mjs"
+import { diffSnapshots, indexByUid } from "./lib/snapshot-diff.mjs"
 
 const NATIVE_HOST_NAME = "com.iris.host"
 const KEEPALIVE_ALARM = "keepalive"
@@ -26,8 +27,12 @@ let sawPingOnPort = false
 
 // Debugger state management for console/error capture
 const debuggerState = new Map()
+const lastSnapshot = new Map()
+const agentCursorByTab = new Map()
+let lastClaims = []
 const MAX_LOG_ENTRIES = 1000
 const MAX_NETWORK_ENTRIES = 1000
+const AGENT_CURSOR_FADE_MS = 1200
 
 function normalizeAllowlist(value) {
   if (!Array.isArray(value)) return []
@@ -315,6 +320,7 @@ async function ensureDebuggerAttached(tabId) {
     await chrome.debugger.attach({ tabId }, "1.3")
     state.attached = true
     await ensureDebuggerDomain(tabId, state, "Runtime")
+    await ensureDebuggerDomain(tabId, state, "Page")
   } catch (e) {
     state.unavailableReason = e?.message || String(e)
     console.warn("[Iris] Failed to attach debugger:", e.message || e)
@@ -336,6 +342,126 @@ async function sendDebuggerCommand(tabId, method, params = {}) {
     throw new Error(state.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
   }
   return await chrome.debugger.sendCommand({ tabId }, method, params)
+}
+
+function cdpMouseButton(button) {
+  const value = String(button || "left").toLowerCase()
+  if (value === "right" || value === "middle") return value
+  return "left"
+}
+
+function injectAgentCursor(fromX, fromY, toX, toY, fadeMs) {
+  const ID = "__iris_agent_cursor"
+  let host = document.getElementById(ID)
+  if (!host) {
+    host = document.createElement("div")
+    host.id = ID
+    document.documentElement.appendChild(host)
+  }
+  host.style.cssText = [
+    "position:fixed",
+    "left:0",
+    "top:0",
+    "width:14px",
+    "height:14px",
+    "margin-left:-3px",
+    "margin-top:-3px",
+    "border-radius:50% 50% 50% 0",
+    "transform:rotate(-45deg)",
+    "background:#22c55e",
+    "box-shadow:0 0 0 2px #fff,0 0 12px #22c55e",
+    "pointer-events:none",
+    "z-index:2147483647",
+  ].join(";")
+  const start = performance.now()
+  const dur = 200
+  function frame(now) {
+    const t = Math.min(1, (now - start) / dur)
+    const ease = 1 - (1 - t) * (1 - t)
+    host.style.left = `${fromX + (toX - fromX) * ease}px`
+    host.style.top = `${fromY + (toY - fromY) * ease}px`
+    if (t < 1) requestAnimationFrame(frame)
+  }
+  requestAnimationFrame(frame)
+  clearTimeout(host._irisHide)
+  host._irisHide = setTimeout(() => {
+    try {
+      host.remove()
+    } catch {}
+  }, fadeMs)
+}
+
+async function showAgentCursor(tabId, { x, y, fromX, fromY }) {
+  const prev = agentCursorByTab.get(tabId)
+  const startX = Number.isFinite(fromX) ? fromX : Number.isFinite(prev?.x) ? prev.x : x
+  const startY = Number.isFinite(fromY) ? fromY : Number.isFinite(prev?.y) ? prev.y : y - 12
+  agentCursorByTab.set(tabId, { x, y })
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: injectAgentCursor,
+      args: [startX, startY, x, y, AGENT_CURSOR_FADE_MS],
+    })
+  } catch {
+    // chrome:// and other restricted pages
+  }
+}
+
+async function dispatchMouse(tabId, { type, x, y, button = "left", clickCount = 1, modifiers = 0 }) {
+  await sendDebuggerCommand(tabId, "Input.dispatchMouseEvent", {
+    type,
+    x,
+    y,
+    button: cdpMouseButton(button),
+    clickCount,
+    modifiers,
+  })
+}
+
+async function cdpClick(tabId, { x, y, button = "left", clickCount = 1, modifiers = 0 }) {
+  const count = clickCount >= 2 ? 2 : 1
+  await dispatchMouse(tabId, { type: "mouseMoved", x, y, button, clickCount: 1, modifiers })
+  for (let i = 1; i <= count; i++) {
+    await dispatchMouse(tabId, { type: "mousePressed", x, y, button, clickCount: i, modifiers })
+    await dispatchMouse(tabId, { type: "mouseReleased", x, y, button, clickCount: i, modifiers })
+  }
+}
+
+async function cdpDrag(tabId, from, to, steps = 8) {
+  const modifiers = 0
+  await dispatchMouse(tabId, { type: "mouseMoved", x: from.x, y: from.y, button: "left", clickCount: 1, modifiers })
+  await dispatchMouse(tabId, { type: "mousePressed", x: from.x, y: from.y, button: "left", clickCount: 1, modifiers })
+  const n = Math.max(2, steps)
+  for (let i = 1; i <= n; i++) {
+    const t = i / n
+    await dispatchMouse(tabId, {
+      type: "mouseMoved",
+      x: from.x + (to.x - from.x) * t,
+      y: from.y + (to.y - from.y) * t,
+      button: "left",
+      clickCount: 1,
+      modifiers,
+    })
+  }
+  await dispatchMouse(tabId, { type: "mouseReleased", x: to.x, y: to.y, button: "left", clickCount: 1, modifiers })
+}
+
+function waitForTabComplete(tabId, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    const listener = (updatedTabId, info) => {
+      if (updatedTabId === tabId && info.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener)
+        clearTimeout(timer)
+        resolve({ completed: true })
+      }
+    }
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener)
+      resolve({ completed: false })
+    }, timeoutMs)
+    chrome.tabs.onUpdated.addListener(listener)
+  })
 }
 
 function makeNetworkState(maxEntries = MAX_NETWORK_ENTRIES) {
@@ -521,6 +647,19 @@ if (chrome.debugger?.onEvent) {
     if (method.startsWith("Network.")) {
       handleNetworkEvent(state, method, params)
     }
+
+    if (method === "Page.javascriptDialogOpening") {
+      state.pendingDialog = {
+        type: params.type || "alert",
+        message: params.message || "",
+        url: params.url || "",
+        defaultPrompt: params.defaultPrompt || "",
+      }
+    }
+
+    if (method === "Page.javascriptDialogClosed") {
+      state.pendingDialog = null
+    }
   })
 }
 
@@ -540,6 +679,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (chrome.debugger?.detach) chrome.debugger.detach({ tabId }).catch(() => {})
     debuggerState.delete(tabId)
   }
+  lastSnapshot.delete(tabId)
+  agentCursorByTab.delete(tabId)
 })
 
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
@@ -644,9 +785,29 @@ async function connectOnce() {
   }
 }
 
+function applyClaims(claims) {
+  lastClaims = Array.isArray(claims) ? claims : []
+  if (isConnected) updateBadge(true)
+}
+
 function updateBadge(connected) {
-  chrome.action.setBadgeText({ text: connected ? "ON" : "" })
-  chrome.action.setBadgeBackgroundColor({ color: connected ? "#22c55e" : "#ef4444" })
+  const n = lastClaims.length
+  if (!connected) {
+    chrome.action.setBadgeText({ text: "" })
+    chrome.action.setBadgeBackgroundColor({ color: "#ef4444" })
+    chrome.action.setTitle({ title: "Iris: disconnected — click to reconnect" })
+    return
+  }
+  if (n > 0) {
+    chrome.action.setBadgeText({ text: String(n) })
+    chrome.action.setBadgeBackgroundColor({ color: "#f59e0b" })
+    const noun = n === 1 ? "tab" : "tabs"
+    chrome.action.setTitle({ title: `Iris: ${n} ${noun} claimed — click to take this tab back` })
+    return
+  }
+  chrome.action.setBadgeText({ text: "ON" })
+  chrome.action.setBadgeBackgroundColor({ color: "#22c55e" })
+  chrome.action.setTitle({ title: "Iris: connected" })
 }
 
 function send(message) {
@@ -661,7 +822,7 @@ function send(message) {
 
 function isBrokerSourcedMessage(message) {
   const t = message?.type
-  return t === "ping" || t === "tool_request" || t === "reload"
+  return t === "ping" || t === "tool_request" || t === "reload" || t === "claims"
 }
 
 async function handleMessage(message) {
@@ -676,10 +837,14 @@ async function handleMessage(message) {
     updateBadge(true)
   }
 
+  if (Array.isArray(message.claims)) applyClaims(message.claims)
+
   if (message.type === "tool_request") {
     await handleToolRequest(message)
   } else if (message.type === "ping") {
     send({ type: "pong" })
+  } else if (message.type === "claims") {
+    applyClaims(message.claims)
   } else if (message.type === "config_response") {
     const cfg = message.config || {}
     const allowlist = normalizeAllowlist(cfg.profileEmails)
@@ -726,6 +891,8 @@ async function executeTool(toolName, args) {
     close_tab: toolCloseTab,
     navigate: toolNavigate,
     click: toolClick,
+    hover: toolHover,
+    drag: toolDrag,
     type: toolType,
     press: toolPress,
     select: toolSelect,
@@ -735,6 +902,8 @@ async function executeTool(toolName, args) {
     scroll: toolScroll,
     wait: toolWait,
     wait_for: toolWaitFor,
+    history: toolHistory,
+    handle_dialog: toolHandleDialog,
     download: toolDownload,
     list_downloads: toolListDownloads,
     set_file_input: toolSetFileInput,
@@ -1038,7 +1207,7 @@ async function pageOps(command, args) {
     return match
   }
 
-  function clickElement(el) {
+  function clickElement(el, options = {}) {
     try {
       el.scrollIntoView({ block: "center", inline: "center" })
     } catch {}
@@ -1046,19 +1215,68 @@ async function pageOps(command, args) {
     const rect = el.getBoundingClientRect()
     const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1)
     const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1)
-    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }
+    const buttonName = String(options.button || "left").toLowerCase()
+    const button = buttonName === "right" ? 2 : buttonName === "middle" ? 1 : 0
+    const clickCount = Number(options.clickCount) >= 2 ? 2 : 1
+    const buttons = button === 2 ? 2 : button === 1 ? 4 : 1
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button, buttons }
 
     try {
       el.dispatchEvent(new MouseEvent("mouseover", opts))
       el.dispatchEvent(new MouseEvent("mousemove", opts))
       el.dispatchEvent(new MouseEvent("mousedown", opts))
       el.dispatchEvent(new MouseEvent("mouseup", opts))
-      el.dispatchEvent(new MouseEvent("click", opts))
+      if (button === 2) {
+        el.dispatchEvent(new MouseEvent("contextmenu", opts))
+      } else {
+        el.dispatchEvent(new MouseEvent("click", opts))
+        if (clickCount >= 2) {
+          el.dispatchEvent(new MouseEvent("mousedown", opts))
+          el.dispatchEvent(new MouseEvent("mouseup", opts))
+          el.dispatchEvent(new MouseEvent("dblclick", opts))
+        }
+      }
     } catch {}
 
+    if (button === 0 && clickCount === 1) {
+      try {
+        el.click()
+      } catch {}
+    }
+  }
+
+  function hoverElement(el) {
     try {
-      el.click()
+      el.scrollIntoView({ block: "center", inline: "center" })
     } catch {}
+    const rect = el.getBoundingClientRect()
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), window.innerWidth - 1)
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), window.innerHeight - 1)
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }
+    try {
+      el.dispatchEvent(new MouseEvent("mouseover", opts))
+      el.dispatchEvent(new MouseEvent("mouseenter", opts))
+      el.dispatchEvent(new MouseEvent("mousemove", opts))
+    } catch {}
+  }
+
+  function dragElements(fromEl, toEl) {
+    const fromRect = fromEl.getBoundingClientRect()
+    const toRect = toEl.getBoundingClientRect()
+    const fx = fromRect.left + fromRect.width / 2
+    const fy = fromRect.top + fromRect.height / 2
+    const tx = toRect.left + toRect.width / 2
+    const ty = toRect.top + toRect.height / 2
+    const dt = new DataTransfer()
+    const startOpts = { bubbles: true, cancelable: true, view: window, clientX: fx, clientY: fy, dataTransfer: dt, buttons: 1 }
+    const endOpts = { bubbles: true, cancelable: true, view: window, clientX: tx, clientY: ty, dataTransfer: dt, buttons: 1 }
+    fromEl.dispatchEvent(new MouseEvent("mousedown", startOpts))
+    fromEl.dispatchEvent(new DragEvent("dragstart", startOpts))
+    toEl.dispatchEvent(new DragEvent("dragenter", endOpts))
+    toEl.dispatchEvent(new DragEvent("dragover", endOpts))
+    toEl.dispatchEvent(new DragEvent("drop", endOpts))
+    fromEl.dispatchEvent(new DragEvent("dragend", endOpts))
+    toEl.dispatchEvent(new MouseEvent("mouseup", endOpts))
   }
 
   function setNativeValue(el, value) {
@@ -1256,8 +1474,36 @@ async function pageOps(command, args) {
     if (!match.chosen) {
       return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
     }
-    clickElement(match.chosen)
+    clickElement(match.chosen, { button: options.button, clickCount: options.clickCount })
     return { ok: true, selectorUsed: match.selectorUsed }
+  }
+
+  if (command === "hover") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) {
+      return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    }
+    hoverElement(match.chosen)
+    return { ok: true, selectorUsed: match.selectorUsed }
+  }
+
+  if (command === "drag") {
+    const fromSelectors = normalizeSelectorList(options.fromSelector || options.selector)
+    const toSelectors = normalizeSelectorList(options.toSelector)
+    const fromIndex = Number.isFinite(options.fromIndex) ? options.fromIndex : index
+    const toIndex = Number.isFinite(options.toIndex) ? options.toIndex : 0
+    if (!fromSelectors.length || !toSelectors.length) {
+      return { ok: false, error: "fromSelector and toSelector are required" }
+    }
+    const from = await resolveMatches(fromSelectors, fromIndex, timeoutMs, pollMs)
+    const to = await resolveMatches(toSelectors, toIndex, timeoutMs, pollMs)
+    if (!from.chosen) return { ok: false, error: `Drag source not found for selectors: ${fromSelectors.join(", ")}` }
+    if (!to.chosen) return { ok: false, error: `Drag target not found for selectors: ${toSelectors.join(", ")}` }
+    try {
+      from.chosen.scrollIntoView({ block: "center", inline: "center" })
+    } catch {}
+    dragElements(from.chosen, to.chosen)
+    return { ok: true, fromSelectorUsed: from.selectorUsed, toSelectorUsed: to.selectorUsed }
   }
 
   if (command === "type") {
@@ -1661,7 +1907,11 @@ async function pageOps(command, args) {
 
 async function toolGetActiveTab() {
   const tab = await getActiveTab()
-  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, title: tab.title } }
+  const pendingDialog = debuggerState.get(tab.id)?.pendingDialog || null
+  return {
+    tabId: tab.id,
+    content: { tabId: tab.id, url: tab.url, title: tab.title, pendingDialog },
+  }
 }
 
 async function toolOpenTab({ url, active = true }) {
@@ -1683,43 +1933,155 @@ async function toolNavigate({ url, tabId }) {
   if (!url) throw new Error("URL is required")
   const tab = await getTabById(tabId)
   await chrome.tabs.update(tab.id, { url })
-
-  await new Promise((resolve) => {
-    const listener = (updatedTabId, info) => {
-      if (updatedTabId === tab.id && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener)
-        resolve()
-      }
-    }
-    chrome.tabs.onUpdated.addListener(listener)
-    setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener)
-      resolve()
-    }, 30000)
-  })
-
+  await waitForTabComplete(tab.id)
   return { tabId: tab.id, content: `Navigated to ${url}` }
 }
 
-async function toolClick({ selector, tabId, index = 0, timeoutMs, pollMs }) {
+async function toolHistory({ action, tabId } = {}) {
+  const op = String(action || "").toLowerCase()
+  if (!["back", "forward", "reload"].includes(op)) {
+    throw new Error("action must be back, forward, or reload")
+  }
+  const tab = await getTabById(tabId)
+  const beforeUrl = tab.url
+  if (op === "back") {
+    try {
+      await chrome.tabs.goBack(tab.id)
+    } catch {
+      return { tabId: tab.id, content: { action: op, changed: false } }
+    }
+  } else if (op === "forward") {
+    try {
+      await chrome.tabs.goForward(tab.id)
+    } catch {
+      return { tabId: tab.id, content: { action: op, changed: false } }
+    }
+  } else {
+    await chrome.tabs.reload(tab.id)
+  }
+
+  const waitMs = op === "reload" ? 30000 : 2000
+  const result = await waitForTabComplete(tab.id, waitMs)
+  const after = await chrome.tabs.get(tab.id).catch(() => tab)
+  const changed = op === "reload" ? result.completed : after.url !== beforeUrl || result.completed
+  return { tabId: tab.id, content: { action: op, changed, url: after.url } }
+}
+
+async function toolHandleDialog({ accept, promptText, tabId } = {}) {
+  if (typeof accept !== "boolean") throw new Error("accept is required")
+  const tab = await getTabById(tabId)
+  const state = await ensureDebuggerAttached(tab.id)
+  if (!state.attached) {
+    throw new Error(state.unavailableReason || "Debugger not attached. DevTools may be open or another debugger is active.")
+  }
+  await ensureDebuggerDomain(tab.id, state, "Page")
+  if (!state.pendingDialog) {
+    const deadline = Date.now() + 2000
+    while (!state.pendingDialog && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50))
+    }
+  }
+  const params = { accept }
+  if (typeof promptText === "string") params.promptText = promptText
+  try {
+    await sendDebuggerCommand(tab.id, "Page.handleJavaScriptDialog", params)
+  } catch (error) {
+    const message = error?.message || String(error)
+    if (!state.pendingDialog) {
+      throw new Error("No JavaScript dialog is open on this tab.")
+    }
+    throw new Error(message)
+  }
+  const dialog = state.pendingDialog
+  state.pendingDialog = null
+  return { tabId: tab.id, content: { handled: true, accept, dialog } }
+}
+
+async function toolClick({ selector, tabId, index = 0, timeoutMs, pollMs, button = "left", clickCount = 1, modifiers } = {}) {
   if (!selector) throw new Error("Selector is required")
   const tab = await getTabById(tabId)
+  const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
+  if (!point?.ok) throw new Error(point?.error || "Click failed")
+  await showAgentCursor(tab.id, { x: point.x, y: point.y })
+  const mods = cdpKeyModifiers(Array.isArray(modifiers) ? modifiers.map(String) : [])
+  const count = Number(clickCount) >= 2 ? 2 : 1
+  const mouseButton = cdpMouseButton(button)
 
   const state = await ensureDebuggerAttached(tab.id)
   if (state.attached) {
-    const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
-    if (!point?.ok) throw new Error(point?.error || "Click failed")
-    const mouse = { x: point.x, y: point.y, button: "left", clickCount: 1 }
-    await sendDebuggerCommand(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", ...mouse })
-    await sendDebuggerCommand(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", ...mouse })
-    const used = point.selectorUsed || selector
-    return { tabId: tab.id, content: `Clicked ${used}` }
+    await cdpClick(tab.id, { x: point.x, y: point.y, button: mouseButton, clickCount: count, modifiers: mods })
+  } else {
+    const result = await runInPage(tab.id, "click", {
+      selector,
+      index,
+      timeoutMs,
+      pollMs,
+      button: mouseButton,
+      clickCount: count,
+    })
+    if (!result?.ok) throw new Error(result?.error || "Click failed")
   }
+  const used = point.selectorUsed || selector
+  const extra = count >= 2 ? " (double)" : mouseButton !== "left" ? ` (${mouseButton})` : ""
+  return { tabId: tab.id, content: `Clicked ${used}${extra}` }
+}
 
-  const result = await runInPage(tab.id, "click", { selector, index, timeoutMs, pollMs })
-  if (!result?.ok) throw new Error(result?.error || "Click failed")
-  const used = result.selectorUsed || selector
-  return { tabId: tab.id, content: `Clicked ${used}` }
+async function toolHover({ selector, tabId, index = 0, timeoutMs, pollMs } = {}) {
+  if (!selector) throw new Error("Selector is required")
+  const tab = await getTabById(tabId)
+  const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
+  if (!point?.ok) throw new Error(point?.error || "Hover failed")
+  await showAgentCursor(tab.id, { x: point.x, y: point.y })
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    await dispatchMouse(tab.id, { type: "mouseMoved", x: point.x, y: point.y, button: "left", clickCount: 1 })
+  } else {
+    const result = await runInPage(tab.id, "hover", { selector, index, timeoutMs, pollMs })
+    if (!result?.ok) throw new Error(result?.error || "Hover failed")
+  }
+  const used = point.selectorUsed || selector
+  return { tabId: tab.id, content: `Hovered ${used}` }
+}
+
+async function toolDrag({
+  fromSelector,
+  selector,
+  toSelector,
+  fromIndex = 0,
+  toIndex = 0,
+  tabId,
+  timeoutMs,
+  pollMs,
+} = {}) {
+  const source = fromSelector || selector
+  if (!source) throw new Error("fromSelector is required")
+  if (!toSelector) throw new Error("toSelector is required")
+  const tab = await getTabById(tabId)
+  const from = await runInPage(tab.id, "rect", { selector: source, index: fromIndex, timeoutMs, pollMs })
+  if (!from?.ok) throw new Error(from?.error || "Drag source not found")
+  const to = await runInPage(tab.id, "rect", { selector: toSelector, index: toIndex, timeoutMs, pollMs })
+  if (!to?.ok) throw new Error(to?.error || "Drag target not found")
+  await showAgentCursor(tab.id, { x: from.x, y: from.y })
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    await showAgentCursor(tab.id, { x: to.x, y: to.y, fromX: from.x, fromY: from.y })
+    await cdpDrag(tab.id, { x: from.x, y: from.y }, { x: to.x, y: to.y })
+  } else {
+    const result = await runInPage(tab.id, "drag", {
+      fromSelector: source,
+      toSelector,
+      fromIndex,
+      toIndex,
+      timeoutMs,
+      pollMs,
+    })
+    if (!result?.ok) throw new Error(result?.error || "Drag failed")
+    await showAgentCursor(tab.id, { x: to.x, y: to.y, fromX: from.x, fromY: from.y })
+  }
+  return {
+    tabId: tab.id,
+    content: `Dragged ${from.selectorUsed || source} to ${to.selectorUsed || toSelector}`,
+  }
 }
 
 async function toolType({ selector, text, tabId, clear = false, index = 0, timeoutMs, pollMs }) {
@@ -1899,12 +2261,13 @@ async function toolScreenshot({
   return { tabId: tab.id, content: `data:${screenshotMime(screenshotFormat)};base64,${result.data}` }
 }
 
-async function toolSnapshot({ tabId }) {
+async function toolSnapshot({ tabId, full = false } = {}) {
   const tab = await getTabById(tabId)
 
   const result = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    func: () => {
+    args: [{ full: !!full }],
+    func: (opts) => {
       function safeText(s) {
         return typeof s === "string" ? s : ""
       }
@@ -1950,11 +2313,53 @@ async function toolSnapshot({ tabId }) {
         return ""
       }
 
-      function build(el, depth = 0, uid = 0) {
-        if (!el || depth > 12) return { nodes: [], nextUid: uid }
+      function clearIrisUids(root) {
+        try {
+          root.querySelectorAll("[data-iris-uid]").forEach((el) => {
+            try {
+              el.removeAttribute("data-iris-uid")
+            } catch {}
+          })
+          root.querySelectorAll("*").forEach((el) => {
+            if (el.shadowRoot) clearIrisUids(el.shadowRoot)
+          })
+        } catch {}
+      }
+
+      function maxExistingUid(root) {
+        let max = -1
+        const visit = (r) => {
+          try {
+            r.querySelectorAll("[data-iris-uid]").forEach((el) => {
+              const match = String(el.getAttribute("data-iris-uid") || "").match(/^e(\d+)$/)
+              if (match) max = Math.max(max, Number(match[1]))
+            })
+            r.querySelectorAll("*").forEach((el) => {
+              if (el.shadowRoot) visit(el.shadowRoot)
+            })
+          } catch {}
+        }
+        visit(root)
+        return max
+      }
+
+      function takeUid(el) {
+        const existing = el.getAttribute("data-iris-uid")
+        if (existing && /^e\d+$/.test(existing)) return existing
+        const seq = Number(document.documentElement.dataset.irisUidSeq || "0") || 0
+        const uidStr = `e${seq}`
+        document.documentElement.dataset.irisUidSeq = String(seq + 1)
+        try {
+          el.setAttribute("data-iris-uid", uidStr)
+        } catch {}
+        return uidStr
+      }
+
+      function build(el, depth = 0) {
+        if (!el || depth > 12) return { nodes: [] }
         const nodes = []
 
-        if (!isVisible(el)) return { nodes: [], nextUid: uid }
+        if (!isVisible(el)) return { nodes: [] }
 
         const isInteractive =
           ["A", "BUTTON", "INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) ||
@@ -1968,17 +2373,13 @@ async function toolSnapshot({ tabId }) {
         const shouldInclude = isInteractive || name.trim() || pt.before || pt.after
 
         if (shouldInclude) {
-          const uidStr = `e${uid}`
+          const uidStr = takeUid(el)
           const node = {
             uid: uidStr,
             role: el.getAttribute("role") || el.tagName.toLowerCase(),
             name: name,
             tag: el.tagName.toLowerCase(),
           }
-
-          try {
-            el.setAttribute("data-iris-uid", uidStr)
-          } catch {}
 
           if (pt.before) node.before = pt.before
           if (pt.after) node.after = pt.after
@@ -2003,24 +2404,19 @@ async function toolSnapshot({ tabId }) {
           node.selector = `[data-iris-uid="${uidStr}"]`
 
           nodes.push(node)
-          uid++
         }
 
         if (el.shadowRoot) {
           for (const child of el.shadowRoot.children) {
-            const r = build(child, depth + 1, uid)
-            nodes.push(...r.nodes)
-            uid = r.nextUid
+            nodes.push(...build(child, depth + 1).nodes)
           }
         }
 
         for (const child of el.children) {
-          const r = build(child, depth + 1, uid)
-          nodes.push(...r.nodes)
-          uid = r.nextUid
+          nodes.push(...build(child, depth + 1).nodes)
         }
 
-        return { nodes, nextUid: uid }
+        return { nodes }
       }
 
       function getAllLinks() {
@@ -2042,31 +2438,18 @@ async function toolSnapshot({ tabId }) {
         pageText = safeText(document.body?.innerText || "").slice(0, 20000)
       } catch {}
 
-      // Clear prior snapshot stamps so eN renumbers cleanly each run
-      try {
-        document.querySelectorAll("[data-iris-uid]").forEach((el) => {
-          try {
-            el.removeAttribute("data-iris-uid")
-          } catch {}
-        })
-        // shadow roots: walk open shadows shallowly
-        const walk = (root) => {
-          root.querySelectorAll("*").forEach((el) => {
-            if (el.shadowRoot) {
-              el.shadowRoot.querySelectorAll("[data-iris-uid]").forEach((n) => {
-                try {
-                  n.removeAttribute("data-iris-uid")
-                } catch {}
-              })
-              walk(el.shadowRoot)
-            }
-          })
-        }
-        walk(document)
-      } catch {}
+      const reset = !!opts?.full || document.documentElement.dataset.irisUidUrl !== location.href
+      if (reset) {
+        clearIrisUids(document)
+        document.documentElement.dataset.irisUidSeq = "0"
+      } else {
+        const existingMax = maxExistingUid(document)
+        const stored = Number(document.documentElement.dataset.irisUidSeq || "0") || 0
+        document.documentElement.dataset.irisUidSeq = String(Math.max(stored, existingMax + 1))
+      }
+      document.documentElement.dataset.irisUidUrl = location.href
 
       const built = build(document.body).nodes.slice(0, 800)
-
 
       return {
         url: location.href,
@@ -2074,12 +2457,51 @@ async function toolSnapshot({ tabId }) {
         text: pageText,
         nodes: built,
         links: getAllLinks(),
+        restamped: reset,
       }
     },
     world: "ISOLATED",
   })
 
-  return { tabId: tab.id, content: JSON.stringify(result[0]?.result, null, 2) }
+  const snapshot = result[0]?.result || { url: tab.url, title: tab.title, nodes: [] }
+  const prev = lastSnapshot.get(tab.id)
+  const shouldFull = !!full || !prev || prev.url !== snapshot.url || snapshot.restamped
+  lastSnapshot.set(tab.id, { url: snapshot.url, nodesByUid: indexByUid(snapshot.nodes) })
+
+  if (shouldFull) {
+    return {
+      tabId: tab.id,
+      content: JSON.stringify(
+        {
+          mode: "full",
+          url: snapshot.url,
+          title: snapshot.title,
+          text: snapshot.text,
+          nodes: snapshot.nodes,
+          links: snapshot.links,
+        },
+        null,
+        2
+      ),
+    }
+  }
+
+  const diff = diffSnapshots(prev.nodesByUid, snapshot.nodes)
+  return {
+    tabId: tab.id,
+    content: JSON.stringify(
+      {
+        mode: "diff",
+        url: snapshot.url,
+        title: snapshot.title,
+        added: diff.added,
+        removed: diff.removed,
+        changed: diff.changed,
+      },
+      null,
+      2
+    ),
+  }
 }
 
 async function toolGetTabs() {
@@ -2556,6 +2978,14 @@ chrome.action.onClicked.addListener(async () => {
   }
 
   await connect()
+
+  if (!isConnected) return
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (!tab?.id) return
+    const claimed = lastClaims.some((c) => c.tabId === tab.id)
+    if (claimed) send({ type: "release_tab", tabId: tab.id })
+  } catch {}
 })
 
 connect().catch(() => {})

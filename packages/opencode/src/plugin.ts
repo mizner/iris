@@ -617,8 +617,61 @@ const plugin: Plugin = async (ctx) => {
         },
       }),
 
+      browser_history: tool({
+        description: "Go back, forward, or reload the current tab.",
+        args: {
+          action: schema.string(),
+          tabId: schema.number().optional(),
+        },
+        async execute({ action, tabId }, ctx) {
+          const data = await toolRequest("history", { action, tabId });
+          return toolResultText(data, `History ${action}`);
+        },
+      }),
+
+      browser_handle_dialog: tool({
+        description: "Accept or dismiss a JavaScript alert/confirm/prompt/beforeunload dialog.",
+        args: {
+          accept: schema.boolean(),
+          promptText: schema.string().optional(),
+          tabId: schema.number().optional(),
+        },
+        async execute({ accept, promptText, tabId }, ctx) {
+          const data = await toolRequest("handle_dialog", { accept, promptText, tabId });
+          return toolResultText(data, accept ? "Accepted dialog" : "Dismissed dialog");
+        },
+      }),
+
       browser_click: tool({
-        description: "Click an element on the page using a CSS selector",
+        description:
+          "Click an element. Optional button (left/right/middle), clickCount (2 = double-click), and modifiers.",
+        args: {
+          selector: schema.string(),
+          index: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+          button: schema.string().optional(),
+          clickCount: schema.number().optional(),
+          modifiers: schema.array(schema.string()).optional(),
+        },
+        async execute({ selector, index, tabId, timeoutMs, pollMs, button, clickCount, modifiers }, ctx) {
+          const data = await toolRequest("click", {
+            selector,
+            index,
+            tabId,
+            timeoutMs,
+            pollMs,
+            button,
+            clickCount,
+            modifiers,
+          });
+          return toolResultText(data, `Clicked ${selector}`);
+        },
+      }),
+
+      browser_hover: tool({
+        description: "Hover the pointer over an element (opens CSS menus, tooltips).",
         args: {
           selector: schema.string(),
           index: schema.number().optional(),
@@ -627,8 +680,35 @@ const plugin: Plugin = async (ctx) => {
           pollMs: schema.number().optional(),
         },
         async execute({ selector, index, tabId, timeoutMs, pollMs }, ctx) {
-          const data = await toolRequest("click", { selector, index, tabId, timeoutMs, pollMs });
-          return toolResultText(data, `Clicked ${selector}`);
+          const data = await toolRequest("hover", { selector, index, tabId, timeoutMs, pollMs });
+          return toolResultText(data, `Hovered ${selector}`);
+        },
+      }),
+
+      browser_drag: tool({
+        description: "Drag from one element to another (selector or uid locators).",
+        args: {
+          fromSelector: schema.string().optional(),
+          selector: schema.string().optional(),
+          toSelector: schema.string(),
+          fromIndex: schema.number().optional(),
+          toIndex: schema.number().optional(),
+          tabId: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          pollMs: schema.number().optional(),
+        },
+        async execute({ fromSelector, selector, toSelector, fromIndex, toIndex, tabId, timeoutMs, pollMs }, ctx) {
+          const data = await toolRequest("drag", {
+            fromSelector,
+            selector,
+            toSelector,
+            fromIndex,
+            toIndex,
+            tabId,
+            timeoutMs,
+            pollMs,
+          });
+          return toolResultText(data, `Dragged to ${toSelector}`);
         },
       }),
 
@@ -722,12 +802,14 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_snapshot: tool({
-        description: "Get an accessibility tree snapshot of the page.",
+        description:
+          "Capture an accessibility snapshot. First call (or full=true) returns all nodes; later calls return a uid-preserving diff.",
         args: {
           tabId: schema.number().optional(),
+          full: schema.boolean().optional(),
         },
-        async execute({ tabId }, ctx) {
-          const data = await toolRequest("snapshot", { tabId });
+        async execute({ tabId, full }, ctx) {
+          const data = await toolRequest("snapshot", { tabId, full });
           return toolResultText(data, "Snapshot failed");
         },
       }),
