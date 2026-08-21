@@ -63,7 +63,7 @@ Runtime files are installed outside the repository:
 └── native-host.cjs
 ```
 
-The Chrome native messaging host name is `com.iris.host`. The extension ID is expected to remain `ncfalpcdanbcccbaakenefpokeioldgd` when the bundled manifest key is preserved.
+The Chrome native messaging host name is `com.iris.host`. The extension ID is expected to remain `ncfalpcdanbcccbaakenefpokeioldgd` when the bundled manifest key is preserved. The toolbar badge shows `ON` when connected and a claim count when tabs are owned; clicking the Iris icon on a claimed tab releases that claim.
 
 ## Development Commands
 

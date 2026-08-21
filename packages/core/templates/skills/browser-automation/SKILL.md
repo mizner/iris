@@ -47,7 +47,7 @@ browser_snapshot
 browser_screenshot
 ```
 
-Use `browser_snapshot` when accessibility structure matters. Use `browser_screenshot` when layout, modals, or visual state matters.
+Use `browser_snapshot` when accessibility structure matters. The first snapshot is a full node list with stable `uid:` values; later snapshots on the same page are diffs (`added` / `removed` / `changed`). Pass `full=true` to restamp. Use `browser_screenshot` when layout, modals, or visual state matters. Hover CSS menus with `browser_hover` before clicking items inside them. If a JS dialog appears, `browser_get_active_tab` includes `pendingDialog`; then `browser_handle_dialog`. Clicking the Iris toolbar icon releases a claimed tab.
 
 ## Selector Preference
 
@@ -74,6 +74,11 @@ Every action should be followed by a read that proves what happened.
 
 ```text
 browser_click selector="text:Submit" timeoutMs=3000
+browser_hover selector="text:File"
+browser_click selector="text:Submit" button="right"
+browser_click selector="text:Item" clickCount=2
+browser_drag fromSelector="uid:e3" toSelector="uid:e8"
+browser_history action="back"
 browser_query mode=page_text pattern="Success|Error|Dashboard"
 ```
 

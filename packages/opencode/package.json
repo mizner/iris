@@ -1,6 +1,6 @@
 {
   "name": "@mizner/iris-opencode",
-  "version": "4.8.1",
+  "version": "4.9.0",
   "description": "OpenCode adapter for Iris browser automation.",
   "type": "module",
   "engines": {

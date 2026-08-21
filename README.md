@@ -125,10 +125,14 @@ browser_health
 browser_get_tabs
 browser_open_tab
 browser_navigate
+browser_history
 browser_click
+browser_hover
+browser_drag
 browser_type
 browser_snapshot
 browser_screenshot
+browser_handle_dialog
 browser_console
 browser_errors
 ```

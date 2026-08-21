@@ -133,19 +133,35 @@ function clearDefaultTab(sessionId, tabId) {
   state.lastSeenAt = nowMs();
 }
 
-function releaseClaim(tabId) {
+function broadcastClaims() {
+  const payload = { type: "to_extension", message: { type: "claims", claims: listClaims() } };
+  for (const [hostSocket] of healthyHosts()) {
+    try {
+      writeJsonLine(hostSocket, payload);
+    } catch {}
+  }
+}
+
+function releaseClaim(tabId, { silent = false } = {}) {
   const info = claims.get(tabId);
-  if (!info) return;
+  if (!info) return false;
   claims.delete(tabId);
   clearDefaultTab(info.sessionId, tabId);
+  if (!silent) broadcastClaims();
+  return true;
 }
 
 function releaseClaimsForSession(sessionId) {
+  let any = false;
   for (const [tabId, info] of claims.entries()) {
-    if (info.sessionId === sessionId) claims.delete(tabId);
+    if (info.sessionId === sessionId) {
+      claims.delete(tabId);
+      any = true;
+    }
   }
   clearDefaultTab(sessionId);
   sessionState.delete(sessionId);
+  if (any) broadcastClaims();
 }
 
 function checkClaim(tabId, sessionId) {
@@ -162,6 +178,7 @@ function setClaim(tabId, sessionId) {
     claimedAt: existing ? existing.claimedAt : nowIso(),
     lastSeenAt: nowMs(),
   });
+  if (!existing || existing.sessionId !== sessionId) broadcastClaims();
 }
 
 function touchClaim(tabId, sessionId) {
@@ -177,11 +194,14 @@ function touchClaim(tabId, sessionId) {
 function cleanupStaleClaims() {
   if (!LEASE_TTL_MS) return;
   const now = nowMs();
+  let expired = false;
   for (const [tabId, info] of claims.entries()) {
     if (now - info.lastSeenAt > LEASE_TTL_MS) {
-      releaseClaim(tabId);
+      releaseClaim(tabId, { silent: true });
+      expired = true;
     }
   }
+  if (expired) broadcastClaims();
   for (const [sessionId, state] of sessionState.entries()) {
     if (!sessionHasClaims(sessionId) && now - state.lastSeenAt > LEASE_TTL_MS) {
       sessionState.delete(sessionId);
@@ -380,6 +400,7 @@ function handleClientMessage(socket, client, msg) {
       });
       // allow host to see current state
       writeJsonLine(socket, { type: "host_ready", claims: listClaims() });
+      writeJsonLine(socket, { type: "to_extension", message: { type: "claims", claims: listClaims() } });
     }
     return;
   }
@@ -389,6 +410,10 @@ function handleClientMessage(socket, client, msg) {
     if (info) info.lastPongAt = nowMs();
     const message = msg.message;
     if (message && message.type === "pong") return;
+    if (message && message.type === "release_tab" && typeof message.tabId === "number") {
+      releaseClaim(message.tabId);
+      return;
+    }
     if (message && message.type === "tool_response" && typeof message.id === "number") {
       const pending = extPending.get(message.id);
       if (!pending) return;
@@ -579,7 +604,10 @@ if (PING_INTERVAL_MS > 0) {
         continue;
       }
       try {
-        writeJsonLine(hostSocket, { type: "to_extension", message: { type: "ping", id: ++nextExtId } });
+        writeJsonLine(hostSocket, {
+          type: "to_extension",
+          message: { type: "ping", id: ++nextExtId, claims: listClaims() },
+        });
       } catch {}
     }
   }, PING_INTERVAL_MS);

@@ -38,7 +38,7 @@ CLI:
 2. Inspect tabs with `browser_get_tabs` or `browser_get_active_tab`.
 3. Claim a tab if multiple agents may be active.
 4. Observe before acting with `browser_query`, `browser_snapshot`, or `browser_screenshot`.
-5. Act with the narrowest reliable selector.
+5. Act with the narrowest reliable selector (`uid:` from a snapshot, then `text:` / `label:`). Hover before CSS menus; drag for reorder UIs. After the first snapshot, diffs are the default — pass `full=true` if uids look wrong.
 6. Verify the result after every navigation, click, type, or download.
 7. Release claimed tabs when done.
 
@@ -56,7 +56,11 @@ CLI:
 - `browser_open_tab` - Open and optionally claim a new tab.
 - `browser_close_tab` - Close a claimed tab.
 - `browser_navigate` - Navigate a tab to a URL.
-- `browser_click` - Click an element by selector.
+- `browser_history` - Go back, forward, or reload (`action=back|forward|reload`).
+- `browser_handle_dialog` - Accept or dismiss a JavaScript alert/confirm/prompt.
+- `browser_click` - Click an element by selector (`button`, `clickCount=2` for double-click, `modifiers`).
+- `browser_hover` - Hover the pointer over an element (CSS menus, tooltips).
+- `browser_drag` - Drag from `fromSelector` to `toSelector`.
 - `browser_type` - Type into an input or editable element.
 - `browser_press` - Press a key (Enter/Tab/Escape/arrows/char) with optional modifiers and focus selector.
 - `browser_select` - Choose an option in a native `<select>`.
@@ -64,7 +68,7 @@ CLI:
 - `browser_wait` - Sleep for a specified duration.
 - `browser_wait_for` - Wait for a selector, text, page-text regex, URL pattern, or network idle.
 - `browser_query` - Read page text, attributes, properties, or selector matches.
-- `browser_snapshot` - Capture the accessibility tree snapshot.
+- `browser_snapshot` - Capture the accessibility tree snapshot. First call is full; later calls return a uid-preserving diff unless `full=true`.
 - `browser_screenshot` - Capture a visible, full-page, selector, or clipped screenshot.
 - `browser_download` - Download a file by URL or click path.
 - `browser_list_downloads` - List recent downloads.
@@ -91,6 +95,7 @@ Prefer:
 
 Selector prefixes, in rough preference order:
 
+- `uid:` / `ref:` for snapshot node ids (`e0`, `e1`, …).
 - `label:` for labeled form inputs.
 - `aria:` for accessible names.
 - `role:` for ARIA roles.
