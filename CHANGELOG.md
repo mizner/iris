@@ -3,6 +3,18 @@
 
 ## Unreleased
 
+- Several Chrome profiles: each session picks one (`browser_profiles`, `browser_use_profile`, `browser_resolve_profile`); `PROFILE_REQUIRED` instead of guessing. Optional `browser_run` decision model.
+- Add `browser_request_user`: hand a tab to the user for sign-in, 2FA, or CAPTCHA (banner with Done button, notification) and wait for a URL, selector, text, or Done.
+- Add `browser_evaluate`: evaluate JavaScript in the page's main world via CDP (ignores page CSP, awaits promises), with a main-world script fallback.
+- Session tabs are collected in a Chrome tab group per session (`IRIS_TAB_GROUPS=off` disables). Adds the `tabGroups` permission.
+- Fix: the OpenCode/OMP adapter started the broker with `process.execPath`, which inside compiled harnesses (OMP) is the harness binary, not Node; it launched stray agent runs and crashed after harness upgrades. Node is now resolved from `IRIS_NODE`, the running Node, `config.json` `nodePath`, or `PATH`.
+- Fix: `browser_wait_for` polls from the service worker, so waits survive navigation and pages that were still loading. Waits longer than 60s no longer time out at the broker or adapter.
+- Fix: `browser_network_stop` no longer attaches the debugger; it detaches by default so Chrome's debugging bar goes away (`detach=false` keeps console capture).
+- Fix: WebMCP detection checks `document.modelContext` (Chromium removed `navigator.modelContext`).
+- A closed tab returns `TAB_NOT_FOUND` with guidance and its claim is released; a session's own closed tab is replaced transparently.
+- `browser_query`: `count` and `all` mode aliases; unknown modes list the valid ones; no-match errors suggest discovery calls.
+- Skill drift check covers all skill copies, rejects references to tools that do not exist, and requires the OpenCode skill to match the template.
+
 ## 4.9.0
 
 - Add `browser_hover` and `browser_drag`; extend `browser_click` with `button`, `clickCount`, and `modifiers`.
