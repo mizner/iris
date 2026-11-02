@@ -25,7 +25,7 @@ function paramType(node) {
   return { optional: false, type: node.type ?? null };
 }
 
-test("OMP extension registers 44 browser_* tools with rebuilt schemas", async () => {
+test("OMP extension registers 49 browser_* tools with rebuilt schemas", async () => {
   const mod = await import(pathToFileURL(extensionPath).href);
   const factory = mod.default;
   assert.equal(typeof factory, "function");
@@ -59,7 +59,7 @@ test("OMP extension registers 44 browser_* tools with rebuilt schemas", async ()
   await factory(pi);
 
   const browserTools = registered.filter((n) => n.startsWith("browser_"));
-  assert.equal(browserTools.length, 44);
+  assert.equal(browserTools.length, 49);
   for (const name of ["browser_profiles", "browser_use_profile", "browser_resolve_profile", "browser_run"]) {
     assert.ok(registered.includes(name), `${name} registered`);
   }

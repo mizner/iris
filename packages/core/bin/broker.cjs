@@ -82,8 +82,14 @@ function wantsTab(toolName) {
     "list_downloads",
     "get_profile_status",
     "profile_summary",
+    "search_history",
+    "bookmarks",
+    "recently_closed",
   ].includes(toolName);
 }
+
+// Profile-wide lookups that can search every connected profile when the session has not chosen one yet.
+const PROFILE_LISTS = { search_history: null, bookmarks: null, recently_closed: "recentlyClosed" };
 
 // --- State ---
 // socket -> { pid, connectedAt, helloAt, lastPongAt, profileKey, profileId, allowed, version }
@@ -548,6 +554,30 @@ async function allProfileStatuses(sessionId) {
   };
 }
 
+async function allProfilesList(tool, args, sessionId) {
+  const results = await fanOut(tool, args, sessionId, EXTENSION_TIMEOUT_MS);
+  if (!results.some((r) => r.ok)) throw firstFanOutError(results);
+  const listKey = PROFILE_LISTS[tool];
+  const merged = [];
+  const errors = [];
+  for (const r of results) {
+    const profile = labelFor(r.info.profileKey);
+    if (!r.ok) {
+      errors.push({ profile, error: r.error });
+      continue;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(r.value?.content || "[]");
+    } catch {
+      parsed = [];
+    }
+    const items = listKey ? parsed?.[listKey] || [] : parsed;
+    for (const item of Array.isArray(items) ? items : []) merged.push({ ...item, profile });
+  }
+  return { content: JSON.stringify(errors.length ? { results: merged, errors } : merged, null, 2) };
+}
+
 async function refreshTabOwners(sessionId) {
   const results = await fanOut("get_tabs", {}, sessionId);
   for (const r of results) {
@@ -670,6 +700,7 @@ async function handleTool(req) {
   if (unscoped && tool === "get_tabs") return await allProfilesTabs(sessionId);
   if (unscoped && tool === "get_active_tab") return await focusedActiveTab(sessionId);
   if (unscoped && tool === "get_profile_status") return await allProfileStatuses(sessionId);
+  if (unscoped && tool in PROFILE_LISTS && !args.restore) return await allProfilesList(tool, args, sessionId);
 
   const route = await resolveRoute(sessionId, { profile: requestedProfile, tabId: args.tabId });
   const isCloseTool = tool === "close_tab";
@@ -714,7 +745,12 @@ async function handleTool(req) {
     }
   }
 
-  return withProfile(tool, res, route.key);
+  const out = withProfile(tool, res, route.key);
+  // Report popups and tabs this session's pages opened since its last call.
+  if (state?.openedTabs?.length && out && typeof out === "object" && !Array.isArray(out)) {
+    out.openedTabs = state.openedTabs.splice(0);
+  }
+  return out;
 }
 
 // --- Profile inventory, choice, and selection ---
@@ -1037,6 +1073,24 @@ function handleClientMessage(socket, client, msg) {
     }
     if (message && message.type === "release_tab" && typeof message.tabId === "number") {
       releaseClaim(message.tabId);
+      return;
+    }
+    if (message && message.type === "tab_opened" && typeof message.tabId === "number") {
+      const opener = claims.get(message.openerTabId);
+      if (!opener || claims.has(message.tabId)) return;
+      tabOwners.set(message.tabId, socket);
+      setClaim(message.tabId, opener.sessionId);
+      const state = getSessionState(opener.sessionId);
+      if (state) {
+        state.openedTabs = state.openedTabs || [];
+        state.openedTabs.push({
+          tabId: message.tabId,
+          openerTabId: message.openerTabId,
+          url: message.url || "",
+          popup: message.windowType === "popup",
+        });
+        if (state.openedTabs.length > 20) state.openedTabs.splice(0, state.openedTabs.length - 20);
+      }
       return;
     }
     if (message && message.type === "tool_response" && typeof message.id === "number") {

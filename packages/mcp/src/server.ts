@@ -39,8 +39,36 @@ function toStructuredContent(value: unknown): Record<string, unknown> | undefine
   return { value };
 }
 
+
+// Screenshots arrive as a data URL, or as JSON with an `image` data URL plus metadata. Return them as image
+// content so the model sees a picture instead of a base64 string.
+function splitImage(text: string): { image?: { data: string; mimeType: string }; rest?: string } {
+  const asImage = (url: unknown) => {
+    const match = typeof url === "string" ? url.match(/^data:(image\/[a-z+]+);base64,([\s\S]+)$/) : null;
+    return match ? { mimeType: match[1], data: match[2] } : undefined;
+  };
+  if (text.startsWith("data:image/")) return { image: asImage(text) };
+  if (text.startsWith('{"image"')) {
+    try {
+      const { image, ...rest } = JSON.parse(text);
+      const parsed = asImage(image);
+      if (parsed) return { image: parsed, rest: JSON.stringify(rest, null, 2) };
+    } catch {}
+  }
+  return {};
+}
+
 function normalizeResult(result: unknown) {
   if (typeof result === "string") {
+    const { image, rest } = splitImage(result);
+    if (image) {
+      return {
+        content: [
+          { type: "image" as const, data: image.data, mimeType: image.mimeType },
+          ...(rest ? [{ type: "text" as const, text: rest }] : []),
+        ],
+      };
+    }
     try {
       const parsed = JSON.parse(result);
       return {

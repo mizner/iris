@@ -9,6 +9,10 @@
   "permissions": [
     "tabs",
     "tabGroups",
+    "history",
+    "bookmarks",
+    "sessions",
+    "webNavigation",
     "activeTab",
     "scripting",
     "storage",

@@ -23440,7 +23440,7 @@ import { tmpdir } from "os";
 import { basename, dirname, isAbsolute, join as join2, resolve } from "path";
 import { spawn } from "child_process";
 import { createRequire as createRequire2 } from "module";
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync, writeFileSync } from "fs";
 import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath } from "url";
@@ -36590,6 +36590,26 @@ function resolveUploadPath(filePath) {
     throw new Error("filePath is required");
   return isAbsolute2(trimmed) ? trimmed : resolve2(process.cwd(), trimmed);
 }
+function saveScreenshot(text, savePath) {
+  let dataUrl = text;
+  let extra = {};
+  if (text.startsWith("{")) {
+    const parsed = JSON.parse(text);
+    if (!parsed?.image)
+      return text;
+    const { image, ...rest } = parsed;
+    dataUrl = image;
+    extra = rest;
+  }
+  const match = dataUrl.match(/^data:image\/[a-z+]+;base64,([\s\S]+)$/);
+  if (!match)
+    return text;
+  const target = isAbsolute2(savePath) ? savePath : resolve2(process.cwd(), savePath);
+  mkdirSync2(dirname2(target), { recursive: true });
+  const bytes = Buffer.from(match[1], "base64");
+  writeFileSync(target, bytes);
+  return JSON.stringify({ saved: target, bytes: bytes.length, ...extra }, null, 2);
+}
 function buildFileUploadPayload(filePath, fileName, mimeType) {
   const absPath = resolveUploadPath(filePath);
   const stats = statSync(absPath);
@@ -36720,14 +36740,25 @@ async function brokerOnlyRequest(op, payload) {
   }
   return await brokerRequest(op, payload);
 }
+var pendingOpenedTabs = [];
 function toolResultText(data, fallback) {
+  if (Array.isArray(data?.openedTabs))
+    pendingOpenedTabs.push(...data.openedTabs);
+  let text;
   if (typeof data?.content === "string")
-    return data.content;
-  if (typeof data === "string")
-    return data;
-  if (data?.content != null)
-    return JSON.stringify(data.content);
-  return fallback;
+    text = data.content;
+  else if (typeof data === "string")
+    text = data;
+  else if (data?.content != null)
+    text = JSON.stringify(data.content);
+  else
+    text = fallback;
+  if (!pendingOpenedTabs.length || text.startsWith("data:") || text.startsWith('{"image"'))
+    return text;
+  const opened = pendingOpenedTabs.splice(0);
+  return `${text}
+
+[Iris] This session's pages opened new tabs (already claimed; pass tabId to use them): ${JSON.stringify(opened)}`;
 }
 var ROUTER_LOG_PATH = join3(RUNTIME_DIR, "router.log");
 var cachedAppleScriptApp = null;
@@ -37282,9 +37313,12 @@ var plugin = async (ctx) => {
         }
       }),
       browser_screenshot: tool({
-        description: "Take a screenshot of the current page. Supports visible, full-page, selector, and manual clip captures. Returns base64 image data URL.",
+        description: 'Take a screenshot of the current page (visible, full-page, selector, or clip). annotate=true draws uid labels on interactive elements (click them with selector="uid:e12") and returns the label list. ifChanged=true returns {unchanged:true} instead of an identical image. savePath writes the image to disk and returns the path instead of image data.',
         args: {
           tabId: schema.number().optional(),
+          annotate: schema.boolean().optional(),
+          ifChanged: schema.boolean().optional(),
+          savePath: schema.string().optional(),
           fullPage: schema.boolean().optional(),
           selector: schema.string().optional(),
           index: schema.number().optional(),
@@ -37297,9 +37331,11 @@ var plugin = async (ctx) => {
           timeoutMs: schema.number().optional(),
           pollMs: schema.number().optional()
         },
-        async execute({ tabId, fullPage, selector, index, x, y, width, height, format, quality, timeoutMs, pollMs }, ctx) {
+        async execute({ tabId, annotate, ifChanged, savePath, fullPage, selector, index, x, y, width, height, format, quality, timeoutMs, pollMs }, ctx) {
           const data = await toolRequest("screenshot", {
             tabId,
+            annotate,
+            ifChanged,
             fullPage,
             selector,
             index,
@@ -37312,17 +37348,22 @@ var plugin = async (ctx) => {
             timeoutMs,
             pollMs
           });
-          return toolResultText(data, "Screenshot failed");
+          const text = toolResultText(data, "Screenshot failed");
+          return savePath ? saveScreenshot(text, savePath) : text;
         }
       }),
       browser_snapshot: tool({
-        description: "Capture an accessibility snapshot. First call (or full=true) returns all nodes; later calls return a uid-preserving diff.",
+        description: "Capture an accessibility snapshot. First call (or full=true, or changed filters) returns all nodes; later calls return a uid-preserving diff. interactive=true keeps only clickable/typeable elements and drops page text (much smaller). selector limits it to one part of the page (CSS or uid:eN). maxNodes caps the node count (default 800).",
         args: {
           tabId: schema.number().optional(),
-          full: schema.boolean().optional()
+          full: schema.boolean().optional(),
+          interactive: schema.boolean().optional(),
+          selector: schema.string().optional(),
+          includeText: schema.boolean().optional(),
+          maxNodes: schema.number().optional()
         },
-        async execute({ tabId, full }, ctx) {
-          const data = await toolRequest("snapshot", { tabId, full });
+        async execute({ tabId, full, interactive, selector, includeText, maxNodes }, ctx) {
+          const data = await toolRequest("snapshot", { tabId, full, interactive, selector, includeText, maxNodes });
           return toolResultText(data, "Snapshot failed");
         }
       }),
@@ -37609,6 +37650,79 @@ var plugin = async (ctx) => {
           return toolResultText(data, "{}");
         }
       }),
+      browser_read: tool({
+        description: "Read the page as clean markdown (headings, lists, tables, links), the cheapest way to read content. Uses <main>/<article> when present and skips nav/header/footer/aside. selector limits it to one part (CSS or uid:eN). outline=true returns only the heading outline. Long pages are paged: pass offset from the truncation note.",
+        args: {
+          selector: schema.string().optional(),
+          maxChars: schema.number().optional(),
+          offset: schema.number().optional(),
+          outline: schema.boolean().optional(),
+          includeLinks: schema.boolean().optional(),
+          includeImages: schema.boolean().optional(),
+          includeChrome: schema.boolean().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ selector, maxChars, offset, outline, includeLinks, includeImages, includeChrome, tabId }, ctx) {
+          const data = await toolRequest("read", { selector, maxChars, offset, outline, includeLinks, includeImages, includeChrome, tabId });
+          return toolResultText(data, "");
+        }
+      }),
+      browser_search_history: tool({
+        description: `Search this Chrome profile's browsing history (title and URL text). query="" lists recent visits. days limits how far back (default 30). Before a profile is chosen, searches every connected profile and labels results by profile.`,
+        args: {
+          query: schema.string().optional(),
+          days: schema.number().optional(),
+          maxResults: schema.number().optional(),
+          profile: schema.string().optional()
+        },
+        async execute({ query, days, maxResults, profile }, ctx) {
+          const data = await toolRequest("search_history", { query, days, maxResults, profile });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_bookmarks: tool({
+        description: "Search this Chrome profile's bookmarks (with folder path). Without query, lists the most recently added. Before a profile is chosen, searches every connected profile.",
+        args: {
+          query: schema.string().optional(),
+          maxResults: schema.number().optional(),
+          profile: schema.string().optional()
+        },
+        async execute({ query, maxResults, profile }, ctx) {
+          const data = await toolRequest("bookmarks", { query, maxResults, profile });
+          return toolResultText(data, "[]");
+        }
+      }),
+      browser_recently_closed: tool({
+        description: "List recently closed tabs and windows (with sessionId), and with devices=true the open tabs on the user's other signed-in devices. restore=<sessionId> reopens one (pass the profile it came from) and returns its tabId.",
+        args: {
+          maxResults: schema.number().optional(),
+          devices: schema.boolean().optional(),
+          restore: schema.string().optional(),
+          profile: schema.string().optional()
+        },
+        async execute({ maxResults, devices, restore, profile }, ctx) {
+          const data = await toolRequest("recently_closed", { maxResults, devices, restore, profile });
+          return toolResultText(data, "{}");
+        }
+      }),
+      browser_upload: tool({
+        description: "Upload local files by path. selector is the input[type=file] or the button that opens the file chooser; Iris clicks it and fills Chrome's chooser directly, so no OS dialog appears. Works in background tabs and with custom upload buttons. Uses the debugger.",
+        args: {
+          selector: schema.string(),
+          files: schema.array(schema.string()),
+          index: schema.number().optional(),
+          timeoutMs: schema.number().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ selector, files, index, timeoutMs, tabId }, ctx) {
+          const paths = (files || []).map((file) => resolveUploadPath(file));
+          const missing = paths.filter((file) => !existsSync2(file));
+          if (missing.length)
+            throw new Error(`File not found: ${missing.join(", ")}`);
+          const data = await toolRequest("upload", { selector, files: paths, index, timeoutMs, tabId });
+          return toolResultText(data, "Uploaded");
+        }
+      }),
       browser_request_user: tool({
         description: "Hand the tab to the user for something only they can do (sign-in, 2FA, CAPTCHA, a choice) and wait. Brings the tab to the front, shows a banner with a Done button and a notification, then returns when urlPattern matches, selector (CSS) or text appears, the user clicks Done, or timeoutMs (default 300000, max 1800000) passes. status: condition_met | user_done | timeout | tab_closed.",
         args: {
@@ -37675,8 +37789,34 @@ function toStructuredContent(value) {
   }
   return { value };
 }
+function splitImage(text) {
+  const asImage = (url) => {
+    const match = typeof url === "string" ? url.match(/^data:(image\/[a-z+]+);base64,([\s\S]+)$/) : null;
+    return match ? { mimeType: match[1], data: match[2] } : undefined;
+  };
+  if (text.startsWith("data:image/"))
+    return { image: asImage(text) };
+  if (text.startsWith('{"image"')) {
+    try {
+      const { image, ...rest } = JSON.parse(text);
+      const parsed = asImage(image);
+      if (parsed)
+        return { image: parsed, rest: JSON.stringify(rest, null, 2) };
+    } catch {}
+  }
+  return {};
+}
 function normalizeResult(result) {
   if (typeof result === "string") {
+    const { image, rest } = splitImage(result);
+    if (image) {
+      return {
+        content: [
+          { type: "image", data: image.data, mimeType: image.mimeType },
+          ...rest ? [{ type: "text", text: rest }] : []
+        ]
+      };
+    }
     try {
       const parsed = JSON.parse(result);
       return {

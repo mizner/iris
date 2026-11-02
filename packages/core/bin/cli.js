@@ -306,7 +306,11 @@ function sleep(ms) {
 function spawnBroker() {
   ensureDir(BASE_DIR);
   const out = openSync(join(BASE_DIR, "broker.log"), "a");
-  const child = spawn(process.execPath, [BROKER_DST], { detached: true, stdio: ["ignore", "ignore", out] });
+  // Use the Node recorded at install time, not whichever Node happened to run this CLI (it may be a
+  // tool-private runtime that later moves or upgrades).
+  const configured = loadConfig()?.nodePath;
+  const nodePath = configured && existsSync(configured) ? configured : resolveNodePath();
+  const child = spawn(nodePath, [BROKER_DST], { detached: true, stdio: ["ignore", "ignore", out] });
   child.unref();
 }
 

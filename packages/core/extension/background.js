@@ -716,6 +716,10 @@ if (chrome.debugger?.onEvent) {
     if (method === "Page.javascriptDialogClosed") {
       state.pendingDialog = null
     }
+
+    if (method === "Page.fileChooserOpened" && state.fileChooserWaiter) {
+      state.fileChooserWaiter(params)
+    }
   })
 }
 
@@ -737,8 +741,46 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   lastSnapshot.delete(tabId)
   agentCursorByTab.delete(tabId)
+  for (const key of lastScreenshotHash.keys()) if (key.startsWith(`${tabId}|`)) lastScreenshotHash.delete(key)
   // Let the broker drop claims and default-tab pointers for the closed tab.
   if (isConnected && lastClaims.some((claim) => claim.tabId === tabId)) send({ type: "release_tab", tabId })
+})
+
+// Popups and new tabs opened from a claimed tab (OAuth windows, target=_blank, window.open) belong to the same
+// session: put them in the opener's tab group and tell the broker so it claims them.
+const reportedOpenedTabs = new Set()
+
+async function reportOpenedTab(tabId, openerTabId, knownUrl = "") {
+  if (!Number.isFinite(tabId) || !Number.isFinite(openerTabId) || reportedOpenedTabs.has(tabId)) return
+  if (!lastClaims.some((claim) => claim.tabId === openerTabId)) return
+  reportedOpenedTabs.add(tabId)
+  const [tab, opener] = await Promise.all([chrome.tabs.get(tabId).catch(() => null), chrome.tabs.get(openerTabId).catch(() => null)])
+  if (!tab) return
+  const win = await chrome.windows.get(tab.windowId).catch(() => null)
+  if (opener && opener.groupId >= 0 && opener.windowId === tab.windowId && chrome.tabs.group) {
+    await chrome.tabs.group({ groupId: opener.groupId, tabIds: [tabId] }).catch(() => {})
+  }
+  if (isConnected) {
+    send({
+      type: "tab_opened",
+      tabId,
+      openerTabId,
+      url: knownUrl || tab.pendingUrl || tab.url || "",
+      windowType: win?.type || "normal",
+    })
+  }
+}
+
+// onCreatedNavigationTarget carries the real source tab and the URL; onCreated is a delayed fallback for tabs
+// it does not cover, by which time the URL is known.
+if (chrome.webNavigation?.onCreatedNavigationTarget) {
+  chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
+    reportOpenedTab(details.tabId, details.sourceTabId, details.url)
+  })
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (Number.isFinite(tab.openerTabId)) setTimeout(() => reportOpenedTab(tab.id, tab.openerTabId), 500)
 })
 
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
@@ -981,6 +1023,11 @@ async function executeTool(toolName, args) {
     get_webmcp_status: toolGetWebMCPStatus,
     request_user: toolRequestUser,
     evaluate: toolEvaluate,
+    read: toolRead,
+    search_history: toolSearchHistory,
+    bookmarks: toolBookmarks,
+    recently_closed: toolRecentlyClosed,
+    upload: toolUpload,
   }
 
   const fn = tools[toolName]
@@ -1810,6 +1857,14 @@ async function pageOps(command, args) {
     return { ok: true, selectorUsed: match.selectorUsed, count: dt.files.length, names }
   }
 
+  if (command === "mark") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    match.chosen.setAttribute("data-iris-mark", safeString(options.token))
+    const isFileInput = match.chosen.tagName === "INPUT" && String(match.chosen.type).toLowerCase() === "file"
+    return { ok: true, selectorUsed: match.selectorUsed, isFileInput }
+  }
+
   if (command === "element_rect") {
     const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
     if (!match.chosen) {
@@ -2159,6 +2214,163 @@ async function toolRequestUser({ message, tabId, urlPattern, selector, text, tim
   }
 }
 
+// --- The profile's own memory: history, bookmarks, recently closed tabs, other devices ---
+
+async function toolSearchHistory({ query = "", days = 30, maxResults = 50 } = {}) {
+  if (!chrome.history?.search) throw new Error("History permission not granted. Reload the Iris extension.")
+  const startTime = Date.now() - clampNumber(days, 0.01, 3650, 30) * 86400000
+  const items = await chrome.history.search({ text: String(query || ""), startTime, maxResults: clampNumber(maxResults, 1, 1000, 50) })
+  const out = items.map((item) => ({
+    url: item.url,
+    title: item.title,
+    lastVisit: item.lastVisitTime ? new Date(item.lastVisitTime).toISOString() : null,
+    visits: item.visitCount,
+  }))
+  return { content: JSON.stringify(out, null, 2) }
+}
+
+async function bookmarkFolderPath(parentId, cache) {
+  const parts = []
+  let id = parentId
+  while (id && id !== "0") {
+    if (!cache.has(id)) {
+      const [node] = await chrome.bookmarks.get(id).catch(() => [null])
+      cache.set(id, node)
+    }
+    const node = cache.get(id)
+    if (!node) break
+    if (node.title) parts.unshift(node.title)
+    id = node.parentId
+  }
+  return parts.join(" / ")
+}
+
+async function toolBookmarks({ query = "", maxResults = 50 } = {}) {
+  if (!chrome.bookmarks) throw new Error("Bookmarks permission not granted. Reload the Iris extension.")
+  const limit = clampNumber(maxResults, 1, 1000, 50)
+  const nodes = String(query || "").trim()
+    ? (await chrome.bookmarks.search(String(query))).filter((n) => n.url)
+    : await chrome.bookmarks.getRecent(limit)
+  const cache = new Map()
+  const out = []
+  for (const node of nodes.slice(0, limit)) {
+    out.push({
+      title: node.title,
+      url: node.url,
+      folder: await bookmarkFolderPath(node.parentId, cache),
+      added: node.dateAdded ? new Date(node.dateAdded).toISOString() : null,
+    })
+  }
+  return { content: JSON.stringify(out, null, 2) }
+}
+
+function describeSessionTab(tab) {
+  return { url: tab.url, title: tab.title }
+}
+
+async function toolRecentlyClosed({ maxResults = 25, devices = false, restore } = {}) {
+  if (!chrome.sessions) throw new Error("Sessions permission not granted. Reload the Iris extension.")
+  if (restore) {
+    const restored = await chrome.sessions.restore(String(restore))
+    const tab = restored?.tab || restored?.window?.tabs?.[0]
+    return { tabId: tab?.id, content: { restored: true, tabId: tab?.id, url: tab?.url, title: tab?.title } }
+  }
+  const limit = clampNumber(maxResults, 1, 25, 25)
+  const closed = await chrome.sessions.getRecentlyClosed({ maxResults: limit })
+  const out = {
+    recentlyClosed: closed.map((s) =>
+      s.tab
+        ? { sessionId: s.tab.sessionId, closedAt: new Date(s.lastModified * 1000).toISOString(), ...describeSessionTab(s.tab) }
+        : {
+            sessionId: s.window?.sessionId,
+            closedAt: new Date(s.lastModified * 1000).toISOString(),
+            window: true,
+            tabs: (s.window?.tabs || []).map(describeSessionTab),
+          }
+    ),
+  }
+  if (devices) {
+    const list = await chrome.sessions.getDevices({ maxResults: 10 }).catch(() => [])
+    out.otherDevices = list.map((d) => ({
+      device: d.deviceName,
+      tabs: d.sessions.flatMap((s) => s.window?.tabs || (s.tab ? [s.tab] : [])).map(describeSessionTab).slice(0, 50),
+    }))
+  }
+  return { content: JSON.stringify(out, null, 2) }
+}
+
+// Upload real files by path. A file input gets the files directly; any other element (a custom "Upload" button)
+// is clicked with a user gesture and Chrome's native file chooser is intercepted, so no OS dialog ever appears.
+async function toolUpload({ selector, files, tabId, index = 0, timeoutMs = 2000, pollMs } = {}) {
+  const paths = (Array.isArray(files) ? files : [files]).filter((f) => typeof f === "string" && f.trim())
+  if (!paths.length) throw new Error("files is required (absolute paths)")
+  if (!selector) throw new Error("selector is required: the file input or the button that opens the file chooser")
+  const tab = await getTabById(tabId)
+  const state = await ensureDebuggerAttached(tab.id)
+  if (!state.attached) throw new Error(state.unavailableReason || "Debugger not attached; browser_upload needs it.")
+
+  const token = `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+  const mark = await runInPage(tab.id, "mark", { selector, index, timeoutMs, pollMs, token })
+  if (!mark?.ok) throw new Error(mark?.error || "Element not found")
+
+  const found = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+    expression: `(() => {
+      const find = (root) => {
+        const hit = root.querySelector('[data-iris-mark="${token}"]')
+        if (hit) return hit
+        for (const el of root.querySelectorAll("*")) if (el.shadowRoot) { const deep = find(el.shadowRoot); if (deep) return deep }
+        return null
+      }
+      const el = find(document)
+      if (el) el.removeAttribute("data-iris-mark")
+      return el
+    })()`,
+  })
+  const objectId = found?.result?.objectId
+  if (!objectId) throw new Error("Could not reach the element through the debugger")
+
+  if (mark.isFileInput) {
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.setFileInputFiles", { files: paths, objectId })
+    return { tabId: tab.id, content: JSON.stringify({ ok: true, via: "file-input", files: paths }, null, 2) }
+  }
+
+  await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.setInterceptFileChooserDialog", { enabled: true })
+  try {
+    const opened = new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        state.fileChooserWaiter = null
+        resolve(null)
+      }, 5000)
+      state.fileChooserWaiter = (params) => {
+        clearTimeout(timer)
+        state.fileChooserWaiter = null
+        resolve(params)
+      }
+    })
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: "function () { this.scrollIntoView({ block: 'center' }); this.click() }",
+      userGesture: true,
+    })
+    const chooser = await opened
+    if (!chooser) {
+      throw new Error("Clicking the element did not open a file chooser. Point selector at the upload button or the input[type=file].")
+    }
+    const list = chooser.mode === "selectSingle" ? paths.slice(0, 1) : paths
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.setFileInputFiles", { files: list, backendNodeId: chooser.backendNodeId })
+    return {
+      tabId: tab.id,
+      content: JSON.stringify(
+        { ok: true, via: "file-chooser", mode: chooser.mode, files: list, ...(list.length < paths.length ? { note: "Chooser accepts one file; extra files ignored." } : {}) },
+        null,
+        2
+      ),
+    }
+  } finally {
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {})
+  }
+}
+
 // Evaluate JavaScript in the page's main world. CDP Runtime.evaluate is used first because it ignores page CSP
 // and can await promises; without the debugger it falls back to a main-world script (blocked by strict CSP).
 async function toolEvaluate({ expression, tabId, awaitPromise = true, maxChars = 20000 } = {}) {
@@ -2492,7 +2704,102 @@ async function getElementScreenshotClip(tabId, selector, index = 0, timeoutMs, p
   }
 }
 
-async function toolScreenshot({
+// Draw a numbered uid label on every visible interactive element. Labels use the same data-iris-uid values as
+// browser_snapshot, so an agent can act on what it sees with selector="uid:e12".
+function irisAnnotate(mode, fullPage) {
+  const LAYER = "__iris_annotations"
+  document.getElementById(LAYER)?.remove()
+  if (mode === "remove") return []
+  const root = document.documentElement
+  if (root.dataset.irisUidUrl !== location.href) {
+    document.querySelectorAll("[data-iris-uid]").forEach((el) => el.removeAttribute("data-iris-uid"))
+    root.dataset.irisUidSeq = "0"
+    root.dataset.irisUidUrl = location.href
+  }
+  const selector =
+    "a[href],button,input:not([type=hidden]),textarea,select,summary,[contenteditable=''],[contenteditable=true]," +
+    "[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[role=combobox],[onclick]"
+  const layer = document.createElement("div")
+  layer.id = LAYER
+  layer.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none"
+  const labels = []
+  for (const el of document.querySelectorAll(selector)) {
+    if (labels.length >= 300) break
+    const rect = el.getBoundingClientRect()
+    if (rect.width < 2 || rect.height < 2) continue
+    const style = getComputedStyle(el)
+    if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") continue
+    if (!fullPage && (rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth)) continue
+    let uid = el.getAttribute("data-iris-uid")
+    if (!uid) {
+      const seq = Number(root.dataset.irisUidSeq || "0") || 0
+      uid = `e${seq}`
+      root.dataset.irisUidSeq = String(seq + 1)
+      el.setAttribute("data-iris-uid", uid)
+    }
+    const x = rect.left + scrollX
+    const y = rect.top + scrollY
+    const box = document.createElement("div")
+    box.style.cssText = `position:absolute;left:${x}px;top:${y}px;width:${rect.width}px;height:${rect.height}px;outline:2px solid #e11d48;outline-offset:-1px`
+    const tag = document.createElement("div")
+    tag.textContent = uid
+    tag.style.cssText = `position:absolute;left:${x}px;top:${Math.max(0, y - 14)}px;background:#e11d48;color:#fff;font:bold 11px/14px monospace;padding:0 3px;border-radius:2px`
+    layer.append(box, tag)
+    const name = (el.getAttribute("aria-label") || el.innerText || el.value || el.placeholder || el.title || "").trim().replace(/\s+/g, " ")
+    labels.push({ uid, role: el.getAttribute("role") || el.tagName.toLowerCase(), name: name.slice(0, 60) })
+  }
+  root.appendChild(layer)
+  return labels
+}
+
+const lastScreenshotHash = new Map()
+
+function hashString(value) {
+  let h = 2166136261
+  for (let i = 0; i < value.length; i += 1) {
+    h ^= value.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(16) + ":" + value.length
+}
+
+async function toolScreenshot(args = {}) {
+  const { tabId, annotate = false, ifChanged = false, fullPage = false } = args
+  const tab = await getTabById(tabId)
+  let labels = null
+  if (annotate) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "ISOLATED",
+      func: irisAnnotate,
+      args: ["draw", !!fullPage],
+    })
+    labels = res?.result || []
+  }
+  let shot
+  try {
+    shot = await captureScreenshot({ ...args, tabId: tab.id })
+  } finally {
+    if (annotate) {
+      await chrome.scripting
+        .executeScript({ target: { tabId: tab.id }, world: "ISOLATED", func: irisAnnotate, args: ["remove", false] })
+        .catch(() => {})
+    }
+  }
+  if (ifChanged) {
+    const key = `${tab.id}|${JSON.stringify([fullPage, args.selector, args.x, args.y, args.width, args.height, annotate])}`
+    const hash = hashString(shot.content)
+    const unchanged = lastScreenshotHash.get(key) === hash
+    lastScreenshotHash.set(key, hash)
+    if (unchanged) {
+      return { tabId: tab.id, content: JSON.stringify({ unchanged: true, note: "Screenshot identical to the previous one for this tab and region." }) }
+    }
+  }
+  if (labels) return { tabId: tab.id, content: JSON.stringify({ image: shot.content, labels }) }
+  return shot
+}
+
+async function captureScreenshot({
   tabId,
   fullPage = false,
   selector,
@@ -2560,12 +2867,170 @@ async function toolScreenshot({
   return { tabId: tab.id, content: `data:${screenshotMime(screenshotFormat)};base64,${result.data}` }
 }
 
-async function toolSnapshot({ tabId, full = false } = {}) {
+// Page content as markdown: far cheaper for an agent to read than page_text or a full snapshot.
+function irisPageToMarkdown(opts) {
+  const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "CANVAS", "IFRAME", "OBJECT", "HEAD"])
+  const CHROME = new Set(["NAV", "FOOTER", "ASIDE", "HEADER"])
+  const includeLinks = opts.includeLinks !== false
+  const includeImages = !!opts.includeImages
+
+  function hidden(el) {
+    if (el.hidden || el.getAttribute("aria-hidden") === "true") return true
+    const style = getComputedStyle(el)
+    return style.display === "none" || style.visibility === "hidden"
+  }
+
+  function pickRoot() {
+    if (opts.selector) {
+      const sel = String(opts.selector).replace(/^(uid|ref)[:=]\s*/i, "")
+      const uidLike = /^e\d+$/.test(sel)
+      const el = document.querySelector(uidLike ? `[data-iris-uid="${sel}"]` : sel)
+      if (!el) return { error: `No element matches ${opts.selector}` }
+      return { root: el, scoped: true }
+    }
+    const main = document.querySelector("main, [role=main], article")
+    return { root: main || document.body, scoped: !!main }
+  }
+
+  const clean = (s) => String(s || "").replace(/\s+/g, " ")
+
+  function inline(node) {
+    let out = ""
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) out += clean(child.textContent)
+      else if (child.nodeType === 1) out += element(child, true)
+    }
+    return out
+  }
+
+  function table(el) {
+    const rows = [...el.querySelectorAll("tr")].slice(0, 200)
+    if (!rows.length) return ""
+    const cells = rows.map((tr) => [...tr.children].map((c) => inline(c).trim().replace(/\|/g, "\\|")))
+    const width = Math.max(...cells.map((r) => r.length))
+    const line = (r) => `| ${Array.from({ length: width }, (_, i) => r[i] || "").join(" | ")} |`
+    return `\n\n${line(cells[0])}\n| ${Array(width).fill("---").join(" | ")} |\n${cells.slice(1).map(line).join("\n")}\n\n`
+  }
+
+  function list(el, depth) {
+    const ordered = el.tagName === "OL"
+    let i = 0
+    let out = "\n"
+    for (const li of el.children) {
+      if (li.tagName !== "LI" || hidden(li)) continue
+      i += 1
+      const nested = [...li.children].filter((c) => c.tagName === "UL" || c.tagName === "OL")
+      const clone = li.cloneNode(true)
+      clone.querySelectorAll("ul,ol").forEach((n) => n.remove())
+      out += `${"  ".repeat(depth)}${ordered ? `${i}.` : "-"} ${inline(clone).trim()}\n`
+      for (const sub of nested) out += list(sub, depth + 1).replace(/^\n/, "")
+    }
+    return out + "\n"
+  }
+
+  function element(el, inInline) {
+    if (SKIP.has(el.tagName) || hidden(el)) return ""
+    if (!opts.includeChrome && !opts.explicit) {
+      // Site chrome: navigation and sidebars anywhere; header/footer only when reading the whole body.
+      const role = el.getAttribute("role")
+      if (el.tagName === "NAV" || el.tagName === "ASIDE" || ["navigation", "complementary", "search", "menu", "menubar"].includes(role)) return ""
+      if (!opts.scoped && CHROME.has(el.tagName)) return ""
+    }
+    const tag = el.tagName
+    if (/^H[1-6]$/.test(tag)) return `\n\n${"#".repeat(Number(tag[1]))} ${inline(el).trim()}\n\n`
+    if (tag === "P") return `\n\n${inline(el).trim()}\n\n`
+    if (tag === "BR") return "\n"
+    if (tag === "HR") return "\n\n---\n\n"
+    if (tag === "UL" || tag === "OL") return list(el, 0)
+    if (tag === "TABLE") return table(el)
+    if (tag === "PRE") return `\n\n\`\`\`\n${el.innerText.replace(/\n+$/, "")}\n\`\`\`\n\n`
+    if (tag === "CODE") return `\`${el.textContent}\``
+    if (tag === "BLOCKQUOTE") return `\n\n> ${inline(el).trim().replace(/\n/g, "\n> ")}\n\n`
+    if (tag === "STRONG" || tag === "B") {
+      const t = inline(el).trim()
+      return t ? ` **${t}** ` : ""
+    }
+    if (tag === "EM" || tag === "I") {
+      const t = inline(el).trim()
+      return t ? ` _${t}_ ` : ""
+    }
+    if (tag === "A") {
+      const t = inline(el).trim()
+      if (!t) return ""
+      const href = el.href && !el.href.startsWith("javascript:") ? el.href : ""
+      return includeLinks && href ? `[${t}](${href})` : t
+    }
+    if (tag === "IMG") return includeImages && el.alt ? `![${clean(el.alt)}](${el.src})` : ""
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") {
+      const label = clean(el.getAttribute("aria-label") || el.placeholder || el.innerText || el.value || el.name || "")
+      return label ? ` [${tag.toLowerCase()}: ${label.trim().slice(0, 80)}] ` : ""
+    }
+    let out = ""
+    for (const child of el.childNodes) {
+      if (child.nodeType === 3) out += clean(child.textContent)
+      else if (child.nodeType === 1) out += element(child, inInline)
+    }
+    if (el.shadowRoot) for (const child of el.shadowRoot.children) out += element(child, inInline)
+    const block = !inInline && /^(DIV|SECTION|ARTICLE|MAIN|LI|DD|DT|FIGURE|FIGCAPTION|DETAILS|SUMMARY|FORM|FIELDSET)$/.test(tag)
+    return block ? `\n${out}\n` : out
+  }
+
+  const picked = pickRoot()
+  if (picked.error) return { ok: false, error: picked.error }
+  opts.scoped = picked.scoped
+  opts.explicit = !!opts.selector
+
+  if (opts.outline) {
+    const heads = [...picked.root.querySelectorAll("h1,h2,h3,h4")].filter((h) => !hidden(h))
+    const outline = heads.map((h) => `${"  ".repeat(Number(h.tagName[1]) - 1)}- ${clean(h.innerText).trim()}`).join("\n")
+    return { ok: true, url: location.href, title: document.title, markdown: outline, totalChars: outline.length, offset: 0, truncated: false }
+  }
+
+  const markdown = element(picked.root, false)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/ {2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+  const offset = Math.max(0, Number(opts.offset) || 0)
+  const maxChars = Math.max(200, Number(opts.maxChars) || 15000)
+  const slice = markdown.slice(offset, offset + maxChars)
+  return {
+    ok: true,
+    url: location.href,
+    title: document.title,
+    markdown: slice,
+    totalChars: markdown.length,
+    offset,
+    truncated: offset + maxChars < markdown.length,
+    nextOffset: offset + maxChars < markdown.length ? offset + maxChars : null,
+  }
+}
+
+async function toolRead({ tabId, selector, maxChars, offset, includeLinks, includeImages, includeChrome, outline } = {}) {
   const tab = await getTabById(tabId)
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "ISOLATED",
+    func: irisPageToMarkdown,
+    args: [{ selector, maxChars, offset, includeLinks, includeImages, includeChrome, outline }],
+  })
+  const out = res?.result
+  if (!out?.ok) throw new Error(out?.error || "Could not read the page")
+  const header = `# ${out.title}\n<${out.url}>`
+  const footer = out.truncated
+    ? `\n\n[truncated: showing ${out.offset}-${out.offset + out.markdown.length} of ${out.totalChars} chars; pass offset=${out.nextOffset} for more]`
+    : ""
+  return { tabId: tab.id, content: `${header}\n\n${out.markdown}${footer}` }
+}
+
+async function toolSnapshot({ tabId, full = false, interactive = false, selector, includeText, maxNodes } = {}) {
+  const tab = await getTabById(tabId)
+  const optionsKey = JSON.stringify([!!interactive, selector || "", includeText ?? null, maxNodes ?? null])
 
   const result = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    args: [{ full: !!full }],
+    args: [{ full: !!full, interactive: !!interactive, selector: selector || "", includeText, maxNodes }],
     func: (opts) => {
       function safeText(s) {
         return typeof s === "string" ? s : ""
@@ -2661,24 +3126,25 @@ async function toolSnapshot({ tabId, full = false } = {}) {
         if (!isVisible(el)) return { nodes: [] }
 
         const isInteractive =
-          ["A", "BUTTON", "INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) ||
+          ["A", "BUTTON", "INPUT", "TEXTAREA", "SELECT", "SUMMARY"].includes(el.tagName) ||
           el.getAttribute("onclick") ||
-          el.getAttribute("role") === "button" ||
+          ["button", "link", "checkbox", "radio", "tab", "menuitem", "option", "switch", "combobox", "textbox"].includes(
+            el.getAttribute("role")
+          ) ||
           el.isContentEditable
 
         const name = getName(el)
         const pt = pseudoText(el)
 
-        const shouldInclude = isInteractive || name.trim() || pt.before || pt.after
+        const shouldInclude = opts.interactive ? !!isInteractive : isInteractive || name.trim() || pt.before || pt.after
 
         if (shouldInclude) {
           const uidStr = takeUid(el)
-          const node = {
-            uid: uidStr,
-            role: el.getAttribute("role") || el.tagName.toLowerCase(),
-            name: name,
-            tag: el.tagName.toLowerCase(),
-          }
+          const tagName = el.tagName.toLowerCase()
+          const role = el.getAttribute("role") || tagName
+          // Compact nodes: act on them with selector="uid:<uid>"; role is omitted when it only repeats the tag.
+          const node = { uid: uidStr, tag: tagName, name: opts.interactive ? name.slice(0, 100) : name }
+          if (role !== tagName) node.role = role
 
           if (pt.before) node.before = pt.before
           if (pt.after) node.after = pt.after
@@ -2699,8 +3165,6 @@ async function toolSnapshot({ tabId, full = false } = {}) {
             if (el.readOnly) node.readOnly = true
             if (el.disabled) node.disabled = true
           }
-
-          node.selector = `[data-iris-uid="${uidStr}"]`
 
           nodes.push(node)
         }
@@ -2732,9 +3196,16 @@ async function toolSnapshot({ tabId, full = false } = {}) {
         return links.slice(0, 200)
       }
 
+      let root = document.body
+      if (opts.selector) {
+        const sel = String(opts.selector).replace(/^(uid|ref)[:=]\s*/i, "")
+        root = document.querySelector(/^e\d+$/.test(sel) ? `[data-iris-uid="${sel}"]` : sel)
+        if (!root) return { error: `No element matches ${opts.selector}` }
+      }
+      const wantText = opts.includeText ?? !opts.interactive
       let pageText = ""
       try {
-        pageText = safeText(document.body?.innerText || "").slice(0, 20000)
+        if (wantText) pageText = safeText(root.innerText || "").slice(0, 20000)
       } catch {}
 
       const reset = !!opts?.full || document.documentElement.dataset.irisUidUrl !== location.href
@@ -2748,14 +3219,15 @@ async function toolSnapshot({ tabId, full = false } = {}) {
       }
       document.documentElement.dataset.irisUidUrl = location.href
 
-      const built = build(document.body).nodes.slice(0, 800)
+      const limit = Math.min(Math.max(Number(opts.maxNodes) || 800, 1), 3000)
+      const built = build(root).nodes.slice(0, limit)
 
       return {
         url: location.href,
         title: document.title,
         text: pageText,
         nodes: built,
-        links: getAllLinks(),
+        links: opts.interactive || opts.selector ? [] : getAllLinks(),
         restamped: reset,
       }
     },
@@ -2763,9 +3235,11 @@ async function toolSnapshot({ tabId, full = false } = {}) {
   })
 
   const snapshot = result[0]?.result || { url: tab.url, title: tab.title, nodes: [] }
+  if (snapshot.error) throw new Error(snapshot.error)
   const prev = lastSnapshot.get(tab.id)
-  const shouldFull = !!full || !prev || prev.url !== snapshot.url || snapshot.restamped
-  lastSnapshot.set(tab.id, { url: snapshot.url, nodesByUid: indexByUid(snapshot.nodes) })
+  // A diff is only meaningful against a snapshot taken with the same filters.
+  const shouldFull = !!full || !prev || prev.url !== snapshot.url || snapshot.restamped || prev.optionsKey !== optionsKey
+  lastSnapshot.set(tab.id, { url: snapshot.url, optionsKey, nodesByUid: indexByUid(snapshot.nodes) })
 
   if (shouldFull) {
     return {
@@ -2775,12 +3249,10 @@ async function toolSnapshot({ tabId, full = false } = {}) {
           mode: "full",
           url: snapshot.url,
           title: snapshot.title,
-          text: snapshot.text,
+          ...(snapshot.text ? { text: snapshot.text } : {}),
           nodes: snapshot.nodes,
-          links: snapshot.links,
-        },
-        null,
-        2
+          ...(snapshot.links?.length ? { links: snapshot.links } : {}),
+        }
       ),
     }
   }
@@ -2796,9 +3268,7 @@ async function toolSnapshot({ tabId, full = false } = {}) {
         added: diff.added,
         removed: diff.removed,
         changed: diff.changed,
-      },
-      null,
-      2
+      }
     ),
   }
 }

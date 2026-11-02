@@ -119,15 +119,14 @@ let replied = false;
 function die(msg, code) {
   if (replied) return;
   replied = true;
-  process.stderr.write(JSON.stringify({ error: msg }) + "\n");
-  process.exit(code || 1);
+  // Exit only after the write drains: process.exit() right after a large write truncates piped output.
+  process.stderr.write(JSON.stringify({ error: msg }) + "\n", () => process.exit(code || 1));
 }
 
 function succeed(data) {
   if (replied) return;
   replied = true;
-  process.stdout.write(JSON.stringify(data, null, 2) + "\n");
-  process.exit(0);
+  process.stdout.write(JSON.stringify(data, null, 2) + "\n", () => process.exit(0));
 }
 
 // Long waits (wait_for, request_user) get their own timeoutMs plus a margin, and the broker is told to wait as long.

@@ -453,6 +453,51 @@ test("get_tabs without a profile lists every profile's tabs, labeled by profile"
   assert.deepEqual(tabs.map((tab) => [tab.id, tab.profile]), [[101, "home"], [202, "work"]]);
 });
 
+test("history search without a profile searches every profile and labels results", async (t) => {
+  const broker = await startBroker(t);
+  const history = (url) => (tool) =>
+    tool === "search_history" ? { content: JSON.stringify([{ url, title: "t" }]) } : tabsHandler([])(tool, {});
+  await broker.makeHost(913, { profileId: "a@x.test", handler: history("https://home.example/") });
+  await broker.makeHost(914, { profileId: "b@x.test", handler: history("https://work.example/") });
+  const plugin = broker.makePlugin("session-history");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "tool", { tool: "search_history", args: { query: "example" } });
+  assert.equal(response.ok, true);
+  const rows = JSON.parse(response.data.content).sort((a, b) => a.url.localeCompare(b.url));
+  assert.deepEqual(rows.map((row) => [row.url, row.profile]), [["https://home.example/", "home"], ["https://work.example/", "work"]]);
+});
+
+test("a tab opened by a claimed tab is claimed for that session and reported once", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(915, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: 60, content: { tabId: 60 } };
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const plugin = broker.makePlugin("session-popup");
+  const call = (id) => broker.request(plugin, id, "tool", { tool: "click", args: { selector: "#login" }, sessionId: "session-popup" });
+
+  assert.equal((await call(1)).ok, true);
+  host.write({ type: "from_extension", message: { type: "tab_opened", tabId: 61, openerTabId: 60, url: "https://auth.example/", windowType: "popup" } });
+  host.write({ type: "from_extension", message: { type: "tab_opened", tabId: 99, openerTabId: 12345, url: "https://other/" } });
+
+  const deadline = Date.now() + 2000;
+  let claims = [];
+  while (Date.now() < deadline) {
+    claims = (await broker.request(plugin, 100 + claims.length, "list_claims")).data.claims;
+    if (claims.some((c) => c.tabId === 61)) break;
+  }
+  assert.ok(claims.some((c) => c.tabId === 61), "popup is claimed by the opener's session");
+  assert.equal(claims.some((c) => c.tabId === 99), false, "tabs opened by unclaimed tabs are ignored");
+
+  const next = await call(2);
+  assert.deepEqual(next.data.openedTabs, [{ tabId: 61, openerTabId: 60, url: "https://auth.example/", popup: true }]);
+  const after = await call(3);
+  assert.equal(after.data.openedTabs, undefined, "reported only once");
+});
+
 test("explicit profile routes to that profile and pins the session", async (t) => {
   const broker = await startBroker(t);
   const hostA = await broker.makeHost(921, { profileId: "a@x.test", handler: tabsHandler([]) });

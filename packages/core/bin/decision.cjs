@@ -170,7 +170,7 @@ function buildElements(nodes) {
   for (const node of Array.isArray(nodes) ? nodes : []) {
     if (!node || typeof node.uid !== "string" || node.disabled || node.readOnly) continue;
     const tag = String(node.tag || "").toLowerCase();
-    const role = String(node.role || "").toLowerCase();
+    const role = String(node.role || node.tag || "").toLowerCase();
     const type = String(node.type || "").toLowerCase();
     const isInput = tag === "input";
     const typeableNode = tag === "textarea" || (isInput && TYPEABLE_INPUTS.has(type)) || (!isInput && TYPE_ROLES.has(role));
