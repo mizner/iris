@@ -3,6 +3,15 @@
 
 ## Unreleased
 
+- Add `browser_read`: the page (or one section) as markdown, with heading outline and paging. Much cheaper than `page_text` or a full snapshot.
+- `browser_snapshot`: `interactive=true` (actionable elements only, no page text), `selector` scope, `maxNodes`, `includeText`.
+- `browser_screenshot`: `annotate=true` draws uid labels on interactive elements and returns the label list; `ifChanged=true` skips identical images; `savePath` writes to disk.
+- MCP and OMP adapters return screenshots as image content instead of base64 text.
+- Tabs and popups opened by a claimed tab are claimed for the same session, added to its tab group, and reported once as `openedTabs`.
+- Add `browser_search_history`, `browser_bookmarks`, `browser_recently_closed` (restore, other devices). Unscoped calls search every connected profile. Adds `history`, `bookmarks`, `sessions`, `webNavigation` permissions.
+- Add `browser_upload`: real file paths through a file input or Chrome's intercepted file chooser, with custom upload buttons and background tabs.
+- `iris reconnect` starts the broker with the Node recorded at install (`config.json` `nodePath`).
+
 - Several Chrome profiles: each session picks one (`browser_profiles`, `browser_use_profile`, `browser_resolve_profile`); `PROFILE_REQUIRED` instead of guessing. Optional `browser_run` decision model.
 - Add `browser_request_user`: hand a tab to the user for sign-in, 2FA, or CAPTCHA (banner with Done button, notification) and wait for a URL, selector, text, or Done.
 - Add `browser_evaluate`: evaluate JavaScript in the page's main world via CDP (ignores page CSP, awaits promises), with a main-world script fallback.

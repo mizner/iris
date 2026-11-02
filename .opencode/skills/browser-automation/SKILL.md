@@ -45,11 +45,16 @@ Interpretation:
 Do not guess selectors on non-trivial pages. Discover first:
 
 ```text
+browser_read outline=true
+browser_read selector="main"
+browser_snapshot interactive=true
+browser_screenshot annotate=true
 browser_query selector="button,a,[role=button],input,select,textarea" mode=list limit=50
-browser_query mode=page_text limit=1000
-browser_snapshot
-browser_screenshot
 ```
+
+`browser_read` returns the page as markdown and is the cheapest way to read content. `browser_snapshot interactive=true` lists only clickable and typeable elements. `browser_screenshot annotate=true` draws uid labels you can click with `selector="uid:e12"`; add `ifChanged=true` when re-checking.
+
+To find a page the user saw before, use `browser_search_history`, `browser_bookmarks`, or `browser_recently_closed` instead of guessing URLs. Popups and new tabs your pages open are claimed automatically and reported as `openedTabs`.
 
 Use `browser_snapshot` when accessibility structure matters. The first snapshot is a full node list with stable `uid:` values; later snapshots on the same page are diffs (`added` / `removed` / `changed`). Pass `full=true` to restamp. Use `browser_screenshot` when layout, modals, or visual state matters. Hover CSS menus with `browser_hover` before clicking items inside them. If a JS dialog appears, `browser_get_active_tab` includes `pendingDialog`; then `browser_handle_dialog`. Clicking the Iris toolbar icon releases a claimed tab.
 
@@ -122,10 +127,10 @@ browser_download selector="a.download" wait=true downloadTimeoutMs=30000
 browser_list_downloads limit=5
 ```
 
-Set a file input:
+Upload a file (works with custom upload buttons; no OS dialog):
 
 ```text
-browser_set_file_input selector="input[type=file]" filePath="/absolute/path/to/file.pdf"
+browser_upload selector="text:Upload" files=["/absolute/path/to/file.pdf"]
 ```
 
 Read page state with JavaScript (awaits promises; shows Chrome's debugging bar until `browser_network_stop` detaches):

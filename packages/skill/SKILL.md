@@ -92,11 +92,30 @@ CLI:
 
 1. Pick the profile (Step 0).
 2. Use `browser_run` for routine navigation when available; otherwise continue with the step tools.
-3. Observe before acting with `browser_query`, `browser_snapshot`, or `browser_screenshot`.
+3. Observe before acting, cheapest first:
+   - To read content: `browser_read` (markdown; `outline=true` for headings only, `selector` for one section).
+   - To find things to click or type into: `browser_snapshot interactive=true` (only actionable elements, no page text), scoped with `selector` when you can.
+   - To see layout or visual state: `browser_screenshot annotate=true` labels every interactive element with its uid, so you can act with `selector="uid:e12"`. Use `ifChanged=true` when re-checking, and `savePath` when the image is for the user rather than for you.
 4. Act with the narrowest reliable selector (`uid:` from a snapshot, then `text:` / `label:`). Hover before CSS menus; drag for reorder UIs. After the first snapshot, diffs are the default; pass `full=true` if uids look wrong.
 5. Read again before every action: navigation and large DOM changes reissue uids.
 6. Verify the result after every navigation, click, type, or download. Two identical failures mean change approach, not retry.
 7. Release claimed tabs when done.
+
+New tabs and popups that your pages open (sign-in windows, `target=_blank` links) are claimed for your session automatically. The next result lists them under `openedTabs` (or an `[Iris] ... opened new tabs` note); pass that `tabId` to work in them.
+
+## The profile's own memory
+
+Iris runs inside the user's real profile, so it can find pages they have seen before:
+
+- `browser_search_history query="hubspot report" days=7` - pages visited, newest first.
+- `browser_bookmarks query="invoice"` - bookmarks with their folder path.
+- `browser_recently_closed` - recently closed tabs and windows; `restore=<sessionId>` reopens one. `devices=true` adds tabs open on the user's other signed-in devices.
+
+Before a profile is chosen these search every connected profile and label each result with `profile`. Use them before guessing a URL for "the page I had yesterday".
+
+## Uploading files
+
+Use `browser_upload selector=<button or file input> files=["/abs/path/file.pdf"]`. It fills Chrome's file chooser directly, so no OS dialog appears, and it works with custom upload buttons and in background tabs. Prefer it over `browser_set_file_input` (which only works on a bare `input[type=file]` and copies the file through the broker).
 
 ## Tool Surface
 
@@ -128,8 +147,8 @@ CLI:
 - `browser_wait` - Sleep for a specified duration.
 - `browser_wait_for` - Wait for a selector, text, page-text regex, URL pattern, or network idle (`timeoutMs` up to 120000).
 - `browser_query` - Read page text, attributes, properties, or selector matches. Modes: `text` (default), `value`, `attribute`, `property`, `html`, `list`, `exists` (returns `{exists, count}` instead of failing), `page_text` (no selector).
-- `browser_snapshot` - Capture the accessibility tree snapshot. First call is full; later calls return a uid-preserving diff unless `full=true`.
-- `browser_screenshot` - Capture a visible, full-page, selector, or clipped screenshot (background tabs use the debugger, not focus).
+- `browser_snapshot` - Capture the accessibility tree snapshot. First call is full; later calls return a uid-preserving diff unless `full=true`. `interactive=true` keeps only actionable elements; `selector` scopes it; `maxNodes` caps it.
+- `browser_screenshot` - Capture a visible, full-page, selector, or clipped screenshot (background tabs use the debugger, not focus). `annotate=true` adds uid labels, `ifChanged=true` skips identical images, `savePath` writes to disk.
 - `browser_download` - Download a file by URL or click path.
 - `browser_list_downloads` - List recent downloads.
 - `browser_set_file_input` - Populate a file input from a local path.
@@ -143,6 +162,11 @@ CLI:
 - `browser_profile_status` - Return allowlist gating status per profile.
 - `browser_webmcp_status` - Detect WebMCP/native model context signals on the current page.
 - `browser_request_user` - Hand the tab to the user (sign-in, 2FA, CAPTCHA) and wait until they finish.
+- `browser_read` - Read the page (or one section) as markdown; `outline=true` for headings; paged with `offset`.
+- `browser_search_history` - Search this profile's browsing history.
+- `browser_bookmarks` - Search bookmarks, or list the most recent.
+- `browser_recently_closed` - List or restore recently closed tabs; `devices=true` adds other devices' tabs.
+- `browser_upload` - Upload local files through a file input or upload button without an OS dialog.
 - `browser_evaluate` - Evaluate a JavaScript expression in the page's main world and return the JSON result.
 
 ## Selector Strategy
