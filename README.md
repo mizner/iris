@@ -236,6 +236,25 @@ Iris stores runtime state in `~/.iris`:
 
 `profileEmails` is optional. Leave it empty to allow any browser profile, or set one or more email addresses to make the extension refuse the wrong profile.
 
+### Several Chrome profiles
+
+Each Chrome profile runs its own extension instance, and each agent session works in exactly one profile. Name your profiles so agents can choose:
+
+```json
+{
+  "profiles": {
+    "personal": { "email": "you@example.com", "purpose": "Personal and client work", "domains": ["example-client.com"], "default": true },
+    "work": { "email": "you@work.example", "purpose": "Company admin", "domains": ["portal.azure.com"] }
+  }
+}
+```
+
+Agents call `browser_profiles`, then `browser_use_profile` or `browser_resolve_profile`. With several profiles connected and none chosen, tab calls fail with `PROFILE_REQUIRED` instead of guessing. `default` is only a suggestion. `IRIS_PROFILE=<name>` selects a profile for an adapter or CLI process, and `iris open-profile <name>` opens a window in that profile so its extension connects.
+
+### Optional decision model
+
+When `TYPESAFE_API_KEY` is set in the environment or in `~/.secrets`, Iris uses TypeSafe's Jev decision model for `browser_run` (fast goal-directed navigation) and to break ties in `browser_resolve_profile`. Every decision includes an UNSURE option and is gated on confidence and margin. Disable it with `"decisionModel": { "enabled": false }` or `IRIS_DECISION=off`.
+
 The unpacked extension includes a fixed manifest key so the extension ID should remain `ncfalpcdanbcccbaakenefpokeioldgd` when loaded from the installed runtime directory.
 
 ## Development

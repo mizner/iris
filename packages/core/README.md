@@ -58,6 +58,8 @@ Runtime config lives in `~/.iris/config.json`:
 
 Set `profileEmails` only when you want Iris to refuse browser profiles that do not match the allowlist.
 
+Add `profiles` (name -> `email`, `purpose`, `domains`, optional `default`) when several Chrome profiles run Iris; agents pick one per session with `browser_profiles` / `browser_use_profile`. `decisionModel` controls the optional Jev decision model (on when `TYPESAFE_API_KEY` is available).
+
 ## CLI
 
 ```bash

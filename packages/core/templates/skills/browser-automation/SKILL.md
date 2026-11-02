@@ -21,8 +21,12 @@ Always start with:
 
 ```text
 browser_status
-browser_get_tabs
+browser_profiles
 ```
+
+Several Chrome profiles (separate signed-in accounts) can be connected. A session works in one: if the user named an account use it, otherwise call `browser_resolve_profile url=<target> task="<short intent>"` and use its `profile` when `confident` is true, then `browser_use_profile`. If it is not confident, choose from `candidates` or ask the user before anything that signs in, submits, or deletes. `PROFILE_REQUIRED` means no profile was chosen; `PROFILE_NOT_CONNECTED` means run `iris open-profile <name>`.
+
+Work in your own background tab (the default without `tabId`) or claim a tab the user already has open; take focus (`active=true`) only when a page must be visible. When `browser_profiles` reports `decisionModel.available`, `browser_run` handles short routine navigation goals quickly.
 
 If there are connection problems:
 

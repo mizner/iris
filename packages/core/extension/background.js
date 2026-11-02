@@ -98,6 +98,59 @@ async function toolGetProfileStatus() {
   }
 }
 
+// Tell the broker which Chrome profile this extension instance runs in, so it can route by profile.
+async function sendIdentify() {
+  try {
+    const status = await toolGetProfileStatus()
+    send({ type: "identify", profileId: status.profileId, allowed: status.allowed, version: runtimeManifest.version })
+  } catch (e) {
+    console.warn("[Iris] identify failed:", e)
+  }
+}
+
+function hostOfUrl(url) {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.hostname : ""
+  } catch {
+    return ""
+  }
+}
+
+// Inventory for profile selection: counts and site hostnames only, no titles or full URLs.
+async function toolProfileSummary() {
+  const status = await toolGetProfileStatus()
+  const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] })
+  const hostCounts = new Map()
+  let tabCount = 0
+  let windowFocused = false
+  let activeHost = null
+  for (const w of windows) {
+    if (w.focused) windowFocused = true
+    for (const t of w.tabs || []) {
+      tabCount += 1
+      const host = hostOfUrl(t.url)
+      if (host) hostCounts.set(host, (hostCounts.get(host) || 0) + 1)
+      if (w.focused && t.active) activeHost = host || null
+    }
+  }
+  const domains = [...hostCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 60)
+    .map(([host, count]) => ({ host, count }))
+  return {
+    content: {
+      profileId: status.profileId,
+      allowed: status.allowed,
+      windowCount: windows.length,
+      tabCount,
+      windowFocused,
+      activeHost,
+      domains,
+    },
+  }
+}
+
 // WebMCP detection and integration
 const WEBMCP_STORAGE_KEY = "webmcp_tokens"
 
@@ -822,7 +875,7 @@ function send(message) {
 
 function isBrokerSourcedMessage(message) {
   const t = message?.type
-  return t === "ping" || t === "tool_request" || t === "reload" || t === "claims"
+  return t === "ping" || t === "tool_request" || t === "reload" || t === "claims" || t === "identify_request"
 }
 
 async function handleMessage(message) {
@@ -835,6 +888,7 @@ async function handleMessage(message) {
     isConnected = true
     connectionAttempts = 0
     updateBadge(true)
+    if (message.type !== "identify_request") sendIdentify()
   }
 
   if (Array.isArray(message.claims)) applyClaims(message.claims)
@@ -845,11 +899,14 @@ async function handleMessage(message) {
     send({ type: "pong" })
   } else if (message.type === "claims") {
     applyClaims(message.claims)
+  } else if (message.type === "identify_request") {
+    await sendIdentify()
   } else if (message.type === "config_response") {
     const cfg = message.config || {}
     const allowlist = normalizeAllowlist(cfg.profileEmails)
     await chrome.storage.local.set({ [ALLOWLIST_STORAGE_KEY]: allowlist })
     profileVerified = false // re-verify on next tool call with fresh allowlist
+    if (isConnected) await sendIdentify()
   } else if (message.type === "reload") {
     try {
       chrome.runtime.reload()
@@ -915,6 +972,7 @@ async function executeTool(toolName, args) {
     network_list: toolNetworkList,
     network_get: toolNetworkGet,
     get_profile_status: toolGetProfileStatus,
+    profile_summary: toolProfileSummary,
     get_webmcp_status: toolGetWebMCPStatus,
   }
 
@@ -1593,14 +1651,21 @@ async function pageOps(command, args) {
     }
     const target = document.activeElement || document.body
     const opts = { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, bubbles: true, cancelable: true, ...mod }
+    let submitted = false
     try {
-      target.dispatchEvent(new KeyboardEvent("keydown", opts))
+      const notCancelled = target.dispatchEvent(new KeyboardEvent("keydown", opts))
       target.dispatchEvent(new KeyboardEvent("keypress", opts))
       target.dispatchEvent(new KeyboardEvent("keyup", opts))
+      // Synthetic key events have no default action, so emulate the browser's implicit form submission.
+      const plainEnter = key === "Enter" && !mod.ctrlKey && !mod.metaKey && !mod.altKey
+      if (plainEnter && notCancelled && target.tagName === "INPUT" && target.form) {
+        target.form.requestSubmit()
+        submitted = true
+      }
     } catch (e) {
       return { ok: false, error: e?.message || String(e) }
     }
-    return { ok: true, key, selectorUsed, method: "dom" }
+    return { ok: true, key, selectorUsed, method: "dom", submitted }
   }
 
   if (command === "select") {
@@ -1908,13 +1973,15 @@ async function pageOps(command, args) {
 async function toolGetActiveTab() {
   const tab = await getActiveTab()
   const pendingDialog = debuggerState.get(tab.id)?.pendingDialog || null
+  const win = await chrome.windows.get(tab.windowId).catch(() => null)
   return {
     tabId: tab.id,
-    content: { tabId: tab.id, url: tab.url, title: tab.title, pendingDialog },
+    content: { tabId: tab.id, url: tab.url, title: tab.title, pendingDialog, windowFocused: !!win?.focused },
   }
 }
 
-async function toolOpenTab({ url, active = true }) {
+// Background by default: agents should not take over the tab the user is looking at.
+async function toolOpenTab({ url, active = false }) {
   const createOptions = {}
   if (typeof url === "string" && url.trim()) createOptions.url = url.trim()
   if (typeof active === "boolean") createOptions.active = active
@@ -2007,7 +2074,9 @@ async function toolClick({ selector, tabId, index = 0, timeoutMs, pollMs, button
   const count = Number(clickCount) >= 2 ? 2 : 1
   const mouseButton = cdpMouseButton(button)
 
-  const state = await ensureDebuggerAttached(tab.id)
+  // Debugger mouse events are not delivered to hidden (background) tabs; a DOM click still runs the
+  // element's activation behavior (links, submit buttons) without bringing the tab to the front.
+  const state = tab.active ? await ensureDebuggerAttached(tab.id) : { attached: false }
   if (state.attached) {
     await cdpClick(tab.id, { x: point.x, y: point.y, button: mouseButton, clickCount: count, modifiers: mods })
   } else {
@@ -2032,7 +2101,7 @@ async function toolHover({ selector, tabId, index = 0, timeoutMs, pollMs } = {})
   const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
   if (!point?.ok) throw new Error(point?.error || "Hover failed")
   await showAgentCursor(tab.id, { x: point.x, y: point.y })
-  const state = await ensureDebuggerAttached(tab.id)
+  const state = tab.active ? await ensureDebuggerAttached(tab.id) : { attached: false }
   if (state.attached) {
     await dispatchMouse(tab.id, { type: "mouseMoved", x: point.x, y: point.y, button: "left", clickCount: 1 })
   } else {
@@ -2117,6 +2186,9 @@ function cdpKeyFields(key) {
     out.windowsVirtualKeyCode = vk
     out.nativeVirtualKeyCode = vk
   }
+  // keyDown needs text to produce the character event that submits forms and inserts characters.
+  if (k === "Enter") out.text = "\r"
+  else if (k.length === 1) out.text = k
   return out
 }
 
@@ -2130,10 +2202,13 @@ async function toolPress({ key, modifiers, selector, tabId, index = 0, timeoutMs
     if (!focusResult?.ok) throw new Error(focusResult?.error || "Focus failed")
   }
 
-  const state = await ensureDebuggerAttached(tab.id)
+  // Debugger key events are not delivered to hidden (background) tabs; use the in-page path there.
+  const state = tab.active ? await ensureDebuggerAttached(tab.id) : { attached: false }
   if (state.attached) {
     const fields = cdpKeyFields(key.trim())
     const mods = cdpKeyModifiers(modList)
+    // Shortcuts (Ctrl/Cmd/Alt + key) must not insert their character.
+    if (mods & ~8) delete fields.text
     await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: mods, ...fields })
     await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: mods, ...fields })
     return { tabId: tab.id, content: `Pressed ${key.trim()}` }
@@ -2214,7 +2289,9 @@ async function toolScreenshot({
   const hasManualClip = [x, y, width, height].every((value) => Number.isFinite(value))
   const hasSelectorClip = typeof selector === "string" && selector.trim()
 
-  if (!fullPage && !hasManualClip && !hasSelectorClip && screenshotFormat === "png" && !Number.isFinite(quality)) {
+  // captureVisibleTab captures whatever tab is visible in the window, so only use it for the active tab.
+  // Background tabs go through the debugger path, which does not change focus.
+  if (tab.active && !fullPage && !hasManualClip && !hasSelectorClip && screenshotFormat === "png" && !Number.isFinite(quality)) {
     const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
     return { tabId: tab.id, content: png }
   }

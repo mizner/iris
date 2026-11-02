@@ -188,12 +188,14 @@ async function ensureBrokerSocket(): Promise<net.Socket> {
     socket = null;
   });
 
-  writeJsonLine(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid });
+  // IRIS_PROFILE pins this adapter's session to one Chrome profile from the first call.
+  const pinnedProfile = process.env.IRIS_PROFILE?.trim() || undefined;
+  writeJsonLine(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid, profile: pinnedProfile });
 
   return socket;
 }
 
-async function brokerRequest(op: string, payload: Record<string, any>): Promise<any> {
+async function brokerRequest(op: string, payload: Record<string, any>, timeoutMs = 60000): Promise<any> {
   const s = await ensureBrokerSocket();
   const id = ++reqId;
 
@@ -204,8 +206,16 @@ async function brokerRequest(op: string, payload: Record<string, any>): Promise<
       if (!pending.has(id)) return;
       pending.delete(id);
       reject(new Error("Timed out waiting for broker response"));
-    }, 60000);
+    }, timeoutMs);
   });
+}
+
+// Fallback planes (Apple Events, agent-browser) cannot tell Chrome profiles apart, so they are only
+// used when the extension plane itself is unreachable, never after a routing or page error.
+function isPlaneUnavailable(message: string): boolean {
+  return /not connected|native host offline|Could not connect to local broker|Native host disconnected|Timed out waiting for (extension|broker)/i.test(
+    message
+  );
 }
 
 async function brokerOnlyRequest(op: string, payload: Record<string, any>): Promise<any> {
@@ -379,6 +389,7 @@ async function routerRequest(toolName: string, args: Record<string, any>): Promi
       const msg = err?.message || String(err);
       errors.push(`extension: ${msg}`);
       logRouter(`FAIL[extension]: ${toolName} - ${msg}`);
+      if (!USE_AGENT_BACKEND && !isPlaneUnavailable(msg)) throw err;
     }
   }
   
@@ -477,7 +488,7 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_status: tool({
-        description: "Check backend connection status and current tab claims.",
+        description: "Check backend connection status, connected Chrome profiles, this session's profile, and tab claims.",
         args: {},
         async execute(args, ctx) {
           const data = await statusRequest();
@@ -532,20 +543,85 @@ const plugin: Plugin = async (ctx) => {
         },
       }),
 
-      browser_get_tabs: tool({
-        description: "List all open browser tabs",
+      browser_profiles: tool({
+        description:
+          "List Chrome profiles: name, account, purpose, connected, open sites, and which one this session uses. Call first when several profiles may be open.",
         args: {},
         async execute(args, ctx) {
-          const data = await toolRequest("get_tabs", {});
+          const data = await brokerOnlyRequest("profiles", {});
+          return JSON.stringify(data);
+        },
+      }),
+
+      browser_use_profile: tool({
+        description: "Choose the Chrome profile (name or email) this session works in. Later calls stay in it.",
+        args: {
+          profile: schema.string(),
+        },
+        async execute({ profile }, ctx) {
+          const data = await brokerOnlyRequest("use_profile", { profile });
+          return JSON.stringify(data);
+        },
+      }),
+
+      browser_resolve_profile: tool({
+        description:
+          "Suggest which Chrome profile fits a target url and a short task, with the reason and any tabs already open there. " +
+          "Uses rules first and a decision model only for ties; confident=false means choose yourself or ask. pin=true also selects it.",
+        args: {
+          url: schema.string().optional(),
+          task: schema.string().optional(),
+          pin: schema.boolean().optional(),
+        },
+        async execute({ url, task, pin }, ctx) {
+          const data = await brokerOnlyRequest("resolve_profile", { url, task, pin });
+          return JSON.stringify(data);
+        },
+      }),
+
+      browser_run: tool({
+        description:
+          "Pursue one short goal in a background tab with a fast decision model choosing each click or typing step. " +
+          "Text is typed only from facts (\"name=value\"). Stops with done, unsure, blocked, needs_agent, stuck, or max_steps; " +
+          "verify the page after done. Returns status unavailable when no decision model key is configured.",
+        args: {
+          goal: schema.string(),
+          url: schema.string().optional(),
+          facts: schema.array(schema.string()).optional(),
+          tabId: schema.number().optional(),
+          profile: schema.string().optional(),
+          maxSteps: schema.number().optional(),
+          allowIrreversible: schema.boolean().optional(),
+        },
+        async execute({ goal, url, facts, tabId, profile, maxSteps, allowIrreversible }, ctx) {
+          const data = await brokerRequest(
+            "run",
+            { goal, url, facts, tabId, profile, maxSteps, allowIrreversible },
+            180000
+          );
+          return JSON.stringify(data);
+        },
+      }),
+
+      browser_get_tabs: tool({
+        description:
+          "List open tabs. Before a profile is chosen this lists every connected profile's tabs, each labeled with its profile.",
+        args: {
+          profile: schema.string().optional(),
+        },
+        async execute({ profile }, ctx) {
+          const data = await toolRequest("get_tabs", { profile });
           return toolResultText(data, "ok");
         },
       }),
 
       browser_get_active_tab: tool({
-        description: "Return the active browser tab",
-        args: {},
-        async execute(args, ctx) {
-          const data = await toolRequest("get_active_tab", {});
+        description: "Return the tab the user is looking at (the focused window's active tab), with its profile.",
+        args: {
+          profile: schema.string().optional(),
+        },
+        async execute({ profile }, ctx) {
+          const data = await toolRequest("get_active_tab", { profile });
           return toolResultText(data, "ok");
         },
       }),
@@ -583,13 +659,14 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_open_tab: tool({
-        description: "Open a new browser tab",
+        description: "Open a new tab in the background (active=true brings it to the front; avoid unless needed).",
         args: {
           url: schema.string().optional(),
           active: schema.boolean().optional(),
+          profile: schema.string().optional(),
         },
-        async execute({ url, active }, ctx) {
-          const data = await toolRequest("open_tab", { url, active });
+        async execute({ url, active, profile }, ctx) {
+          const data = await toolRequest("open_tab", { url, active, profile });
           return toolResultText(data, "Opened new tab");
         },
       }),
@@ -606,13 +683,14 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_navigate: tool({
-        description: "Navigate to a URL in the browser",
+        description: "Navigate a tab to a URL. Without tabId this uses the session's own background tab.",
         args: {
           url: schema.string(),
           tabId: schema.number().optional(),
+          profile: schema.string().optional(),
         },
-        async execute({ url, tabId }, ctx) {
-          const data = await toolRequest("navigate", { url, tabId });
+        async execute({ url, tabId, profile }, ctx) {
+          const data = await toolRequest("navigate", { url, tabId, profile });
           return toolResultText(data, `Navigated to ${url}`);
         },
       }),
@@ -950,9 +1028,10 @@ const plugin: Plugin = async (ctx) => {
         args: {
           limit: schema.number().optional(),
           state: schema.string().optional(),
+          profile: schema.string().optional(),
         },
-        async execute({ limit, state }, ctx) {
-          const data = await toolRequest("list_downloads", { limit, state });
+        async execute({ limit, state, profile }, ctx) {
+          const data = await toolRequest("list_downloads", { limit, state, profile });
           return toolResultText(data, "[]");
         },
       }),
@@ -1101,10 +1180,12 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_profile_status: tool({
-        description: "Return Iris profile gating status for the active Chrome profile.",
-        args: {},
-        async execute(args, ctx) {
-          const data = await toolRequest("get_profile_status", {});
+        description: "Return allowlist gating status per Chrome profile (or for one profile).",
+        args: {
+          profile: schema.string().optional(),
+        },
+        async execute({ profile }, ctx) {
+          const data = await toolRequest("get_profile_status", { profile });
           return toolResultText(data, "{}");
         },
       }),

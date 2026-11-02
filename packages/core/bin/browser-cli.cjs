@@ -16,9 +16,14 @@
  *   node browser-cli.cjs get_tabs
  *   node browser-cli.cjs status
  *
+ *   node browser-cli.cjs profiles
+ *   node browser-cli.cjs get_tabs --profile work
+ *   IRIS_PROFILE=work node browser-cli.cjs snapshot
+ *
  * Environment:
  *   BROWSER_SESSION  — Override session ID (default: auto-generated)
- *   BROWSER_TIMEOUT  — Request timeout in ms (default: 15000)
+ *   BROWSER_TIMEOUT  — Request timeout in ms (default: 15000; run uses at least 120000)
+ *   IRIS_PROFILE     — Chrome profile (alias or email) for this invocation
  *
  * Exit codes:
  *   0 = success (JSON on stdout)
@@ -47,7 +52,10 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     "       console, errors, network_start, network_stop, network_list, network_get,\n" +
     "       download, highlight, set_file_input,\n" +
     "       get_profile_status, get_webmcp_status\n" +
-    "\nOps:   status, list_claims, claim_tab, release_tab\n"
+    "\nOps:   status, list_claims, claim_tab, release_tab,\n" +
+    "       profiles, use_profile --profile <name>, resolve_profile --url <url> --task <text>,\n" +
+    "       run --goal <text> [--url <url>] [--facts '[\"name=value\"]']\n" +
+    "\nAny tool accepts --profile <alias|email>; IRIS_PROFILE sets it for every call.\n"
   );
   process.exit(2);
 }
@@ -94,8 +102,14 @@ if (argv.length > 1) {
 
 // --- Broker ops vs tool ops ---
 
-const BROKER_OPS = ["status", "list_claims", "claim_tab", "release_tab"];
+const BROKER_OPS = ["status", "list_claims", "claim_tab", "release_tab", "profiles", "use_profile", "resolve_profile", "run"];
 const isBrokerOp = BROKER_OPS.includes(command);
+const PROFILE = (process.env.IRIS_PROFILE || "").trim();
+if (typeof args.facts === "string" && args.facts.trim().startsWith("[")) {
+  try {
+    args.facts = JSON.parse(args.facts);
+  } catch {}
+}
 
 // --- Socket communication ---
 
@@ -116,11 +130,14 @@ function succeed(data) {
   process.exit(0);
 }
 
-const timer = setTimeout(() => die("Timeout after " + TIMEOUT_MS + "ms", 1), TIMEOUT_MS);
+const EFFECTIVE_TIMEOUT_MS = command === "run" ? Math.max(TIMEOUT_MS, 120000) : TIMEOUT_MS;
+const timer = setTimeout(() => die("Timeout after " + EFFECTIVE_TIMEOUT_MS + "ms", 1), EFFECTIVE_TIMEOUT_MS);
 
 const sock = net.createConnection(SOCKET_PATH, () => {
   // Handshake
-  sock.write(JSON.stringify({ type: "hello", role: "plugin", sessionId: SESSION_ID, pid: process.pid }) + "\n");
+  sock.write(
+    JSON.stringify({ type: "hello", role: "plugin", sessionId: SESSION_ID, pid: process.pid, profile: PROFILE || undefined }) + "\n"
+  );
 
   // Send request immediately (broker doesn't ack hello for plugins)
   if (isBrokerOp) {
