@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { BASE_DIR, SOCKET_PATH as DEFAULT_SOCKET_PATH } from "@mizner/iris/paths";
 import net from "net";
-import { createAgentBackend, type AgentBackend } from "./agent-backend.js";
+import { createAgentBackend, resolveNodeBinary, type AgentBackend } from "./agent-backend.js";
 import { existsSync, mkdirSync, openSync, readFileSync, statSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { spawn } from "child_process";
@@ -104,7 +104,8 @@ function maybeStartBroker(): void {
 
   try {
     const out = openSync(join(RUNTIME_DIR, "broker.log"), "a");
-    const child = spawn(process.execPath, [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
+    const child = spawn(resolveNodeBinary(), [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
+    child.on("error", () => {});
     child.unref();
   } catch {
     // ignore
@@ -376,13 +377,21 @@ function labelRouterPlane(result: unknown, plane: "applescript" | "agent-browser
   return { content: result, plane };
 }
 
+// Long waits (wait_for up to 2 min, request_user up to 30 min) need more than the default 60s round trip.
+function callTimeoutMs(args: Record<string, any>): number {
+  const requested = Number(args?.timeoutMs);
+  if (!Number.isFinite(requested) || requested <= 45000) return 60000;
+  return Math.min(requested, 30 * 60 * 1000) + 15000;
+}
+
 async function routerRequest(toolName: string, args: Record<string, any>): Promise<any> {
   const errors: string[] = [];
   
   // Try 1: Extension (broker)
   if (!USE_AGENT_BACKEND || !USE_ROUTER_FALLBACKS) {
     try {
-      const result = await brokerRequest("tool", { tool: toolName, args });
+      const timeoutMs = callTimeoutMs(args);
+      const result = await brokerRequest("tool", { tool: toolName, args, timeoutMs }, timeoutMs);
       logRouter(`SUCCESS[extension]: ${toolName}`);
       return result;
     } catch (err: any) {
@@ -955,7 +964,7 @@ const plugin: Plugin = async (ctx) => {
 
       browser_query: tool({
         description:
-          "Read data from the page using selectors, optional wait, or page_text extraction (shadow DOM + same-origin iframes).",
+          "Read data from the page using selectors, optional wait, or page_text extraction (shadow DOM + same-origin iframes). mode: text (default), value, attribute, property, html, list (alias all), exists (alias count; returns {exists,count} instead of failing), page_text (no selector needed).",
         args: {
           selector: schema.string().optional(),
           mode: schema.string().optional(),
@@ -1138,12 +1147,14 @@ const plugin: Plugin = async (ctx) => {
       }),
 
       browser_network_stop: tool({
-        description: "Stop network capture for a tab while keeping captured records available until cleared.",
+        description:
+          "Stop network capture for a tab while keeping captured records available until cleared. Detaches the debugger (removing Chrome's debugging bar, which also stops console/error capture) unless detach=false.",
         args: {
           tabId: schema.number().optional(),
+          detach: schema.boolean().optional(),
         },
-        async execute({ tabId }, ctx) {
-          const data = await toolRequest("network_stop", { tabId });
+        async execute({ tabId, detach }, ctx) {
+          const data = await toolRequest("network_stop", { tabId, detach });
           return toolResultText(data, "Network capture stopped");
         },
       }),
@@ -1198,6 +1209,47 @@ const plugin: Plugin = async (ctx) => {
         async execute({ tabId }, ctx) {
           const data = await toolRequest("get_webmcp_status", { tabId });
           return toolResultText(data, "{}");
+        },
+      }),
+
+      browser_request_user: tool({
+        description:
+          "Hand the tab to the user for something only they can do (sign-in, 2FA, CAPTCHA, a choice) and wait. Brings the tab to the front, shows a banner with a Done button and a notification, then returns when urlPattern matches, selector (CSS) or text appears, the user clicks Done, or timeoutMs (default 300000, max 1800000) passes. status: condition_met | user_done | timeout | tab_closed.",
+        args: {
+          message: schema.string(),
+          urlPattern: schema.string().optional(),
+          selector: schema.string().optional(),
+          text: schema.string().optional(),
+          timeoutMs: schema.number().optional(),
+          focus: schema.boolean().optional(),
+          tabId: schema.number().optional(),
+        },
+        async execute({ message, urlPattern, selector, text, timeoutMs, focus, tabId }, ctx) {
+          const data = await toolRequest("request_user", {
+            message,
+            urlPattern,
+            selector,
+            text,
+            timeoutMs: timeoutMs ?? 300000,
+            focus,
+            tabId,
+          });
+          return toolResultText(data, "{}");
+        },
+      }),
+
+      browser_evaluate: tool({
+        description:
+          "Evaluate a JavaScript expression in the page's main world and return the JSON result (promises are awaited; top-level await works). Uses the debugger (ignores page CSP); falls back to a main-world script. For statements, use an IIFE: (() => { ... })().",
+        args: {
+          expression: schema.string(),
+          awaitPromise: schema.boolean().optional(),
+          maxChars: schema.number().optional(),
+          tabId: schema.number().optional(),
+        },
+        async execute({ expression, awaitPromise, maxChars, tabId }, ctx) {
+          const data = await toolRequest("evaluate", { expression, awaitPromise, maxChars, tabId });
+          return toolResultText(data, "undefined");
         },
       }),
     },

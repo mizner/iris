@@ -617,9 +617,24 @@ function maybePin(sessionId, route) {
   if (state && !state.profileKey && route.key) state.profileKey = route.key;
 }
 
+// One Chrome tab group per agent session; IRIS_TAB_GROUPS=off leaves tabs ungrouped.
+function sessionGroupTitle(sessionId) {
+  if (!sessionId || /^(off|false|0)$/i.test(process.env.IRIS_TAB_GROUPS || "")) return undefined;
+  const label = String(sessionId).replace(/[^a-z0-9]/gi, "").slice(-4);
+  return label ? `Iris ${label}` : "Iris";
+}
+
+const MAX_TOOL_TIMEOUT_MS = 31 * 60 * 1000;
+
+function toolTimeoutMs(requested) {
+  const n = Number(requested);
+  if (!Number.isFinite(n) || n <= EXTENSION_TIMEOUT_MS) return EXTENSION_TIMEOUT_MS;
+  return Math.min(n, MAX_TOOL_TIMEOUT_MS);
+}
+
 async function ensureSessionTab(sessionId, hostSocket) {
   if (!sessionId) throw new Error("Missing sessionId for tab creation");
-  const res = await callExtension(hostSocket, "open_tab", { active: false }, sessionId);
+  const res = await callExtension(hostSocket, "open_tab", { active: false, group: sessionGroupTitle(sessionId) }, sessionId);
   const tabId = res && typeof res.tabId === "number" ? res.tabId : undefined;
   if (!tabId) throw new Error("Failed to create a new tab for this session");
   tabOwners.set(tabId, hostSocket);
@@ -644,6 +659,8 @@ async function handleTool(req) {
   const { tool, sessionId } = req;
   if (!tool) throw new Error("Missing tool");
   const { profile: requestedProfile, ...args } = req.args || {};
+  const timeoutMs = toolTimeoutMs(req.timeoutMs);
+  if (tool === "open_tab" && args.group === undefined) args.group = sessionGroupTitle(sessionId);
 
   if (sessionId) touchSession(sessionId);
   const state = sessionId ? getSessionState(sessionId) : null;
@@ -658,13 +675,26 @@ async function handleTool(req) {
   const isCloseTool = tool === "close_tab";
 
   let tabId = args.tabId;
+  const implicitTab = wantsTab(tool) && typeof tabId !== "number";
   if (wantsTab(tool)) {
-    if (typeof tabId !== "number") tabId = await sessionTabFor(sessionId, route, { create: !isCloseTool });
+    if (implicitTab) tabId = await sessionTabFor(sessionId, route, { create: !isCloseTool });
     const claimCheck = checkClaim(tabId, sessionId);
     if (!claimCheck.ok) throw new Error(claimCheck.error);
   }
 
-  const res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId);
+  let res;
+  try {
+    res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId, timeoutMs);
+  } catch (error) {
+    if (typeof tabId !== "number" || !/TAB_NOT_FOUND|No tab with id/.test(error?.message || "")) throw error;
+    // The tab is gone (user closed it). Forget it; a session's own implicit tab is replaced transparently.
+    tabOwners.delete(tabId);
+    if (claims.has(tabId)) releaseClaim(tabId);
+    else clearDefaultTab(sessionId, tabId);
+    if (!implicitTab || isCloseTool) throw error;
+    tabId = await ensureSessionTab(sessionId, route.socket);
+    res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId, timeoutMs);
+  }
   recordTabs(route.socket, tool, res);
   maybePin(sessionId, route);
 
@@ -1134,7 +1164,7 @@ function handleClientMessage(socket, client, msg) {
         }
 
         if (msg.op === "tool") {
-          const result = await handleTool({ tool: msg.tool, args: msg.args || {}, sessionId });
+          const result = await handleTool({ tool: msg.tool, args: msg.args || {}, sessionId, timeoutMs: msg.timeoutMs });
           replyOk(result);
           return;
         }

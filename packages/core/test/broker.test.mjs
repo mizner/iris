@@ -343,6 +343,34 @@ test("tool without tabId works in a background session tab, not the user's activ
   assert.deepEqual(toolRequests(host, "click").map((m) => m.message.args.tabId), [99, 99]);
 });
 
+test("a closed session tab is replaced; a closed explicit tab fails with TAB_NOT_FOUND and is forgotten", async (t) => {
+  const broker = await startBroker(t);
+  let nextTab = 40;
+  const closed = new Set();
+  const host = await broker.makeHost(702, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: ++nextTab, content: { tabId: nextTab } };
+      if (closed.has(args.tabId)) throw new Error(`TAB_NOT_FOUND: Tab ${args.tabId} no longer exists`);
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const plugin = broker.makePlugin("session-stale-tab");
+  const call = (id, args) => broker.request(plugin, id, "tool", { tool: "click", args, sessionId: "session-stale-tab" });
+
+  assert.equal((await call(1, { selector: "#a" })).ok, true);
+  closed.add(41);
+  const recovered = await call(2, { selector: "#a" });
+  assert.equal(recovered.ok, true, "implicit session tab is replaced transparently");
+  assert.deepEqual(toolRequests(host, "click").map((m) => m.message.args.tabId), [41, 41, 42]);
+
+  closed.add(42);
+  const explicit = await call(3, { selector: "#a", tabId: 42 });
+  assert.equal(explicit.ok, false);
+  assert.match(explicit.error, /TAB_NOT_FOUND/);
+  const claims = await broker.request(plugin, 4, "list_claims");
+  assert.equal(claims.data.claims.some((c) => c.tabId === 42), false, "closed tab claim is released");
+});
+
 test("claim_tab broadcasts claims to the extension host", async (t) => {
   const broker = await startBroker(t);
   const host = await broker.makeHost(801, { pong: true });

@@ -1,6 +1,6 @@
 import net from "net";
 import { BASE_DIR } from "@mizner/iris/paths";
-import { mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { spawn } from "child_process";
@@ -120,9 +120,23 @@ function resolveAgentDaemonPath(): string | null {
   }
 }
 
+// Inside a compiled harness (OMP, Bun single-file builds) process.execPath is the harness binary, not Node.
+// Spawning it with a script path starts another agent run instead of the script.
+export function resolveNodeBinary(): string {
+  const override = (process.env.IRIS_NODE || process.env.OPENCODE_BROWSER_AGENT_NODE)?.trim();
+  if (override) return override;
+  if (/^node(\.exe)?$/i.test(basename(process.execPath))) return process.execPath;
+  try {
+    const config = JSON.parse(readFileSync(join(BASE_DIR, "config.json"), "utf8"));
+    if (typeof config?.nodePath === "string" && existsSync(config.nodePath)) return config.nodePath;
+  } catch {
+    // no runtime config yet
+  }
+  return "node";
+}
+
 function resolveAgentNodePath(): string {
-  const override = process.env.OPENCODE_BROWSER_AGENT_NODE?.trim();
-  return override || process.execPath;
+  return resolveNodeBinary();
 }
 
 export function getAgentPackageVersion(): string | null {
@@ -160,6 +174,7 @@ async function maybeStartAgentDaemon(connection: AgentConnectionInfo, session: s
         AGENT_BROWSER_DAEMON: "1",
       },
     });
+    child.on("error", () => {});
     child.unref();
   } catch {
     // ignore

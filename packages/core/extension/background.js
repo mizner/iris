@@ -159,8 +159,9 @@ function detectWebMCP() {
   const hasLegacyWidget = document?.querySelector?.("[data-webmcp-widget]") !== null
   const hasLegacyGlobal = typeof window?.webMCP !== "undefined"
   
-  // Check for native/W3C WebMCP
-  const hasNativeWebMCP = typeof navigator?.modelContext !== "undefined"
+  // Check for native/W3C WebMCP (Chromium moved it from navigator to document in July 2026)
+  const hasNativeWebMCP =
+    typeof document?.modelContext !== "undefined" || typeof navigator?.modelContext !== "undefined"
   
   return {
     legacy: hasLegacyWidget || hasLegacyGlobal,
@@ -220,7 +221,9 @@ async function toolGetWebMCPStatus({ tabId } = {}) {
       func: () => {
         const hasLegacyWidget = document.querySelector("[data-webmcp-widget]") !== null
         const hasLegacyGlobal = typeof window.webMCP !== "undefined"
-        const hasNativeWebMCP = typeof navigator.modelContext !== "undefined"
+        // Chromium moved WebMCP from navigator.modelContext to document.modelContext in July 2026.
+        const hasNativeWebMCP =
+          typeof document.modelContext !== "undefined" || typeof navigator.modelContext !== "undefined"
         
         let capabilities = null
         if (window.webMCP?.isConnected) {
@@ -734,6 +737,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   lastSnapshot.delete(tabId)
   agentCursorByTab.delete(tabId)
+  // Let the broker drop claims and default-tab pointers for the closed tab.
+  if (isConnected && lastClaims.some((claim) => claim.tabId === tabId)) send({ type: "release_tab", tabId })
 })
 
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
@@ -974,6 +979,8 @@ async function executeTool(toolName, args) {
     get_profile_status: toolGetProfileStatus,
     profile_summary: toolProfileSummary,
     get_webmcp_status: toolGetWebMCPStatus,
+    request_user: toolRequestUser,
+    evaluate: toolEvaluate,
   }
 
   const fn = tools[toolName]
@@ -988,7 +995,18 @@ async function getActiveTab() {
 }
 
 async function getTabById(tabId) {
-  return tabId ? await chrome.tabs.get(tabId) : await getActiveTab()
+  if (!tabId) return await getActiveTab()
+  try {
+    return await chrome.tabs.get(tabId)
+  } catch (error) {
+    if (/No tab with id/i.test(error?.message || "")) {
+      throw new Error(
+        `TAB_NOT_FOUND: Tab ${tabId} no longer exists in this Chrome profile (closed, or it belongs to another profile). ` +
+          "Call browser_get_tabs for current tab ids, or omit tabId to use this session's own tab."
+      )
+    }
+    throw error
+  }
 }
 
 async function runInPage(tabId, command, args) {
@@ -1502,7 +1520,10 @@ async function pageOps(command, args) {
     return { ok: false, error: "selector, text, pattern, or urlPattern is required" }
   }
 
-  const mode = typeof options.mode === "string" && options.mode ? options.mode : "text"
+  const MODE_ALIASES = { count: "exists", all: "list", page: "page_text" }
+  const rawMode = typeof options.mode === "string" && options.mode ? options.mode : "text"
+  const mode = MODE_ALIASES[rawMode] || rawMode
+  const QUERY_MODES = ["text", "value", "attribute", "property", "html", "list", "exists", "page_text"]
   const selectors = normalizeSelectorList(options.selector)
   const index = Number.isFinite(options.index) ? options.index : 0
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : DEFAULT_TIMEOUT_MS
@@ -1908,8 +1929,12 @@ async function pageOps(command, args) {
       return { ok: true, value: getPageText(limit, pattern, flags) }
     }
 
+    if (!QUERY_MODES.includes(mode)) {
+      return { ok: false, error: `Unknown mode: ${rawMode}. Valid modes: ${QUERY_MODES.join(", ")} (count is an alias of exists).` }
+    }
+
     if (!selectors.length) {
-      return { ok: false, error: "Selector is required" }
+      return { ok: false, error: `selector is required for mode=${mode}; use mode=page_text to read the whole page.` }
     }
 
     const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
@@ -1923,7 +1948,13 @@ async function pageOps(command, args) {
     }
 
     if (!match.chosen) {
-      return { ok: false, error: `No matches for selectors: ${selectors.join(", ")}` }
+      return {
+        ok: false,
+        error:
+          `No matches for selectors: ${selectors.join(", ")}. ` +
+          "mode=exists returns {exists:false} instead of failing; browser_snapshot or " +
+          'browser_query mode=list selector="button,a,input,textarea,[role]" shows what is on the page.',
+      }
     }
 
     if (mode === "text") {
@@ -1964,7 +1995,7 @@ async function pageOps(command, args) {
       }
     }
 
-    return { ok: false, error: `Unknown mode: ${mode}` }
+    return { ok: false, error: `Unknown mode: ${rawMode}. Valid modes: ${QUERY_MODES.join(", ")}.` }
   }
 
   return { ok: false, error: `Unknown command: ${String(command)}` }
@@ -1980,14 +2011,205 @@ async function toolGetActiveTab() {
   }
 }
 
+// Agent tabs are collected in one Chrome tab group per session so they are visible and easy to close together.
+async function addToSessionGroup(tab, title) {
+  if (!chrome.tabGroups || !chrome.tabs.group || !title) return null
+  try {
+    const [existing] = await chrome.tabGroups.query({ title, windowId: tab.windowId })
+    if (existing) {
+      await chrome.tabs.group({ groupId: existing.id, tabIds: [tab.id] })
+      return existing.id
+    }
+    const groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } })
+    await chrome.tabGroups.update(groupId, { title, color: "green" })
+    return groupId
+  } catch (error) {
+    console.warn("[Iris] Could not group tab:", error?.message || error)
+    return null
+  }
+}
+
 // Background by default: agents should not take over the tab the user is looking at.
-async function toolOpenTab({ url, active = false }) {
+async function toolOpenTab({ url, active = false, group }) {
   const createOptions = {}
   if (typeof url === "string" && url.trim()) createOptions.url = url.trim()
   if (typeof active === "boolean") createOptions.active = active
 
   const tab = await chrome.tabs.create(createOptions)
-  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active } }
+  const groupId = await addToSessionGroup(tab, group)
+  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active, groupId } }
+}
+
+// Runs in the page (isolated world): shows or removes the handoff banner and checks the completion condition.
+function irisUserPrompt(message, selector, text, mode) {
+  const ID = "__iris_user_prompt"
+  let bar = document.getElementById(ID)
+  if (mode === "remove") {
+    bar?.remove()
+    return { done: false, matched: false }
+  }
+  if (mode === "start") window.__irisUserDone = false
+  if (!bar && !window.__irisUserDone) {
+    bar = document.createElement("div")
+    bar.id = ID
+    bar.style.cssText =
+      "position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;gap:12px;align-items:center;" +
+      "padding:10px 16px;background:#14532d;color:#fff;font:14px/1.4 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.3)"
+    const label = document.createElement("span")
+    label.style.flex = "1"
+    label.textContent = `Iris: ${message} The agent is waiting; click Done when finished.`
+    const button = document.createElement("button")
+    button.textContent = "Done"
+    button.style.cssText = "padding:4px 14px;border:0;border-radius:4px;background:#22c55e;color:#052e16;font-weight:600;cursor:pointer"
+    button.addEventListener("click", () => {
+      window.__irisUserDone = true
+      bar.remove()
+    })
+    bar.append(label, button)
+    ;(document.body || document.documentElement).appendChild(bar)
+  }
+  let matched = false
+  try {
+    if (selector) matched = !!document.querySelector(selector)
+    if (!matched && text) matched = (document.body?.innerText || "").includes(text)
+  } catch {}
+  return { done: !!window.__irisUserDone, matched }
+}
+
+function urlMatches(url, pattern) {
+  if (!pattern || !url) return false
+  try {
+    return new RegExp(pattern).test(url) || url.includes(pattern)
+  } catch {
+    return url.includes(pattern)
+  }
+}
+
+async function injectUserPrompt(tabId, message, selector, text, mode) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: irisUserPrompt,
+      args: [message, selector || "", text || "", mode],
+    })
+    return res?.result || { done: false, matched: false }
+  } catch {
+    // Mid-navigation or a restricted page (chrome://, Web Store): try again on the next poll.
+    return { done: false, matched: false }
+  }
+}
+
+// Hand the tab to the user (sign-in, 2FA, CAPTCHA, a choice only they can make) and wait until they finish.
+async function toolRequestUser({ message, tabId, urlPattern, selector, text, timeoutMs, focus = true } = {}) {
+  if (typeof message !== "string" || !message.trim()) throw new Error("message is required")
+  const tab = await getTabById(tabId)
+  const timeout = clampNumber(timeoutMs, 5000, 1800000, 300000)
+  const startUrl = tab.url || ""
+
+  if (focus !== false) {
+    await chrome.tabs.update(tab.id, { active: true })
+    await chrome.windows.update(tab.windowId, { focused: true, drawAttention: true }).catch(() => {})
+  }
+  if (chrome.notifications?.create) {
+    chrome.notifications
+      .create(`iris-handoff-${tab.id}`, {
+        type: "basic",
+        iconUrl: "icons/icon128.png",
+        title: "Iris needs you",
+        message: message.trim(),
+        requireInteraction: true,
+      })
+      .catch(() => {})
+  }
+
+  let mode = "start"
+  const endAt = Date.now() + timeout
+  let status = "timeout"
+  let finalUrl = startUrl
+  while (Date.now() < endAt) {
+    const current = await chrome.tabs.get(tab.id).catch(() => null)
+    if (!current) {
+      status = "tab_closed"
+      break
+    }
+    finalUrl = current.url || finalUrl
+    if (urlPattern && urlMatches(finalUrl, urlPattern)) {
+      status = "condition_met"
+      break
+    }
+    const check = await injectUserPrompt(tab.id, message.trim(), selector, text, mode)
+    mode = "poll"
+    if (check.matched) {
+      status = "condition_met"
+      break
+    }
+    if (check.done) {
+      status = "user_done"
+      break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+
+  if (status !== "tab_closed") await injectUserPrompt(tab.id, "", "", "", "remove")
+  chrome.notifications?.clear?.(`iris-handoff-${tab.id}`).catch?.(() => {})
+  return {
+    tabId: tab.id,
+    content: JSON.stringify({ ok: status === "condition_met" || status === "user_done", status, url: finalUrl }, null, 2),
+  }
+}
+
+// Evaluate JavaScript in the page's main world. CDP Runtime.evaluate is used first because it ignores page CSP
+// and can await promises; without the debugger it falls back to a main-world script (blocked by strict CSP).
+async function toolEvaluate({ expression, tabId, awaitPromise = true, maxChars = 20000 } = {}) {
+  if (typeof expression !== "string" || !expression.trim()) throw new Error("expression is required")
+  const tab = await getTabById(tabId)
+  const limit = clampNumber(maxChars, 100, 500000, 20000)
+  const format = (value, via) => {
+    let text
+    try {
+      text = typeof value === "string" ? value : JSON.stringify(value, null, 2)
+    } catch {
+      text = String(value)
+    }
+    if (text === undefined) text = "undefined"
+    const truncated = text.length > limit
+    return { tabId: tab.id, content: truncated ? `${text.slice(0, limit)}\n[truncated ${text.length - limit} chars; via ${via}]` : text }
+  }
+
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+      expression,
+      awaitPromise: awaitPromise !== false,
+      returnByValue: true,
+      userGesture: true,
+      replMode: true,
+    })
+    if (res?.exceptionDetails) {
+      const detail = res.exceptionDetails.exception?.description || res.exceptionDetails.text || "Evaluation failed"
+      throw new Error(`Evaluation threw: ${detail}`)
+    }
+    const remote = res?.result || {}
+    return format("value" in remote ? remote.value : remote.description ?? remote.type, "cdp")
+  }
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    func: async (code) => {
+      try {
+        const value = await (0, eval)(code)
+        return { ok: true, value: value === undefined ? null : JSON.parse(JSON.stringify(value)) }
+      } catch (error) {
+        return { ok: false, error: error?.message || String(error) }
+      }
+    },
+    args: [expression],
+  })
+  const out = res?.result
+  if (!out?.ok) throw new Error(`Evaluation failed: ${out?.error || "no result"} (debugger unavailable: ${state.unavailableReason || "unknown"})`)
+  return format(out.value, "main-world script")
 }
 
 async function toolCloseTab({ tabId }) {
@@ -2600,7 +2822,9 @@ async function toolQuery({
   pattern,
   flags,
 }) {
-  if (!selector && mode !== "page_text") throw new Error("selector is required")
+  if (!selector && mode !== "page_text" && mode !== "page") {
+    throw new Error(`selector is required for mode=${mode}; use mode=page_text to read the whole page.`)
+  }
   const tab = await getTabById(tabId)
 
   const result = await runInPage(tab.id, "query", {
@@ -2618,7 +2842,7 @@ async function toolQuery({
 
   if (!result?.ok) throw new Error(result?.error || "Query failed")
 
-  if (mode === "list" || mode === "property" || mode === "exists" || mode === "page_text") {
+  if (["list", "all", "property", "exists", "count", "page_text", "page"].includes(mode)) {
     return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
   }
 
@@ -2683,20 +2907,23 @@ async function toolWaitFor({
     }
   }
 
-  const result = await runInPage(tab.id, "wait_for", {
-    selector,
-    text,
-    pattern,
-    urlPattern,
-    state,
-    timeoutMs: timeout,
-    pollMs: poll,
-    index,
-    flags,
-  })
-
-  if (!result?.ok) throw new Error(result?.error || "Wait condition failed")
-  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+  // Poll from the service worker with single in-page checks: a loop inside the page dies with the document,
+  // so a wait started on about:blank or before a navigation would never see the new page.
+  const endAt = Date.now() + timeout
+  while (true) {
+    let result = null
+    try {
+      result = await runInPage(tab.id, "wait_for", { selector, text, pattern, urlPattern, state, timeoutMs: 0, index, flags })
+    } catch (error) {
+      const message = error?.message || String(error)
+      if (/permission|No tab with id|cannot be scripted/i.test(message)) throw error
+      // Mid-navigation: the frame is being replaced; check again on the next poll.
+    }
+    if (result?.ok) return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+    if (result && result.error !== "Timed out waiting for condition") throw new Error(result.error || "Wait condition failed")
+    if (Date.now() >= endAt) throw new Error(`Timed out after ${timeout}ms waiting for condition`)
+    await new Promise((resolve) => setTimeout(resolve, poll))
+  }
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -2879,20 +3106,30 @@ async function toolNetworkStart({ tabId, clear = true, maxEntries } = {}) {
   }
 }
 
-async function toolNetworkStop({ tabId } = {}) {
+// Never attaches: stopping capture must not raise Chrome's debugging bar. Detaches by default so the bar goes away.
+async function toolNetworkStop({ tabId, detach = true } = {}) {
   const tab = await getTabById(tabId)
-  const state = await ensureDebuggerAttached(tab.id)
-  const network = state.network
-  if (state.attached && network?.enabled) {
+  const state = debuggerState.get(tab.id)
+  const network = state?.network
+  if (state?.attached && network?.enabled) {
     try {
       await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.disable")
     } catch {}
-    network.enabled = false
     state.enabledDomains?.delete?.("Network")
+  }
+  if (network) network.enabled = false
+  let detached = false
+  if (detach !== false && state?.attached) {
+    try {
+      await chrome.debugger.detach({ tabId: tab.id })
+    } catch {}
+    state.attached = false
+    state.enabledDomains = new Set()
+    detached = true
   }
   return {
     tabId: tab.id,
-    content: JSON.stringify({ ok: true, enabled: false, count: network?.order?.length || 0 }, null, 2),
+    content: JSON.stringify({ ok: true, enabled: false, detached, count: network?.order?.length || 0 }, null, 2),
   }
 }
 

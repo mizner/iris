@@ -9,12 +9,12 @@ import { homedir } from "os";
 import { join } from "path";
 import net2 from "net";
 import net from "net";
-import { mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, isAbsolute, join as join2, resolve } from "path";
 import { spawn } from "child_process";
 import { createRequire as createRequire2 } from "module";
-import { existsSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, statSync } from "fs";
 import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath } from "url";
@@ -12354,9 +12354,21 @@ function resolveAgentDaemonPath() {
     return null;
   }
 }
+function resolveNodeBinary() {
+  const override = (process.env.IRIS_NODE || process.env.OPENCODE_BROWSER_AGENT_NODE)?.trim();
+  if (override)
+    return override;
+  if (/^node(\.exe)?$/i.test(basename(process.execPath)))
+    return process.execPath;
+  try {
+    const config = JSON.parse(readFileSync(join2(BASE_DIR, "config.json"), "utf8"));
+    if (typeof config?.nodePath === "string" && existsSync(config.nodePath))
+      return config.nodePath;
+  } catch {}
+  return "node";
+}
 function resolveAgentNodePath() {
-  const override = process.env.OPENCODE_BROWSER_AGENT_NODE?.trim();
-  return override || process.execPath;
+  return resolveNodeBinary();
 }
 function getAgentPackageVersion() {
   try {
@@ -12392,6 +12404,7 @@ async function maybeStartAgentDaemon(connection, session) {
         AGENT_BROWSER_DAEMON: "1"
       }
     });
+    child.on("error", () => {});
     child.unref();
   } catch {}
 }
@@ -13189,11 +13202,12 @@ function writeJsonLine2(socket, msg) {
 }
 function maybeStartBroker() {
   const brokerPath = join3(RUNTIME_DIR, "broker.cjs");
-  if (!existsSync(brokerPath))
+  if (!existsSync2(brokerPath))
     return;
   try {
     const out = openSync(join3(RUNTIME_DIR, "broker.log"), "a");
-    const child = spawn2(process.execPath, [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
+    const child = spawn2(resolveNodeBinary(), [brokerPath], { detached: true, stdio: ["ignore", "ignore", out] });
+    child.on("error", () => {});
     child.unref();
   } catch {}
 }
@@ -13419,11 +13433,18 @@ function labelRouterPlane(result, plane) {
   }
   return { content: result, plane };
 }
+function callTimeoutMs(args) {
+  const requested = Number(args?.timeoutMs);
+  if (!Number.isFinite(requested) || requested <= 45000)
+    return 60000;
+  return Math.min(requested, 1800000) + 15000;
+}
 async function routerRequest(toolName, args) {
   const errors = [];
   if (!USE_AGENT_BACKEND || !USE_ROUTER_FALLBACKS) {
     try {
-      const result = await brokerRequest("tool", { tool: toolName, args });
+      const timeoutMs = callTimeoutMs(args);
+      const result = await brokerRequest("tool", { tool: toolName, args, timeoutMs }, timeoutMs);
       logRouter(`SUCCESS[extension]: ${toolName}`);
       return result;
     } catch (err) {
@@ -13938,7 +13959,7 @@ var plugin = async (ctx) => {
         }
       }),
       browser_query: tool({
-        description: "Read data from the page using selectors, optional wait, or page_text extraction (shadow DOM + same-origin iframes).",
+        description: "Read data from the page using selectors, optional wait, or page_text extraction (shadow DOM + same-origin iframes). mode: text (default), value, attribute, property, html, list (alias all), exists (alias count; returns {exists,count} instead of failing), page_text (no selector needed).",
         args: {
           selector: schema.string().optional(),
           mode: schema.string().optional(),
@@ -14104,12 +14125,13 @@ var plugin = async (ctx) => {
         }
       }),
       browser_network_stop: tool({
-        description: "Stop network capture for a tab while keeping captured records available until cleared.",
+        description: "Stop network capture for a tab while keeping captured records available until cleared. Detaches the debugger (removing Chrome's debugging bar, which also stops console/error capture) unless detach=false.",
         args: {
-          tabId: schema.number().optional()
+          tabId: schema.number().optional(),
+          detach: schema.boolean().optional()
         },
-        async execute({ tabId }, ctx) {
-          const data = await toolRequest("network_stop", { tabId });
+        async execute({ tabId, detach }, ctx) {
+          const data = await toolRequest("network_stop", { tabId, detach });
           return toolResultText(data, "Network capture stopped");
         }
       }),
@@ -14159,6 +14181,43 @@ var plugin = async (ctx) => {
         async execute({ tabId }, ctx) {
           const data = await toolRequest("get_webmcp_status", { tabId });
           return toolResultText(data, "{}");
+        }
+      }),
+      browser_request_user: tool({
+        description: "Hand the tab to the user for something only they can do (sign-in, 2FA, CAPTCHA, a choice) and wait. Brings the tab to the front, shows a banner with a Done button and a notification, then returns when urlPattern matches, selector (CSS) or text appears, the user clicks Done, or timeoutMs (default 300000, max 1800000) passes. status: condition_met | user_done | timeout | tab_closed.",
+        args: {
+          message: schema.string(),
+          urlPattern: schema.string().optional(),
+          selector: schema.string().optional(),
+          text: schema.string().optional(),
+          timeoutMs: schema.number().optional(),
+          focus: schema.boolean().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ message, urlPattern, selector, text, timeoutMs, focus, tabId }, ctx) {
+          const data = await toolRequest("request_user", {
+            message,
+            urlPattern,
+            selector,
+            text,
+            timeoutMs: timeoutMs ?? 300000,
+            focus,
+            tabId
+          });
+          return toolResultText(data, "{}");
+        }
+      }),
+      browser_evaluate: tool({
+        description: "Evaluate a JavaScript expression in the page's main world and return the JSON result (promises are awaited; top-level await works). Uses the debugger (ignores page CSP); falls back to a main-world script. For statements, use an IIFE: (() => { ... })().",
+        args: {
+          expression: schema.string(),
+          awaitPromise: schema.boolean().optional(),
+          maxChars: schema.number().optional(),
+          tabId: schema.number().optional()
+        },
+        async execute({ expression, awaitPromise, maxChars, tabId }, ctx) {
+          const data = await toolRequest("evaluate", { expression, awaitPromise, maxChars, tabId });
+          return toolResultText(data, "undefined");
         }
       })
     }
