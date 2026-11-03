@@ -107,10 +107,17 @@ async function startBroker(t) {
     };
 
     socket.on("data", createJsonLineParser(push));
-    socket.once("connect", () => writeJsonLine(socket, hello));
+    // Requests wait for this so the broker always sees the hello (session identity) first.
+    const ready = new Promise((resolve) =>
+      socket.once("connect", () => {
+        writeJsonLine(socket, hello);
+        resolve();
+      })
+    );
 
     return {
       socket,
+      ready,
       closed,
       messages,
       write(message) {
@@ -178,6 +185,7 @@ async function startBroker(t) {
   }
 
   async function request(client, id, op, extra = {}) {
+    await client.ready;
     client.write({ type: "request", id, op, ...extra });
     return await client.nextMessage((message) => message.type === "response" && message.id === id);
   }
