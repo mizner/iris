@@ -137,7 +137,15 @@ const timer = setTimeout(() => die("Timeout after " + EFFECTIVE_TIMEOUT_MS + "ms
 const sock = net.createConnection(SOCKET_PATH, () => {
   // Handshake
   sock.write(
-    JSON.stringify({ type: "hello", role: "plugin", sessionId: SESSION_ID, pid: process.pid, profile: PROFILE || undefined }) + "\n"
+    JSON.stringify({
+      type: "hello",
+      role: "plugin",
+      sessionId: SESSION_ID,
+      pid: process.pid,
+      profile: PROFILE || undefined,
+      harness: process.env.IRIS_HARNESS || "cli",
+      project: process.env.IRIS_PROJECT || path.basename(process.cwd()),
+    }) + "\n"
   );
 
   // Send request immediately (broker doesn't ack hello for plugins)

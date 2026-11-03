@@ -26,7 +26,7 @@ Each Chrome profile is a separate signed-in account with its own extension insta
    - Only one profile is connected: it is used automatically.
    - Otherwise call `browser_resolve_profile url=<target> task="<short intent>"`. It checks, in order: the task names a profile, the site is already open in exactly one profile, the site is listed under one profile's `domains`, and finally (when available) a decision model whose answer can be UNSURE. With `confident: true`, use `profile`; `pin=true` selects it in the same call.
    - With `confident: false`, choose from `candidates` using their purpose and open sites. If it is still unclear and the work signs in, submits, sends, buys, or deletes, ask the user and name the candidates. Read-only work may use `suggestion` (the configured default).
-3. Call `browser_use_profile profile=<name>` unless it is already selected. Every later call stays in that profile, and results carry `profile` so you can confirm where you are.
+3. Call `browser_use_profile profile=<name>` unless it is already selected. Then call `browser_name_group name="<2-4 words for the task>"` so the user can see what your tabs are for (for example `name="Codeable Neverland quote"`). Every later call stays in that profile, and results carry `profile` so you can confirm where you are.
 4. If you get `PROFILE_NOT_CONNECTED`, run `iris open-profile <name>` in a shell and retry. Do not switch to another profile to make the call succeed.
 
 Do not tell the user to click the Iris icon to switch profiles. That old workaround no longer selects anything. To fix a whole session to one profile at launch, set `IRIS_PROFILE=<name>` for the adapter or CLI.
@@ -40,7 +40,9 @@ Taking focus and using high-access tools (debugger, `browser_evaluate`) is allow
 3. **Taking focus.** Use `active=true` when a page must be visible to work, such as sites that pause rendering or ignore input in background tabs.
 4. **Computer use.** For things outside page content: native file dialogs, Chrome's own UI, macOS permission sheets. Use the computer-use skill.
 
-Tabs this session opens are collected in a green Chrome tab group named `Iris <id>`, so the user can see and close them together.
+Tabs this session opens are collected in one Chrome tab group. Until you name it with `browser_name_group`, it is named after the first site you open plus your harness (`codeable · omo`); after naming, `Codeable Neverland quote · omo`. Name it as soon as the task is clear, and rename it if the task changes.
+
+Other agents may be working in the same Chrome profile. `browser_get_tabs` marks each claimed tab with `claimedBy` (`sessionId`, `harness`, `project`, `group`), and `browser_list_claims` lists the same owners. Do not navigate, close, or type into another session's tabs; work in your own or ask the user.
 
 Debugger-backed tools (`browser_console`, `browser_errors`, `browser_evaluate`, network capture, some clicks and background screenshots) show Chrome's "started debugging" bar. `browser_network_stop` detaches the debugger and removes the bar (pass `detach=false` to keep console capture running). Release claimed tabs and close tabs you opened when you are done.
 
@@ -162,6 +164,7 @@ Use `browser_upload selector=<button or file input> files=["/abs/path/file.pdf"]
 - `browser_profile_status` - Return allowlist gating status per profile.
 - `browser_webmcp_status` - Detect WebMCP/native model context signals on the current page.
 - `browser_request_user` - Hand the tab to the user (sign-in, 2FA, CAPTCHA) and wait until they finish.
+- `browser_name_group` - Name this session's tab group after its task (harness is appended); optional `color`.
 - `browser_read` - Read the page (or one section) as markdown; `outline=true` for headings; paged with `offset`.
 - `browser_search_history` - Search this profile's browsing history.
 - `browser_bookmarks` - Search bookmarks, or list the most recent.

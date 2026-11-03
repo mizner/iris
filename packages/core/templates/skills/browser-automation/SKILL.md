@@ -26,7 +26,7 @@ browser_profiles
 
 Several Chrome profiles (separate signed-in accounts) can be connected. A session works in one: if the user named an account use it, otherwise call `browser_resolve_profile url=<target> task="<short intent>"` and use its `profile` when `confident` is true, then `browser_use_profile`. If it is not confident, choose from `candidates` or ask the user before anything that signs in, submits, or deletes. `PROFILE_REQUIRED` means no profile was chosen; `PROFILE_NOT_CONNECTED` means run `iris open-profile <name>`.
 
-Work in your own background tab (the default without `tabId`, grouped into a Chrome tab group named `Iris <id>`) or claim a tab the user already has open; take focus (`active=true`) when a page must be visible. When `browser_profiles` reports `decisionModel.available`, `browser_run` handles short routine navigation goals quickly.
+Name your tab group after the task right away (`browser_name_group name="Codeable Neverland quote"`; the harness is appended). Tabs claimed by other agents show `claimedBy` in `browser_get_tabs`; leave them alone. Work in your own background tab (the default without `tabId`, collected in your tab group) or claim a tab the user already has open; take focus (`active=true`) when a page must be visible. When `browser_profiles` reports `decisionModel.available`, `browser_run` handles short routine navigation goals quickly.
 
 If there are connection problems:
 

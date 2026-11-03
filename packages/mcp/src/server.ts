@@ -138,6 +138,15 @@ async function main() {
     );
   }
 
+  // Name the harness after the MCP client (omo, codex, hermes, ...) so tab groups and claims show who owns them.
+  server.server.oninitialized = () => {
+    if (process.env.IRIS_HARNESS) return;
+    const client = String(server.server.getClientVersion()?.name || "").toLowerCase();
+    const known = [["senpi", "omo"], ["omo", "omo"], ["codex", "codex"], ["hermes", "hermes"], ["claude", "claude"], ["cursor", "cursor"]];
+    const match = known.find(([needle]) => client.includes(needle));
+    process.env.IRIS_HARNESS = match ? match[1] : client.replace(/[-_ ]?mcp[-_ ]?client$/, "").slice(0, 16) || "mcp";
+  };
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

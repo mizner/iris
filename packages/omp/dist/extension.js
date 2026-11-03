@@ -13288,7 +13288,9 @@ async function ensureBrokerSocket() {
     socket = null;
   });
   const pinnedProfile = process.env.IRIS_PROFILE?.trim() || undefined;
-  writeJsonLine2(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid, profile: pinnedProfile });
+  const harness = process.env.IRIS_HARNESS?.trim() || "opencode";
+  const project = process.env.IRIS_PROJECT?.trim() || basename2(process.cwd());
+  writeJsonLine2(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid, profile: pinnedProfile, harness, project });
   return socket;
 }
 async function brokerRequest(op, payload, timeoutMs = 60000) {
@@ -14224,6 +14226,17 @@ var plugin = async (ctx) => {
           return toolResultText(data, "{}");
         }
       }),
+      browser_name_group: tool({
+        description: `Name this session's Chrome tab group after the task (2-4 words, e.g. "Codeable Neverland"); the harness is appended ("Codeable Neverland · omo"). Call it once the task is clear. Optional color: grey, blue, red, yellow, green, pink, purple, cyan, orange.`,
+        args: {
+          name: schema.string(),
+          color: schema.string().optional()
+        },
+        async execute({ name, color }, ctx) {
+          const data = await brokerOnlyRequest("name_group", { name, color });
+          return JSON.stringify(data, null, 2);
+        }
+      }),
       browser_read: tool({
         description: "Read the page as clean markdown (headings, lists, tables, links), the cheapest way to read content. Uses <main>/<article> when present and skips nav/header/footer/aside. selector limits it to one part (CSS or uid:eN). outline=true returns only the heading outline. Long pages are paged: pass offset from the truncation note.",
         args: {
@@ -14481,6 +14494,7 @@ function resultToNotifyText(result) {
     return String(result).slice(0, 500);
   }
 }
+process.env.IRIS_HARNESS ||= "omp";
 var irisPluginPromise = Promise.resolve(plugin_default({})).then((plugin) => {
   if (!isRecord(plugin) || !isRecord(plugin.tool)) {
     throw new Error("iris-opencode plugin did not return a tool map");

@@ -182,7 +182,7 @@ async function startBroker(t) {
     return await client.nextMessage((message) => message.type === "response" && message.id === id);
   }
 
-  return { child, logs, makeHost, makePlugin, request, waitForProfiles };
+  return { child, logs, makeClient, makeHost, makePlugin, request, waitForProfiles };
 }
 
 function toolRequests(host, tool) {
@@ -369,6 +369,35 @@ test("a closed session tab is replaced; a closed explicit tab fails with TAB_NOT
   assert.match(explicit.error, /TAB_NOT_FOUND/);
   const claims = await broker.request(plugin, 4, "list_claims");
   assert.equal(claims.data.claims.some((c) => c.tabId === 42), false, "closed tab claim is released");
+});
+
+test("tab groups are named from the site, then the agent's name, with the harness; claims show the owner", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(703, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: 70, content: { tabId: 70 } };
+      if (tool === "name_group") return { content: { title: args.title, groups: [9] } };
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const plugin = broker.makeClient({ type: "hello", role: "plugin", sessionId: "session-named", harness: "omo", project: "iris" });
+  const tool = (id, name, args) => broker.request(plugin, id, "tool", { tool: name, args, sessionId: "session-named" });
+
+  assert.equal((await tool(1, "open_tab", { url: "https://app.codeable.io/tasks/1" })).ok, true);
+  assert.equal(toolRequests(host, "open_tab")[0].message.args.group, "codeable · omo");
+
+  const named = await broker.request(plugin, 2, "name_group", { name: "Neverland venue quote", color: "blue" });
+  assert.equal(named.ok, true);
+  assert.equal(named.data.title, "Neverland venue quote · omo");
+  const rename = toolRequests(host, "name_group")[0].message.args;
+  assert.deepEqual([rename.tabIds, rename.title, rename.color], [[70], "Neverland venue quote · omo", "blue"]);
+
+  const claims = (await broker.request(plugin, 3, "list_claims")).data.claims;
+  assert.deepEqual(
+    claims.map((c) => [c.tabId, c.harness, c.project, c.group]),
+    [[70, "omo", "iris", "Neverland venue quote · omo"]]
+  );
+  assert.equal((await broker.request(plugin, 4, "name_group", { name: "x", color: "magenta" })).ok, false, "unknown color is rejected");
 });
 
 test("claim_tab broadcasts claims to the extension host", async (t) => {

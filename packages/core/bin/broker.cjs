@@ -239,12 +239,24 @@ function ownerOfTab(tabId) {
 
 // --- Claims ---
 
+// Who a session is: the harness that runs it, the project it works in, and its tab group name.
+function sessionOwner(sessionId) {
+  const state = sessionState.get(sessionId);
+  return {
+    sessionId,
+    harness: state?.harness || null,
+    project: state?.project || null,
+    group: state?.groupTitle || null,
+  };
+}
+
 function listClaims() {
   const out = [];
   for (const [tabId, info] of claims.entries()) {
+    const owner = sessionOwner(info.sessionId);
     out.push({
       tabId,
-      sessionId: info.sessionId,
+      ...owner,
       claimedAt: info.claimedAt,
       lastSeenAt: new Date(info.lastSeenAt).toISOString(),
     });
@@ -483,7 +495,11 @@ function withProfile(tool, result, key) {
   const out = { ...result, profile };
   if (tool === "get_tabs") {
     const tabs = parseTabList(result);
-    if (tabs) out.content = JSON.stringify(tabs.map((tab) => ({ ...tab, profile })), null, 2);
+    const ownedBy = (tab) => {
+      const claim = claims.get(tab.id);
+      return claim ? { claimedBy: sessionOwner(claim.sessionId) } : {};
+    };
+    if (tabs) out.content = JSON.stringify(tabs.map((tab) => ({ ...tab, profile, ...ownedBy(tab) })), null, 2);
   } else if ((tool === "open_tab" || tool === "get_active_tab") && result.content && typeof result.content === "object") {
     out.content = { ...result.content, profile };
   }
@@ -648,10 +664,79 @@ function maybePin(sessionId, route) {
 }
 
 // One Chrome tab group per agent session; IRIS_TAB_GROUPS=off leaves tabs ungrouped.
+// Title: the agent's name for the task (browser_name_group), else the first site it opened, else its project,
+// followed by the harness, e.g. "Codeable Neverland · omo" or "codeable · omp".
+const GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
+
+function groupsEnabled() {
+  return !/^(off|false|0)$/i.test(process.env.IRIS_TAB_GROUPS || "");
+}
+
+function clipText(value, max) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+function siteName(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "file:") return "local file";
+    if (!/^https?:$/.test(parsed.protocol)) return null;
+    const parts = parsed.hostname.replace(/^www\./, "").split(".");
+    if (parts.length >= 2 && /^\d+$/.test(parts[parts.length - 1])) return parsed.hostname;
+    return parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+  } catch {
+    return null;
+  }
+}
+
 function sessionGroupTitle(sessionId) {
-  if (!sessionId || /^(off|false|0)$/i.test(process.env.IRIS_TAB_GROUPS || "")) return undefined;
-  const label = String(sessionId).replace(/[^a-z0-9]/gi, "").slice(-4);
-  return label ? `Iris ${label}` : "Iris";
+  if (!sessionId || !groupsEnabled()) return undefined;
+  const state = sessionState.get(sessionId);
+  const name = clipText(state?.label || state?.site || state?.project || "Iris", 30);
+  return state?.harness ? `${name} · ${state.harness}` : name;
+}
+
+// A claimed tab of this session in the given profile: new tabs join that tab's group instead of a same-named one.
+function sessionAnchorTab(sessionId, hostSocket) {
+  for (const [tabId, info] of claims.entries()) {
+    if (info.sessionId === sessionId && ownerOfTab(tabId) === hostSocket) return tabId;
+  }
+  return undefined;
+}
+
+function groupArgs(sessionId, hostSocket) {
+  const title = sessionGroupTitle(sessionId);
+  if (!title) return {};
+  const state = sessionState.get(sessionId);
+  if (state) state.groupTitle = title;
+  return { group: title, groupColor: state?.color, groupWith: sessionAnchorTab(sessionId, hostSocket) };
+}
+
+// Retitle every group holding this session's tabs (and group any loose ones) after its name changes.
+async function renameSessionGroups(sessionId, { force = false } = {}) {
+  const state = sessionState.get(sessionId);
+  const title = sessionGroupTitle(sessionId);
+  if (!state || !title || (!force && state.groupTitle === title)) return [];
+  state.groupTitle = title;
+  const byHost = new Map();
+  for (const [tabId, info] of claims.entries()) {
+    if (info.sessionId !== sessionId) continue;
+    const host = ownerOfTab(tabId);
+    if (!host) continue;
+    if (!byHost.has(host)) byHost.set(host, []);
+    byHost.get(host).push(tabId);
+  }
+  const groups = [];
+  for (const [host, tabIds] of byHost) {
+    try {
+      const res = await callExtension(host, "name_group", { tabIds, title, color: state.color }, sessionId);
+      groups.push(...(res?.content?.groups || []));
+    } catch {
+      // A profile that cannot group (no tabGroups permission yet) keeps its tabs ungrouped.
+    }
+  }
+  return groups;
 }
 
 const MAX_TOOL_TIMEOUT_MS = 31 * 60 * 1000;
@@ -664,7 +749,7 @@ function toolTimeoutMs(requested) {
 
 async function ensureSessionTab(sessionId, hostSocket) {
   if (!sessionId) throw new Error("Missing sessionId for tab creation");
-  const res = await callExtension(hostSocket, "open_tab", { active: false, group: sessionGroupTitle(sessionId) }, sessionId);
+  const res = await callExtension(hostSocket, "open_tab", { active: false, ...groupArgs(sessionId, hostSocket) }, sessionId);
   const tabId = res && typeof res.tabId === "number" ? res.tabId : undefined;
   if (!tabId) throw new Error("Failed to create a new tab for this session");
   tabOwners.set(tabId, hostSocket);
@@ -690,10 +775,13 @@ async function handleTool(req) {
   if (!tool) throw new Error("Missing tool");
   const { profile: requestedProfile, ...args } = req.args || {};
   const timeoutMs = toolTimeoutMs(req.timeoutMs);
-  if (tool === "open_tab" && args.group === undefined) args.group = sessionGroupTitle(sessionId);
 
   if (sessionId) touchSession(sessionId);
   const state = sessionId ? getSessionState(sessionId) : null;
+  // Until the agent names its task, the group is named after the first site it opens.
+  if (state && !state.label && !state.site && (tool === "open_tab" || tool === "navigate") && args.url) {
+    state.site = siteName(args.url);
+  }
 
   const unscoped =
     !requestedProfile && !state?.profileKey && typeof args.tabId !== "number" && routingCandidates().length > 1;
@@ -712,6 +800,8 @@ async function handleTool(req) {
     const claimCheck = checkClaim(tabId, sessionId);
     if (!claimCheck.ok) throw new Error(claimCheck.error);
   }
+
+  if (tool === "open_tab" && args.group === undefined) Object.assign(args, groupArgs(sessionId, route.socket));
 
   let res;
   try {
@@ -743,6 +833,10 @@ async function handleTool(req) {
       touchClaim(usedTabId, sessionId);
       setDefaultTab(sessionId, usedTabId);
     }
+  }
+
+  if (state?.site && !state.label && state.groupTitle && state.groupTitle !== sessionGroupTitle(sessionId)) {
+    await renameSessionGroups(sessionId).catch(() => {});
   }
 
   const out = withProfile(tool, res, route.key);
@@ -1036,6 +1130,9 @@ function handleClientMessage(socket, client, msg) {
       if (state && typeof msg.profile === "string" && msg.profile.trim()) {
         state.profileKey = matchProfileKey(msg.profile) || normalizeKey(msg.profile);
       }
+      if (state && typeof msg.harness === "string" && msg.harness.trim()) state.harness = clipText(msg.harness, 16);
+      if (state && typeof msg.project === "string" && msg.project.trim()) state.project = clipText(msg.project, 40);
+      if (state && Number.isFinite(msg.pid)) state.pid = msg.pid;
     }
     if (client.role === "native-host") {
       const now = nowMs();
@@ -1124,7 +1221,8 @@ function handleClientMessage(socket, client, msg) {
           const state = sessionId ? sessionState.get(sessionId) : null;
           const sessionInfo = state
             ? {
-                sessionId,
+                ...sessionOwner(sessionId),
+                pid: state.pid ?? null,
                 defaultTabId: state.defaultTabId,
                 profile: state.profileKey ? labelFor(state.profileKey) : null,
                 lastSeenAt: new Date(state.lastSeenAt).toISOString(),
@@ -1154,6 +1252,26 @@ function handleClientMessage(socket, client, msg) {
 
         if (msg.op === "list_claims") {
           replyOk({ claims: listClaims() });
+          return;
+        }
+
+        if (msg.op === "name_group") {
+          const state = getSessionState(sessionId);
+          if (!state) throw new Error("Missing sessionId");
+          const name = clipText(msg.name, 30);
+          if (!name) throw new Error("name is required: 2-4 words describing this session's task");
+          if (msg.color !== undefined && !GROUP_COLORS.has(String(msg.color))) {
+            throw new Error(`color must be one of: ${[...GROUP_COLORS].join(", ")}`);
+          }
+          state.label = name;
+          if (msg.color !== undefined) state.color = String(msg.color);
+          const groups = await renameSessionGroups(sessionId, { force: true });
+          replyOk({
+            ok: true,
+            title: sessionGroupTitle(sessionId),
+            groups,
+            note: groups.length ? undefined : "Saved; tabs this session opens will use this group name.",
+          });
           return;
         }
 

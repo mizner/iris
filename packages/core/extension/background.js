@@ -1028,6 +1028,7 @@ async function executeTool(toolName, args) {
     bookmarks: toolBookmarks,
     recently_closed: toolRecentlyClosed,
     upload: toolUpload,
+    name_group: toolNameGroup,
   }
 
   const fn = tools[toolName]
@@ -2067,16 +2068,18 @@ async function toolGetActiveTab() {
 }
 
 // Agent tabs are collected in one Chrome tab group per session so they are visible and easy to close together.
-async function addToSessionGroup(tab, title) {
+// Join the group of anchorTabId (another tab of the same session) when it is in this window; otherwise start a new
+// group. Matching by title alone would merge two sessions that happen to share a name ("codeable · omo").
+async function addToSessionGroup(tab, title, color, anchorTabId) {
   if (!chrome.tabGroups || !chrome.tabs.group || !title) return null
   try {
-    const [existing] = await chrome.tabGroups.query({ title, windowId: tab.windowId })
-    if (existing) {
-      await chrome.tabs.group({ groupId: existing.id, tabIds: [tab.id] })
-      return existing.id
+    const anchor = Number.isFinite(anchorTabId) ? await chrome.tabs.get(anchorTabId).catch(() => null) : null
+    if (anchor && anchor.groupId >= 0 && anchor.windowId === tab.windowId) {
+      await chrome.tabs.group({ groupId: anchor.groupId, tabIds: [tab.id] })
+      return anchor.groupId
     }
     const groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } })
-    await chrome.tabGroups.update(groupId, { title, color: "green" })
+    await chrome.tabGroups.update(groupId, { title, color: color || "green" })
     return groupId
   } catch (error) {
     console.warn("[Iris] Could not group tab:", error?.message || error)
@@ -2085,14 +2088,45 @@ async function addToSessionGroup(tab, title) {
 }
 
 // Background by default: agents should not take over the tab the user is looking at.
-async function toolOpenTab({ url, active = false, group }) {
+async function toolOpenTab({ url, active = false, group, groupColor, groupWith }) {
   const createOptions = {}
   if (typeof url === "string" && url.trim()) createOptions.url = url.trim()
   if (typeof active === "boolean") createOptions.active = active
 
   const tab = await chrome.tabs.create(createOptions)
-  const groupId = await addToSessionGroup(tab, group)
+  const groupId = await addToSessionGroup(tab, group, groupColor, groupWith)
   return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active, groupId } }
+}
+
+// Retitle the groups holding these tabs; loose tabs join the first of those groups (or a new one) per window.
+async function toolNameGroup({ tabIds = [], title, color } = {}) {
+  if (!chrome.tabGroups || !chrome.tabs.group) throw new Error("Tab groups unavailable. Reload the Iris extension.")
+  if (typeof title !== "string" || !title.trim()) throw new Error("title is required")
+  const tabs = (await Promise.all(tabIds.map((id) => chrome.tabs.get(id).catch(() => null)))).filter(Boolean)
+  const groups = new Set()
+  const groupByWindow = new Map()
+  for (const tab of tabs) {
+    if (tab.groupId < 0) continue
+    if (!groups.has(tab.groupId)) {
+      await chrome.tabGroups.update(tab.groupId, { title, ...(color ? { color } : {}) })
+      groups.add(tab.groupId)
+    }
+    if (!groupByWindow.has(tab.windowId)) groupByWindow.set(tab.windowId, tab.groupId)
+  }
+  for (const tab of tabs) {
+    if (tab.groupId >= 0) continue
+    const existing = groupByWindow.get(tab.windowId)
+    if (existing !== undefined) {
+      await chrome.tabs.group({ groupId: existing, tabIds: [tab.id] }).catch(() => {})
+    } else {
+      const gid = await addToSessionGroup(tab, title, color)
+      if (gid !== null) {
+        groups.add(gid)
+        groupByWindow.set(tab.windowId, gid)
+      }
+    }
+  }
+  return { content: { title, groups: [...groups] } }
 }
 
 // Runs in the page (isolated world): shows or removes the handoff banner and checks the completion condition.
@@ -3275,7 +3309,18 @@ async function toolSnapshot({ tabId, full = false, interactive = false, selector
 
 async function toolGetTabs() {
   const tabs = await chrome.tabs.query({})
-  const out = tabs.map((t) => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }))
+  const groupTitles = new Map()
+  if (chrome.tabGroups) {
+    for (const g of await chrome.tabGroups.query({}).catch(() => [])) groupTitles.set(g.id, g.title || "")
+  }
+  const out = tabs.map((t) => ({
+    id: t.id,
+    url: t.url,
+    title: t.title,
+    active: t.active,
+    windowId: t.windowId,
+    ...(t.groupId >= 0 ? { group: groupTitles.get(t.groupId) ?? "" } : {}),
+  }))
   return { content: JSON.stringify(out, null, 2) }
 }
 

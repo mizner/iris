@@ -13373,7 +13373,9 @@ async function ensureBrokerSocket() {
     socket = null;
   });
   const pinnedProfile = process.env.IRIS_PROFILE?.trim() || undefined;
-  writeJsonLine2(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid, profile: pinnedProfile });
+  const harness = process.env.IRIS_HARNESS?.trim() || "opencode";
+  const project = process.env.IRIS_PROJECT?.trim() || basename2(process.cwd());
+  writeJsonLine2(socket, { type: "hello", role: "plugin", sessionId, pid: process.pid, profile: pinnedProfile, harness, project });
   return socket;
 }
 async function brokerRequest(op, payload, timeoutMs = 60000) {
@@ -14307,6 +14309,17 @@ var plugin = async (ctx) => {
         async execute({ tabId }, ctx) {
           const data = await toolRequest("get_webmcp_status", { tabId });
           return toolResultText(data, "{}");
+        }
+      }),
+      browser_name_group: tool({
+        description: `Name this session's Chrome tab group after the task (2-4 words, e.g. "Codeable Neverland"); the harness is appended ("Codeable Neverland · omo"). Call it once the task is clear. Optional color: grey, blue, red, yellow, green, pink, purple, cyan, orange.`,
+        args: {
+          name: schema.string(),
+          color: schema.string().optional()
+        },
+        async execute({ name, color }, ctx) {
+          const data = await brokerOnlyRequest("name_group", { name, color });
+          return JSON.stringify(data, null, 2);
         }
       }),
       browser_read: tool({

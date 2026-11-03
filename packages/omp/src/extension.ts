@@ -244,6 +244,9 @@ function resultToNotifyText(result: unknown): string {
   }
 }
 
+// Read when the adapter first connects, so it labels this session's claims and tab group as OMP's.
+process.env.IRIS_HARNESS ||= "omp";
+
 const irisPluginPromise: Promise<IrisPlugin> = Promise.resolve(irisOpencode({})).then((plugin) => {
   if (!isRecord(plugin) || !isRecord(plugin.tool)) {
     throw new Error("iris-opencode plugin did not return a tool map");

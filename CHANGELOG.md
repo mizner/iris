@@ -3,6 +3,9 @@
 
 ## Unreleased
 
+- Tab groups get useful names: the first site a session opens plus its harness (`codeable · omo`), or the agent's own name via the new `browser_name_group` (`Codeable Neverland quote · omo`, optional color). New tabs join the session's own group, so two sessions on the same site stay separate.
+- Sessions identify their harness (OMP, OMO, Codex, Hermes, OpenCode, CLI; MCP clients are detected from `clientInfo`) and project. `browser_get_tabs` marks claimed tabs with `claimedBy`, and claims and `browser_status` show the owner.
+
 - Add `browser_read`: the page (or one section) as markdown, with heading outline and paging. Much cheaper than `page_text` or a full snapshot.
 - `browser_snapshot`: `interactive=true` (actionable elements only, no page text), `selector` scope, `maxNodes`, `includeText`.
 - `browser_screenshot`: `annotate=true` draws uid labels on interactive elements and returns the label list; `ifChanged=true` skips identical images; `savePath` writes to disk.
