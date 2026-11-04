@@ -21,6 +21,8 @@ try {
 }
 
 const DEFAULT_LEASE_TTL_MS = 5 * 60 * 1000;
+// How long an idle, disconnected session keeps its tab group name and group ids.
+const SESSION_STATE_TTL_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_PING_INTERVAL_MS = 20000;
 const DEFAULT_PONG_TIMEOUT_MS = 45000;
 const EXTENSION_TIMEOUT_MS = 60000;
@@ -339,7 +341,7 @@ function releaseClaimsForSession(sessionId) {
     }
   }
   clearDefaultTab(sessionId);
-  sessionState.delete(sessionId);
+  // The session's name and tab groups outlive the connection: CLI calls and reconnecting adapters come back to them.
   if (any) broadcastClaims();
 }
 
@@ -381,8 +383,9 @@ function cleanupStaleClaims() {
     }
   }
   if (expired) broadcastClaims();
+  const connected = new Set([...clients].map((client) => client.sessionId).filter(Boolean));
   for (const [sessionId, state] of sessionState.entries()) {
-    if (!sessionHasClaims(sessionId) && now - state.lastSeenAt > LEASE_TTL_MS) {
+    if (!connected.has(sessionId) && !sessionHasClaims(sessionId) && now - state.lastSeenAt > SESSION_STATE_TTL_MS) {
       sessionState.delete(sessionId);
     }
   }
@@ -705,12 +708,32 @@ function sessionAnchorTab(sessionId, hostSocket) {
   return undefined;
 }
 
+// Group ids are remembered per profile, so new tabs rejoin the session's group even after its claims lapse.
+function hostKey(hostSocket) {
+  return hosts.get(hostSocket)?.profileKey || "default";
+}
+
+function hostForKey(key) {
+  for (const [socket] of healthyHosts()) if (hostKey(socket) === key) return socket;
+  return null;
+}
+
+function rememberGroup(sessionId, hostSocket, groupId) {
+  const state = sessionState.get(sessionId);
+  if (state && Number.isInteger(groupId) && groupId >= 0) (state.groups ||= {})[hostKey(hostSocket)] = groupId;
+}
+
 function groupArgs(sessionId, hostSocket) {
   const title = sessionGroupTitle(sessionId);
   if (!title) return {};
   const state = sessionState.get(sessionId);
   if (state) state.groupTitle = title;
-  return { group: title, groupColor: state?.color, groupWith: sessionAnchorTab(sessionId, hostSocket) };
+  return {
+    group: title,
+    groupColor: state?.color,
+    groupId: state?.groups?.[hostKey(hostSocket)],
+    groupWith: sessionAnchorTab(sessionId, hostSocket),
+  };
 }
 
 // Retitle every group holding this session's tabs (and group any loose ones) after its name changes.
@@ -720,18 +743,26 @@ async function renameSessionGroups(sessionId, { force = false } = {}) {
   if (!state || !title || (!force && state.groupTitle === title)) return [];
   state.groupTitle = title;
   const byHost = new Map();
+  const entry = (host) => {
+    if (!byHost.has(host)) byHost.set(host, { tabIds: [], groupIds: [] });
+    return byHost.get(host);
+  };
+  for (const [key, groupId] of Object.entries(state.groups || {})) {
+    const host = hostForKey(key);
+    if (host) entry(host).groupIds.push(groupId);
+  }
   for (const [tabId, info] of claims.entries()) {
     if (info.sessionId !== sessionId) continue;
     const host = ownerOfTab(tabId);
-    if (!host) continue;
-    if (!byHost.has(host)) byHost.set(host, []);
-    byHost.get(host).push(tabId);
+    if (host) entry(host).tabIds.push(tabId);
   }
   const groups = [];
-  for (const [host, tabIds] of byHost) {
+  for (const [host, { tabIds, groupIds }] of byHost) {
     try {
-      const res = await callExtension(host, "name_group", { tabIds, title, color: state.color }, sessionId);
-      groups.push(...(res?.content?.groups || []));
+      const res = await callExtension(host, "name_group", { tabIds, groupIds, title, color: state.color }, sessionId);
+      const named = res?.content?.groups || [];
+      if (!state.groups?.[hostKey(host)]) rememberGroup(sessionId, host, named[0]);
+      groups.push(...named);
     } catch {
       // A profile that cannot group (no tabGroups permission yet) keeps its tabs ungrouped.
     }
@@ -752,6 +783,7 @@ async function ensureSessionTab(sessionId, hostSocket) {
   const res = await callExtension(hostSocket, "open_tab", { active: false, ...groupArgs(sessionId, hostSocket) }, sessionId);
   const tabId = res && typeof res.tabId === "number" ? res.tabId : undefined;
   if (!tabId) throw new Error("Failed to create a new tab for this session");
+  rememberGroup(sessionId, hostSocket, res.content?.groupId);
   tabOwners.set(tabId, hostSocket);
   touchClaim(tabId, sessionId);
   setDefaultTab(sessionId, tabId);
@@ -817,6 +849,7 @@ async function handleTool(req) {
     res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId, timeoutMs);
   }
   recordTabs(route.socket, tool, res);
+  if (tool === "open_tab" && sessionId) rememberGroup(sessionId, route.socket, res?.content?.groupId);
   maybePin(sessionId, route);
 
   const usedTabId =

@@ -4,6 +4,7 @@
 ## Unreleased
 
 - Tab groups get useful names: the first site a session opens plus its harness (`codeable · omo`), or the agent's own name via the new `browser_name_group` (`Codeable Neverland quote · omo`, optional color). New tabs join the session's own group, so two sessions on the same site stay separate.
+- Sessions reuse their own tab group: the broker remembers each session's group per profile, and a session keeps its name and group through lapsed claims, reconnects, and idle periods (up to 12 hours). `browser-cli` calls share one session (the calling agent's `PI_SESSION_ID`, else the working directory) instead of a new one per call, and `name_group` works from the CLI. `open_tab` reports `groupError` when Chrome refuses to group a tab.
 - Sessions identify their harness (OMP, OMO, Codex, Hermes, OpenCode, CLI; MCP clients are detected from `clientInfo`) and project. `browser_get_tabs` marks claimed tabs with `claimedBy`, and claims and `browser_status` show the owner.
 
 - Add `browser_read`: the page (or one section) as markdown, with heading outline and paging. Much cheaper than `page_text` or a full snapshot.

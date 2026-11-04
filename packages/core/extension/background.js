@@ -2070,41 +2070,55 @@ async function toolGetActiveTab() {
 // Agent tabs are collected in one Chrome tab group per session so they are visible and easy to close together.
 // Join the group of anchorTabId (another tab of the same session) when it is in this window; otherwise start a new
 // group. Matching by title alone would merge two sessions that happen to share a name ("codeable · omo").
-async function addToSessionGroup(tab, title, color, anchorTabId) {
+async function addToSessionGroup(tab, title, color, anchorTabId, groupId) {
   if (!chrome.tabGroups || !chrome.tabs.group || !title) return null
   try {
+    // The session's remembered group comes first: it survives lapsed claims and reconnects.
+    const known = Number.isInteger(groupId) ? await chrome.tabGroups.get(groupId).catch(() => null) : null
+    if (known && known.windowId === tab.windowId) {
+      await chrome.tabs.group({ groupId: known.id, tabIds: [tab.id] })
+      return known.id
+    }
     const anchor = Number.isFinite(anchorTabId) ? await chrome.tabs.get(anchorTabId).catch(() => null) : null
     if (anchor && anchor.groupId >= 0 && anchor.windowId === tab.windowId) {
       await chrome.tabs.group({ groupId: anchor.groupId, tabIds: [tab.id] })
       return anchor.groupId
     }
-    const groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } })
-    await chrome.tabGroups.update(groupId, { title, color: color || "green" })
-    return groupId
+    const created = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } })
+    await chrome.tabGroups.update(created, { title, color: color || "green" })
+    return created
   } catch (error) {
     console.warn("[Iris] Could not group tab:", error?.message || error)
-    return null
+    return { error: error?.message || String(error) }
   }
 }
 
 // Background by default: agents should not take over the tab the user is looking at.
-async function toolOpenTab({ url, active = false, group, groupColor, groupWith }) {
+async function toolOpenTab({ url, active = false, group, groupColor, groupId, groupWith }) {
   const createOptions = {}
   if (typeof url === "string" && url.trim()) createOptions.url = url.trim()
   if (typeof active === "boolean") createOptions.active = active
 
   const tab = await chrome.tabs.create(createOptions)
-  const groupId = await addToSessionGroup(tab, group, groupColor, groupWith)
-  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active, groupId } }
+  const joined = await addToSessionGroup(tab, group, groupColor, groupWith, groupId)
+  const grouping = joined && typeof joined === "object" ? { groupId: null, groupError: joined.error } : { groupId: joined }
+  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active, ...grouping } }
 }
 
 // Retitle the groups holding these tabs; loose tabs join the first of those groups (or a new one) per window.
-async function toolNameGroup({ tabIds = [], title, color } = {}) {
+async function toolNameGroup({ tabIds = [], groupIds = [], title, color } = {}) {
   if (!chrome.tabGroups || !chrome.tabs.group) throw new Error("Tab groups unavailable. Reload the Iris extension.")
   if (typeof title !== "string" || !title.trim()) throw new Error("title is required")
   const tabs = (await Promise.all(tabIds.map((id) => chrome.tabs.get(id).catch(() => null)))).filter(Boolean)
   const groups = new Set()
   const groupByWindow = new Map()
+  for (const id of groupIds) {
+    const group = await chrome.tabGroups.get(id).catch(() => null)
+    if (!group) continue
+    await chrome.tabGroups.update(group.id, { title, ...(color ? { color } : {}) })
+    groups.add(group.id)
+    if (!groupByWindow.has(group.windowId)) groupByWindow.set(group.windowId, group.id)
+  }
   for (const tab of tabs) {
     if (tab.groupId < 0) continue
     if (!groups.has(tab.groupId)) {
@@ -2120,7 +2134,7 @@ async function toolNameGroup({ tabIds = [], title, color } = {}) {
       await chrome.tabs.group({ groupId: existing, tabIds: [tab.id] }).catch(() => {})
     } else {
       const gid = await addToSessionGroup(tab, title, color)
-      if (gid !== null) {
+      if (Number.isInteger(gid)) {
         groups.add(gid)
         groupByWindow.set(tab.windowId, gid)
       }

@@ -408,6 +408,35 @@ test("tab groups are named from the site, then the agent's name, with the harnes
   assert.equal((await broker.request(plugin, 4, "name_group", { name: "x", color: "magenta" })).ok, false, "unknown color is rejected");
 });
 
+test("a session that reconnects rejoins its own tab group and keeps its name", async (t) => {
+  const broker = await startBroker(t);
+  let nextTab = 80;
+  const host = await broker.makeHost(704, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") {
+        const tabId = nextTab++;
+        return { tabId, content: { tabId, groupId: args.groupId ?? 12 } };
+      }
+      if (tool === "name_group") return { content: { title: args.title, groups: [12] } };
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const hello = { type: "hello", role: "plugin", sessionId: "cli-agent-1", harness: "cli" };
+
+  const first = broker.makeClient(hello);
+  await broker.request(first, 1, "tool", { tool: "open_tab", args: { url: "https://app.codeable.io/" }, sessionId: "cli-agent-1" });
+  await broker.request(first, 2, "name_group", { name: "Quote follow-up" });
+  const closed = new Promise((resolve) => first.socket.once("close", resolve));
+  first.socket.end();
+  await closed;
+
+  const second = broker.makeClient(hello);
+  await broker.request(second, 3, "tool", { tool: "open_tab", args: { url: "https://example.com/" }, sessionId: "cli-agent-1" });
+  const reopened = toolRequests(host, "open_tab")[1].message.args;
+  assert.equal(reopened.groupId, 12, "the second tab is sent to the remembered group");
+  assert.equal(reopened.group, "Quote follow-up · cli", "the name survives the reconnect");
+});
+
 test("claim_tab broadcasts claims to the extension host", async (t) => {
   const broker = await startBroker(t);
   const host = await broker.makeHost(801, { pong: true });

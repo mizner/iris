@@ -21,7 +21,7 @@
  *   IRIS_PROFILE=work node browser-cli.cjs snapshot
  *
  * Environment:
- *   BROWSER_SESSION  — Override session ID (default: auto-generated)
+ *   BROWSER_SESSION  — Override session ID (default: the calling agent's PI_SESSION_ID, else the working directory)
  *   BROWSER_TIMEOUT  — Request timeout in ms (default: 15000; run uses at least 120000)
  *   IRIS_PROFILE     — Chrome profile (alias or email) for this invocation
  *
@@ -38,7 +38,11 @@ const path = require("path");
 const BASE_DIR = path.join(os.homedir(), ".iris");
 const SOCKET_PATH = path.join(BASE_DIR, "broker.sock");
 const TIMEOUT_MS = parseInt(process.env.BROWSER_TIMEOUT, 10) || 15000;
-const SESSION_ID = process.env.BROWSER_SESSION || "cli-" + process.pid;
+// Each CLI call is a new process, so the session comes from the calling agent (OMO/OMP export PI_SESSION_ID),
+// else the working directory: repeated calls share one session, its tab group, and its name.
+const SESSION_ID =
+  process.env.BROWSER_SESSION ||
+  (process.env.PI_SESSION_ID ? "cli-" + process.env.PI_SESSION_ID : "cli-" + process.cwd().replace(/[^a-z0-9]+/gi, "-").slice(-48));
 
 // --- Arg parsing ---
 
@@ -52,7 +56,7 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     "       console, errors, network_start, network_stop, network_list, network_get,\n" +
     "       download, highlight, set_file_input,\n" +
     "       get_profile_status, get_webmcp_status, request_user, evaluate\n" +
-    "\nOps:   status, list_claims, claim_tab, release_tab,\n" +
+    "\nOps:   status, list_claims, claim_tab, release_tab, name_group,\n" +
     "       profiles, use_profile --profile <name>, resolve_profile --url <url> --task <text>,\n" +
     "       run --goal <text> [--url <url>] [--facts '[\"name=value\"]']\n" +
     "\nAny tool accepts --profile <alias|email>; IRIS_PROFILE sets it for every call.\n"
@@ -102,7 +106,7 @@ if (argv.length > 1) {
 
 // --- Broker ops vs tool ops ---
 
-const BROKER_OPS = ["status", "list_claims", "claim_tab", "release_tab", "profiles", "use_profile", "resolve_profile", "run"];
+const BROKER_OPS = ["status", "list_claims", "claim_tab", "release_tab", "profiles", "use_profile", "resolve_profile", "run", "name_group"];
 const isBrokerOp = BROKER_OPS.includes(command);
 const PROFILE = (process.env.IRIS_PROFILE || "").trim();
 if (typeof args.facts === "string" && args.facts.trim().startsWith("[")) {
