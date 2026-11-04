@@ -217,6 +217,9 @@ function writeHostWrapper(nodePath) {
     `# Prefer a stable Node symlink so runtime updates do not break Chrome native messaging.\n` +
     `NODE=${shellQuote(nodePath)}\n` +
     `[ -x "$NODE" ] || NODE="$(command -v node)"\n` +
+    `# Chrome passes its login environment to the host; a compile cache on a drive Chrome may not read\n` +
+    `# (external volumes need macOS permission) blocks Node before the host starts. The host does not need it.\n` +
+    `unset NODE_COMPILE_CACHE\n` +
     `exec "$NODE" ${shellQuote(NATIVE_HOST_DST)}\n`;
   writeFileSync(NATIVE_HOST_WRAPPER, script, { mode: 0o755 });
   chmodSync(NATIVE_HOST_WRAPPER, 0o755);
