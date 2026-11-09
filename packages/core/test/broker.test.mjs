@@ -59,7 +59,7 @@ const TEST_CONFIG = {
   },
 };
 
-async function startBroker(t) {
+async function startBroker(t, env = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "iris-broker-"));
   const socketPath = path.join(dir, "broker.sock");
   const configPath = path.join(dir, "config.json");
@@ -72,6 +72,7 @@ async function startBroker(t) {
       IRIS_DECISION: "off",
       IRIS_PING_INTERVAL_MS: "150",
       IRIS_PONG_TIMEOUT_MS: "400",
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -141,7 +142,7 @@ async function startBroker(t) {
     };
   }
 
-  async function makeHost(pid, { pong = true, profileId, allowed = true, handler } = {}) {
+  async function makeHost(pid, { pong = true, profileId, allowed = true, handler, workerId = `worker-${pid}` } = {}) {
     const host = makeClient({ type: "hello", role: "native-host", pid });
     host.pong = pong;
     host.socket.on(
@@ -163,7 +164,7 @@ async function startBroker(t) {
     );
     await host.nextMessage((message) => message.type === "host_ready");
     if (profileId) {
-      host.write({ type: "from_extension", message: { type: "identify", profileId, allowed } });
+      host.write({ type: "from_extension", message: { type: "identify", profileId, allowed, workerId } });
     }
     return host;
   }
@@ -211,6 +212,16 @@ function tabsHandler(tabs, summary = {}) {
 function isToolRequest(tool) {
   return (message) => message?.type === "to_extension" && message.message?.type === "tool_request" && message.message.tool === tool;
 }
+
+test("handoff messages identify the routed profile and account", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(901, { profileId: "b@x.test", handler: tabsHandler([]) });
+  const plugin = broker.makePlugin();
+  await broker.waitForProfiles(plugin, 1);
+  const result = await broker.request(plugin, 1, "tool", { tool: "request_user", args: { profile: "work", message: "Please sign in." } });
+  assert.equal(result.ok, true);
+  assert.equal(toolRequests(host, "request_user")[0].message.args.message, "[work · b@x.test] Please sign in.");
+});
 
 test("orphan host remains connected when newer host closes", async (t) => {
   const broker = await startBroker(t);
@@ -673,4 +684,267 @@ test("hello with a profile pins the session before the first call", async (t) =>
   assert.equal(response.data.profile, "home");
   assert.equal(toolRequests(hostA, "get_tabs").length, 1);
   assert.equal(toolRequests(hostB, "get_tabs").length, 0);
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function handoffResult(status, extra = {}) {
+  return { tabId: 77, content: JSON.stringify({ ok: true, status, ...extra }) };
+}
+
+async function pendingHandoff(t, env = {}, handoffOwner) {
+  const broker = await startBroker(t, env);
+  const done = deferred();
+  const cleanup = deferred();
+  const host = await broker.makeHost(1101, {
+    profileId: "a@x.test",
+    handler: (tool, args) => {
+      if (tool === "request_user") return done.promise;
+      if (tool === "request_cancel") return cleanup.promise;
+      return tabsHandler([])(tool, args);
+    },
+  });
+  const plugin = broker.makePlugin("handoff-owner");
+  await broker.waitForProfiles(plugin, 1);
+  const started = await broker.request(plugin, 1, "tool", {
+    tool: "request_user", args: { wait: false, tabId: 77, message: "Please continue", handoffOwner },
+  });
+  assert.equal(started.ok, true);
+  assert.deepEqual(started.data, { ok: true, status: "pending", requestId: started.data.requestId, tabId: 77, profile: "home" });
+  assert.match(started.data.requestId, /^[0-9a-f-]{36}$/);
+  const forwarded = await host.nextMessage(isToolRequest("request_user"));
+  assert.equal(forwarded.message.args.requestId, started.data.requestId);
+  assert.equal(forwarded.message.args.handoffOwner, undefined);
+  assert.equal(forwarded.message.args.message, "[home · a@x.test] Please continue");
+  const control = (client, id, tool = "request_status", args = {}) => broker.request(client, id, "tool", {
+    tool, args: { requestId: started.data.requestId, ...args },
+  });
+  return { broker, host, plugin, done, cleanup, started, control };
+}
+
+async function terminalStatus(control, plugin, firstId = 20) {
+  for (let id = firstId; id < firstId + 100; id++) {
+    const response = await control(plugin, id);
+    if (!response.ok || response.data.status !== "pending") return response;
+    await wait(5);
+  }
+  throw new Error("Handoff did not become terminal");
+}
+
+test("async handoffs reject cross-session, profile, tab and forged session access", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t);
+  await broker.makeHost(1102, { profileId: "b@x.test", handler: tabsHandler([]) });
+  await broker.waitForProfiles(plugin, 2);
+  const stranger = broker.makePlugin("handoff-stranger");
+  for (const [index, tool] of ["request_status", "request_cancel"].entries()) {
+    assert.equal((await control(stranger, 2 + index, tool)).ok, false);
+    assert.equal((await control(plugin, 4 + index, tool, { profile: "work" })).ok, false);
+    assert.equal((await control(plugin, 6 + index, tool, { tabId: 88 })).ok, false);
+  }
+  const forged = await broker.request(stranger, 8, "tool", {
+    sessionId: "handoff-owner", tool: "request_status", args: { requestId: "unused" },
+  });
+  assert.equal(forged.ok, false);
+  assert.match(forged.error, /Session identity mismatch/);
+  assert.equal((await control(plugin, 9)).data.status, "pending");
+  assert.equal(toolRequests(host, "request_status").length, 0);
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+});
+
+test("async terminal content is retained then expires", async (t) => {
+  const { plugin, done, control } = await pendingHandoff(t, { IRIS_REQUEST_RETENTION_MS: "180" });
+  const terminal = handoffResult("unreadable_page", { reason: "Restricted page" });
+  done.resolve(terminal);
+  const response = await terminalStatus(control, plugin);
+  assert.equal(response.data.status, "unreadable_page");
+  assert.equal(response.data.content, terminal.content);
+  await wait(240);
+  const expired = await control(plugin, 121);
+  assert.equal(expired.ok, false);
+  assert.match(expired.error, /REQUEST_NOT_FOUND/);
+});
+
+test("cancel waits for cleanup and completion racing cancellation wins", async (t) => {
+  const { host, plugin, done, cleanup, control } = await pendingHandoff(t);
+  const cancellation = control(plugin, 2, "request_cancel");
+  await host.nextMessage(isToolRequest("request_cancel"));
+  assert.equal(plugin.messages.some((m) => m.type === "response" && m.id === 2), false);
+  done.resolve(handoffResult("condition_met"));
+  assert.equal((await terminalStatus(control, plugin)).data.status, "condition_met");
+  assert.equal(plugin.messages.some((m) => m.type === "response" && m.id === 2), false);
+  cleanup.resolve(handoffResult("cancelled", { reason: "requested" }));
+  assert.equal((await cancellation).data.status, "condition_met");
+  assert.equal((await control(plugin, 121, "request_cancel")).data.status, "condition_met");
+  assert.equal(toolRequests(host, "request_cancel").length, 1);
+});
+
+test("cancel wins before late completion and repeated cancels share cleanup", async (t) => {
+  const { host, plugin, done, cleanup, control } = await pendingHandoff(t);
+  const first = control(plugin, 2, "request_cancel");
+  const second = control(plugin, 3, "request_cancel");
+  await host.nextMessage(isToolRequest("request_cancel"));
+  cleanup.resolve(handoffResult("cancelled", { reason: "requested" }));
+  assert.equal((await first).data.status, "cancelled");
+  assert.equal((await second).data.status, "cancelled");
+  done.resolve(handoffResult("user_done"));
+  assert.equal((await control(plugin, 4)).data.status, "cancelled");
+  assert.equal(toolRequests(host, "request_cancel").length, 1);
+});
+
+test("pending handoff renews short leases after client disconnect without polling", async (t) => {
+  const { broker, plugin, done, started } = await pendingHandoff(t, { IRIS_CLAIM_TTL_MS: "80" });
+  plugin.destroy();
+  await plugin.closed;
+  await wait(280);
+  const observer = broker.makePlugin("lease-observer");
+  const claims = await broker.request(observer, 1, "list_claims");
+  assert.ok(claims.data.claims.some((claim) => claim.tabId === 77 && claim.sessionId === "handoff-owner"));
+  const reconnected = broker.makePlugin("handoff-owner");
+  const status = await broker.request(reconnected, 2, "tool", {
+    tool: "request_status", args: { requestId: started.data.requestId },
+  });
+  assert.equal(status.data.status, "pending");
+  done.resolve(handoffResult("user_done"));
+});
+
+test("host disconnect cancels pending handoff and reconnect cleans orphan banner", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t);
+  host.destroy();
+  await host.closed;
+  const status = await terminalStatus(control, plugin);
+  assert.equal(status.data.status, "cancelled");
+  assert.match(status.data.reason, /Native host disconnected/);
+  const replacement = await broker.makeHost(1103, { profileId: "a@x.test", handler: () => handoffResult("cancelled") });
+  await replacement.nextMessage(isToolRequest("request_cancel"));
+  assert.equal((await control(plugin, 121)).data.reason, "Native host disconnected");
+});
+
+test("identity refresh keeps handoff pending but changed worker cancels with bounded cleanup", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t, { IRIS_REQUEST_CLEANUP_MS: "40" });
+  host.write({ type: "from_extension", message: { type: "identify", profileId: "a@x.test", workerId: "worker-1101" } });
+  // Host and plugin use separate sockets; a same-host request is an ordering barrier for identify.
+  await broker.request(plugin, 10, "tool", { tool: "get_tabs", args: {} });
+  assert.equal((await control(plugin, 11)).data.status, "pending");
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+  host.write({ type: "from_extension", message: { type: "identify", profileId: "a@x.test" } });
+  await broker.request(plugin, 12, "tool", { tool: "get_tabs", args: {} });
+  assert.equal((await control(plugin, 13)).data.status, "pending");
+  host.write({ type: "from_extension", message: { type: "identify", profileId: "a@x.test", workerId: "worker-restarted" } });
+  await host.nextMessage(isToolRequest("request_cancel"));
+  const status = await control(plugin, 2);
+  assert.equal(status.data.status, "cancelled");
+  assert.match(status.data.reason, /worker reconnected/);
+  await wait(80);
+  assert.equal((await control(plugin, 3)).data.status, "cancelled");
+});
+
+test("unresponsive cancellation cleanup is bounded", async (t) => {
+  const { plugin, control } = await pendingHandoff(t, { IRIS_REQUEST_CLEANUP_MS: "40" });
+  const cancelled = await control(plugin, 2, "request_cancel");
+  assert.equal(cancelled.data.status, "cancelled");
+  assert.match(cancelled.data.reason, /Cancellation cleanup failed: Timed out/);
+});
+
+test("pending handoff refuses duplicate tab requests and never resurrects a released claim", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t, { IRIS_CLAIM_TTL_MS: "80" });
+  const duplicate = await broker.request(plugin, 2, "tool", {
+    tool: "request_user", args: { wait: false, tabId: 77, message: "Duplicate" },
+  });
+  assert.equal(duplicate.ok, false);
+  assert.match(duplicate.error, /REQUEST_PENDING/);
+  assert.equal(toolRequests(host, "request_user").length, 1);
+  await broker.request(plugin, 3, "release_tab", { tabId: 77 });
+  await wait(130);
+  assert.equal((await broker.request(plugin, 4, "list_claims")).data.claims.some((claim) => claim.tabId === 77), false);
+  const terminal = await control(plugin, 5);
+  assert.equal(terminal.data.status, "cancelled");
+  assert.equal(terminal.data.reason, "Tab claim released");
+  await host.nextMessage(isToolRequest("request_cancel"));
+});
+
+test("async start requires selecting the routed tab's profile first", async (t) => {
+  const broker = await startBroker(t);
+  await broker.makeHost(1201, { profileId: "a@x.test", handler: tabsHandler([{ id: 101 }]) });
+  const work = await broker.makeHost(1202, {
+    profileId: "b@x.test",
+    handler: (tool, args) => tool === "request_user" ? new Promise(() => {}) : tabsHandler([{ id: 202 }])(tool, args),
+  });
+  const plugin = broker.makePlugin("cross-profile-start");
+  await broker.waitForProfiles(plugin, 2);
+  await broker.request(plugin, 1, "tool", { tool: "get_tabs", args: {} });
+  await broker.request(plugin, 2, "use_profile", { profile: "home" });
+  const start = (id, profile) => broker.request(plugin, id, "tool", {
+    tool: "request_user", args: { wait: false, tabId: 202, message: "Continue", ...(profile ? { profile } : {}) },
+  });
+  for (const [id, profile] of [[3, undefined], [4, "work"]]) {
+    const rejected = await start(id, profile);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error, /REQUEST_OWNERSHIP: Select the target profile/);
+  }
+  assert.equal(toolRequests(work, "request_user").length, 0);
+  await broker.request(plugin, 5, "use_profile", { profile: "work" });
+  assert.equal((await start(6)).data.status, "pending");
+});
+
+test("switching profile blocks handoff controls until switching back", async (t) => {
+  const { broker, plugin, control } = await pendingHandoff(t);
+  await broker.makeHost(1203, { profileId: "b@x.test", handler: tabsHandler([]) });
+  await broker.waitForProfiles(plugin, 2);
+  await broker.request(plugin, 2, "use_profile", { profile: "work" });
+  assert.equal((await control(plugin, 3)).ok, false);
+  assert.equal((await control(plugin, 4, "request_status", { profile: "home" })).ok, false);
+  assert.equal((await control(plugin, 5, "request_cancel", { profile: "home" })).ok, false);
+  await broker.request(plugin, 6, "use_profile", { profile: "home" });
+  assert.equal((await control(plugin, 7)).data.status, "pending");
+});
+
+test("forced claim transfer cancels former owner's handoff before another session observes", async (t) => {
+  const { broker, host, plugin, done, cleanup, control } = await pendingHandoff(t);
+  const other = broker.makePlugin("new-tab-owner");
+  const transferred = await broker.request(other, 1, "claim_tab", { tabId: 77, force: true });
+  assert.equal(transferred.ok, true);
+  const terminal = await control(plugin, 2);
+  assert.equal(terminal.data.status, "cancelled");
+  assert.equal(terminal.data.reason, "Tab claim transferred");
+  await host.nextMessage(isToolRequest("request_cancel"));
+  cleanup.resolve(handoffResult("cancelled"));
+  done.resolve(handoffResult("condition_met", { observed: "new owner's data" }));
+  const later = await control(plugin, 3);
+  assert.equal(later.data.status, "cancelled");
+  assert.equal(later.data.observed, undefined);
+  assert.equal((await broker.request(other, 2, "list_claims")).data.claims.find((claim) => claim.tabId === 77).sessionId, "new-tab-owner");
+});
+
+test("shared transport handoffs require the exact internal conversation owner", async (t) => {
+  const { host, plugin, cleanup, control } = await pendingHandoff(t, {}, "conversation-a");
+  for (const [index, tool] of ["request_status", "request_cancel"].entries()) {
+    assert.equal((await control(plugin, 2 + index, tool, { handoffOwner: "conversation-b" })).ok, false);
+    assert.equal((await control(plugin, 4 + index, tool)).ok, false);
+  }
+  assert.equal((await control(plugin, 6, "request_status", { handoffOwner: "conversation-a" })).data.status, "pending");
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+  cleanup.resolve(handoffResult("cancelled"));
+  assert.equal((await control(plugin, 7, "request_cancel", { handoffOwner: "conversation-a" })).data.status, "cancelled");
+});
+
+test("claim and release require the same-session pending handoff owner before cancelling", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t, {}, "conversation-a");
+  const attempts = [
+    [2, plugin, "release_tab", { tabId: 77, handoffOwner: "conversation-b" }],
+    [3, plugin, "release_tab", { tabId: 77 }],
+    [4, plugin, "claim_tab", { tabId: 77, force: true, handoffOwner: "conversation-b" }],
+  ];
+  for (const [id, client, op, extra] of attempts) {
+    const response = await broker.request(client, id, op, extra);
+    assert.equal(response.ok, false);
+    assert.match(response.error, /REQUEST_OWNERSHIP/);
+  }
+  assert.equal((await control(plugin, 6, "request_status", { handoffOwner: "conversation-a" })).data.status, "pending");
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+  assert.equal((await broker.request(plugin, 7, "release_tab", { tabId: 77, handoffOwner: "conversation-a" })).data.released, true);
+  assert.equal((await control(plugin, 8, "request_status", { handoffOwner: "conversation-a" })).data.status, "cancelled");
 });

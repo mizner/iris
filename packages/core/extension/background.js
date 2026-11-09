@@ -2,6 +2,7 @@ import { redactHeaders, redactNetworkBody } from "./lib/network-redact.mjs"
 import { diffSnapshots, indexByUid } from "./lib/snapshot-diff.mjs"
 
 const NATIVE_HOST_NAME = "com.iris.host"
+const workerId = crypto.randomUUID()
 const KEEPALIVE_ALARM = "keepalive"
 const PERMISSION_HINT = "Click the Iris extension icon and approve requested permissions."
 const OPTIONAL_RUNTIME_PERMISSIONS = ["nativeMessaging", "downloads", "debugger"]
@@ -102,7 +103,7 @@ async function toolGetProfileStatus() {
 async function sendIdentify() {
   try {
     const status = await toolGetProfileStatus()
-    send({ type: "identify", profileId: status.profileId, allowed: status.allowed, version: runtimeManifest.version })
+    send({ type: "identify", profileId: status.profileId, allowed: status.allowed, version: runtimeManifest.version, workerId })
   } catch (e) {
     console.warn("[Iris] identify failed:", e)
   }
@@ -824,6 +825,8 @@ async function connect() {
 }
 
 async function connectOnce() {
+  await handoffStartupCleanup
+  await cancelAllUserRequests("disconnected")
   clearReconnectTimer()
 
   if (port) {
@@ -858,6 +861,7 @@ async function connectOnce() {
     port.onDisconnect.addListener(() => {
       isConnected = false
       port = null
+      void cancelAllUserRequests("disconnected")
       updateBadge(false)
 
       const err = chrome.runtime.lastError
@@ -1022,6 +1026,7 @@ async function executeTool(toolName, args) {
     profile_summary: toolProfileSummary,
     get_webmcp_status: toolGetWebMCPStatus,
     request_user: toolRequestUser,
+    request_cancel: toolRequestCancel,
     evaluate: toolEvaluate,
     read: toolRead,
     search_history: toolSearchHistory,
@@ -2144,14 +2149,30 @@ async function toolNameGroup({ tabIds = [], groupIds = [], title, color } = {}) 
 }
 
 // Runs in the page (isolated world): shows or removes the handoff banner and checks the completion condition.
-function irisUserPrompt(message, selector, text, mode) {
+function irisUserPrompt(message, selector, text, mode, requestId = "", leaseUntil = 0) {
   const ID = "__iris_user_prompt"
+  if (mode === "probe") return { readable: true }
   let bar = document.getElementById(ID)
+  const cancelled = window.__irisCancelledHandoffs ||= new Set()
+  if (mode === "remove" && requestId) cancelled.add(requestId)
+  if (mode !== "remove" && requestId && (cancelled.has(requestId) || Date.now() > leaseUntil)) return { done: false, matched: false }
   if (mode === "remove") {
-    bar?.remove()
+    if (!requestId || window.__irisHandoffId === requestId) {
+      bar?.remove()
+      window.clearTimeout?.(window.__irisHandoffTimer)
+    }
     return { done: false, matched: false }
   }
   if (mode === "start") window.__irisUserDone = false
+  if (requestId) {
+    window.__irisHandoffId = requestId
+    window.clearTimeout?.(window.__irisHandoffTimer)
+    window.__irisHandoffTimer = window.setTimeout?.(() => {
+      if (window.__irisHandoffId !== requestId) return
+      cancelled.add(requestId)
+      document.getElementById(ID)?.remove()
+    }, Math.max(0, leaseUntil - Date.now()))
+  }
   if (!bar && !window.__irisUserDone) {
     bar = document.createElement("div")
     bar.id = ID
@@ -2174,7 +2195,16 @@ function irisUserPrompt(message, selector, text, mode) {
   let matched = false
   try {
     if (selector) matched = !!document.querySelector(selector)
-    if (!matched && text) matched = (document.body?.innerText || "").includes(text)
+    if (!matched && text) {
+      // Agent instructions and the profile prefix are not page completion evidence.
+      const display = bar?.style.display
+      try {
+        if (bar) bar.style.display = "none"
+        matched = (document.body?.innerText || "").includes(text)
+      } finally {
+        if (bar) bar.style.display = display
+      }
+    }
   } catch {}
   return { done: !!window.__irisUserDone, matched }
 }
@@ -2188,35 +2218,159 @@ function urlMatches(url, pattern) {
   }
 }
 
-async function injectUserPrompt(tabId, message, selector, text, mode) {
+async function injectUserPrompt(tabId, message, selector, text, mode, requestId = "", leaseUntil = 0) {
   try {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "ISOLATED",
       func: irisUserPrompt,
-      args: [message, selector || "", text || "", mode],
+      args: [message, selector || "", text || "", mode, requestId || "", leaseUntil || 0],
     })
     return res?.result || { done: false, matched: false }
-  } catch {
-    // Mid-navigation or a restricted page (chrome://, Web Store): try again on the next poll.
-    return { done: false, matched: false }
+  } catch (error) {
+    const reason = error?.message || String(error)
+    const unreadable = /cannot access|cannot be scripted|missing host permission|must request permission|not allowed|extensions gallery|chrome web store/i.test(reason)
+    // Navigation can temporarily destroy the execution context; only access failures are terminal.
+    return { done: false, matched: false, unreadable, reason }
   }
 }
 
+// Internal transport bookkeeping only; the broker owns public handoff state and ownership.
+const activeUserRequests = new Map()
+const activeUserTabs = new Map()
+const cancelledUserRequests = new Set()
+const HANDOFF_STORAGE_KEY = "iris.activeHandoffs"
+const handoffStorage = chrome.storage?.session || chrome.storage?.local
+let handoffStorageQueue = Promise.resolve()
+
+async function cleanupUserRequest(request) {
+  if (Number.isInteger(request.tabId)) {
+    await injectUserPrompt(request.tabId, "", "", "", "remove", request.requestId)
+    await chrome.notifications?.clear?.(`iris-handoff-${request.requestId}`)?.catch(() => {})
+  }
+}
+
+const handoffStartupCleanup = (async () => {
+  if (!handoffStorage) return
+  const stored = await handoffStorage.get(HANDOFF_STORAGE_KEY)
+  for (const request of stored[HANDOFF_STORAGE_KEY] || []) {
+    cancelledUserRequests.add(request.requestId)
+    await cleanupUserRequest(request)
+  }
+  await handoffStorage.set({ [HANDOFF_STORAGE_KEY]: [] })
+})()
+
+function persistUserRequests() {
+  const write = handoffStorageQueue.then(() => handoffStorage?.set({
+    [HANDOFF_STORAGE_KEY]: [...activeUserRequests.values()]
+      .filter((request) => Number.isInteger(request.tabId))
+      .map(({ requestId, tabId }) => ({ requestId, tabId })),
+  }))
+  handoffStorageQueue = write.catch(() => {})
+  return write
+}
+
+function cancelledUserResult(request) {
+  return { tabId: request.tabId, content: JSON.stringify({ ok: false, status: "cancelled", reason: request.reason || "requested", ...(request.url !== undefined ? { url: request.url } : {}) }, null, 2) }
+}
+
+async function toolRequestCancel({ requestId, tabId } = {}) {
+  if (typeof requestId !== "string" || !requestId) throw new Error("requestId is required")
+  const request = activeUserRequests.get(requestId)
+  if (request) {
+    if (tabId !== undefined && request.tabId !== undefined && request.tabId !== tabId) throw new Error("requestId does not match tabId")
+    cancelledUserRequests.add(requestId)
+    request.cancelled = true
+    request.reason ||= "requested"
+    request.wake?.()
+    await request.finished.catch(() => {})
+    return cancelledUserResult(request)
+  }
+  cancelledUserRequests.add(requestId)
+  await handoffStartupCleanup
+  const missing = { requestId, tabId }
+  if (![...activeUserRequests.values()].some((active) => active.tabId === tabId)) await cleanupUserRequest(missing)
+  return cancelledUserResult(missing)
+}
+
+async function cancelAllUserRequests(reason) {
+  const requests = [...activeUserRequests.values()]
+  for (const request of requests) {
+    cancelledUserRequests.add(request.requestId)
+    request.cancelled = true
+    request.reason = reason
+    request.wake?.()
+  }
+  await Promise.allSettled(requests.map((request) => request.finished))
+}
+
+function toolRequestUser(args = {}) {
+  const requestId = args.requestId || crypto.randomUUID()
+  if (typeof requestId !== "string") return Promise.reject(new Error("requestId must be a string"))
+  if (activeUserRequests.has(requestId)) return Promise.reject(new Error("requestId is already active"))
+  if (cancelledUserRequests.has(requestId)) return Promise.resolve(cancelledUserResult({ requestId, tabId: args.tabId }))
+  const request = { requestId, tabId: args.tabId, cancelled: false }
+  activeUserRequests.set(requestId, request)
+  request.finished = (async () => {
+    try {
+      await handoffStartupCleanup
+      return await runUserRequest(args, request)
+    } finally {
+      try { if (request.cleanup) await cleanupUserRequest(request) } finally {
+        if (activeUserTabs.get(request.tabId) === request) activeUserTabs.delete(request.tabId)
+        activeUserRequests.delete(requestId)
+        await persistUserRequests()
+      }
+    }
+  })()
+  return request.finished
+}
+
 // Hand the tab to the user (sign-in, 2FA, CAPTCHA, a choice only they can make) and wait until they finish.
-async function toolRequestUser({ message, tabId, urlPattern, selector, text, timeoutMs, focus = true } = {}) {
+async function runUserRequest({ message, tabId, urlPattern, selector, text, timeoutMs, focus = true } = {}, request) {
   if (typeof message !== "string" || !message.trim()) throw new Error("message is required")
   const tab = await getTabById(tabId)
+  request.url = tab.url || ""
+  request.tabId = tab.id
+  if (request.cancelled) return cancelledUserResult(request)
+  // Blocking and async callers share one banner per tab; never steal a live handoff.
+  if (activeUserTabs.has(tab.id)) {
+    throw new Error("A user handoff is already active on this tab")
+  }
+  activeUserTabs.set(tab.id, request)
+  await persistUserRequests()
+  if (request.cancelled) return cancelledUserResult(request)
   const timeout = clampNumber(timeoutMs, 5000, 1800000, 300000)
   const startUrl = tab.url || ""
+  const needsPage = !!(selector || text)
+  const pageAccess = async (url) => {
+    let location = "unknown"
+    try {
+      const parsed = new URL(url)
+      location = `${parsed.protocol}${parsed.host ? `//${parsed.host}` : ""}`
+      if (!["http:", "https:", "file:", "ftp:"].includes(parsed.protocol)) {
+        return { unreadable: true, reason: `The extension cannot read ${location} pages.`, location }
+      }
+    } catch {}
+    const check = await injectUserPrompt(tab.id, "", "", "", "probe")
+    return { ...check, location }
+  }
+  if (needsPage && !(urlPattern && urlMatches(startUrl, urlPattern))) {
+    const access = await pageAccess(startUrl)
+    if (access.unreadable) {
+      return { tabId: tab.id, content: JSON.stringify({ ok: false, status: "unreadable_page", url: startUrl, reason: access.reason, location: access.location }, null, 2) }
+    }
+  }
 
+  if (request.cancelled) return cancelledUserResult(request)
+  request.cleanup = true
   if (focus !== false) {
     await chrome.tabs.update(tab.id, { active: true })
     await chrome.windows.update(tab.windowId, { focused: true, drawAttention: true }).catch(() => {})
   }
   if (chrome.notifications?.create) {
-    chrome.notifications
-      .create(`iris-handoff-${tab.id}`, {
+    await chrome.notifications
+      .create(`iris-handoff-${request.requestId}`, {
         type: "basic",
         iconUrl: "icons/icon128.png",
         title: "Iris needs you",
@@ -2225,24 +2379,43 @@ async function toolRequestUser({ message, tabId, urlPattern, selector, text, tim
       })
       .catch(() => {})
   }
+  if (request.cancelled) return cancelledUserResult(request)
 
   let mode = "start"
   const endAt = Date.now() + timeout
   let status = "timeout"
   let finalUrl = startUrl
-  while (Date.now() < endAt) {
+  let unreadablePage
+  while (!request.cancelled && Date.now() < endAt) {
     const current = await chrome.tabs.get(tab.id).catch(() => null)
+    if (request.cancelled) break
     if (!current) {
       status = "tab_closed"
       break
     }
     finalUrl = current.url || finalUrl
+    request.url = finalUrl
     if (urlPattern && urlMatches(finalUrl, urlPattern)) {
       status = "condition_met"
       break
     }
-    const check = await injectUserPrompt(tab.id, message.trim(), selector, text, mode)
+    if (needsPage) {
+      const access = await pageAccess(finalUrl)
+      if (access.unreadable) {
+        status = "unreadable_page"
+        unreadablePage = { reason: access.reason, location: access.location }
+        break
+      }
+    }
+    if (request.cancelled) break
+    const check = await injectUserPrompt(tab.id, message.trim(), selector, text, mode, request.requestId, Date.now() + 15000)
+    if (request.cancelled) break
     mode = "poll"
+    if (needsPage && check.unreadable) {
+      status = "unreadable_page"
+      unreadablePage = { reason: check.reason, location: (await pageAccess(finalUrl)).location }
+      break
+    }
     if (check.matched) {
       status = "condition_met"
       break
@@ -2251,14 +2424,18 @@ async function toolRequestUser({ message, tabId, urlPattern, selector, text, tim
       status = "user_done"
       break
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    await new Promise((resolve) => {
+      request.wake = resolve
+      setTimeout(resolve, 1000)
+      if (request.cancelled) resolve()
+    })
+    request.wake = undefined
   }
 
-  if (status !== "tab_closed") await injectUserPrompt(tab.id, "", "", "", "remove")
-  chrome.notifications?.clear?.(`iris-handoff-${tab.id}`).catch?.(() => {})
+  if (request.cancelled) return cancelledUserResult(request)
   return {
     tabId: tab.id,
-    content: JSON.stringify({ ok: status === "condition_met" || status === "user_done", status, url: finalUrl }, null, 2),
+    content: JSON.stringify({ ok: status === "condition_met" || status === "user_done", status, url: finalUrl, ...unreadablePage }, null, 2),
   }
 }
 

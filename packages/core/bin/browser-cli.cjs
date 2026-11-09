@@ -55,7 +55,7 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     "       history, handle_dialog,\n" +
     "       console, errors, network_start, network_stop, network_list, network_get,\n" +
     "       download, highlight, set_file_input,\n" +
-    "       get_profile_status, get_webmcp_status, request_user, evaluate\n" +
+    "       get_profile_status, get_webmcp_status, request_user, request_status, request_cancel, evaluate\n" +
     "\nOps:   status, list_claims, claim_tab, release_tab, name_group,\n" +
     "       profiles, use_profile --profile <name>, resolve_profile --url <url> --task <text>,\n" +
     "       run --goal <text> [--url <url>] [--facts '[\"name=value\"]']\n" +

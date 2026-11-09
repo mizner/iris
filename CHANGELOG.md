@@ -3,6 +3,8 @@
 
 ## Unreleased
 
+- Nonblocking handoffs: `browser_request_user wait=false` returns a session/profile-owned `requestId` immediately; `browser_request_status` and `browser_request_cancel` let the agent keep talking while the user acts. Pending requests renew tab claims; terminal results expire after 10 minutes. Cancellation and extension disconnect/restart clean up prompts.
+- `browser_request_user` returns `unreadable_page` with a reason and scheme/host for selector/text waits on inaccessible pages (including navigation during a wait), rather than a misleading timeout. URL-only waits remain supported there. Handoff banners and notifications automatically identify the tab's Chrome profile and account.
 - Tab groups get useful names: the first site a session opens plus its harness (`codeable · omo`), or the agent's own name via the new `browser_name_group` (`Codeable Neverland quote · omo`, optional color). New tabs join the session's own group, so two sessions on the same site stay separate.
 - The native host wrapper clears `NODE_COMPILE_CACHE`: a cache on an external drive made Chrome-launched hosts hang at startup (no macOS removable-volume access), so the extension never connected.
 - Sessions reuse their own tab group: the broker remembers each session's group per profile, and a session keeps its name and group through lapsed claims, reconnects, and idle periods (up to 12 hours). `browser-cli` calls share one session (the calling agent's `PI_SESSION_ID`, else the working directory) instead of a new one per call, and `name_group` works from the CLI. `open_tab` reports `groupError` when Chrome refuses to group a tab.

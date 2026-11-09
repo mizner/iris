@@ -5,6 +5,7 @@ const net = require("net");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { randomUUID } = require("crypto");
 
 const BASE_DIR = path.join(os.homedir(), ".iris");
 const SOCKET_PATH = (process.env.IRIS_BROKER_SOCK || "").trim() || path.join(BASE_DIR, "broker.sock");
@@ -40,10 +41,12 @@ const LEASE_TTL_MS = (() => {
   if (Number.isFinite(value) && value >= 0) return value;
   return DEFAULT_LEASE_TTL_MS;
 })();
-const LEASE_SWEEP_MS =
-  LEASE_TTL_MS > 0 ? Math.min(Math.max(10000, Math.floor(LEASE_TTL_MS / 2)), 60000) : 0;
+const LEASE_SWEEP_MS = LEASE_TTL_MS > 0 ? Math.max(1, Math.min(Math.floor(LEASE_TTL_MS / 2), 60000)) : 0;
 const PING_INTERVAL_MS = readMsEnv("IRIS_PING_INTERVAL_MS", DEFAULT_PING_INTERVAL_MS);
 const PONG_TIMEOUT_MS = readMsEnv("IRIS_PONG_TIMEOUT_MS", DEFAULT_PONG_TIMEOUT_MS);
+// Terminal handoffs remain queryable for ten minutes, then are removed (tests may shorten this).
+const REQUEST_RETENTION_MS = readMsEnv("IRIS_REQUEST_RETENTION_MS", 10 * 60 * 1000);
+const REQUEST_CLEANUP_MS = readMsEnv("IRIS_REQUEST_CLEANUP_MS", 5000);
 
 function nowMs() {
   return Date.now();
@@ -107,6 +110,8 @@ const claims = new Map();
 const sessionState = new Map();
 // Which host (Chrome profile) a tab lives in: tabId -> host socket
 const tabOwners = new Map();
+// Public handoff ids are random and owned by exactly one session and profile.
+const userRequests = new Map();
 
 // --- Config and profile naming ---
 
@@ -326,6 +331,7 @@ function broadcastClaims() {
 function releaseClaim(tabId, { silent = false } = {}) {
   const info = claims.get(tabId);
   if (!info) return false;
+  cancelTabUserRequests(tabId, info.sessionId, "Tab claim released");
   claims.delete(tabId);
   clearDefaultTab(info.sessionId, tabId);
   if (!silent) broadcastClaims();
@@ -336,6 +342,7 @@ function releaseClaimsForSession(sessionId) {
   let any = false;
   for (const [tabId, info] of claims.entries()) {
     if (info.sessionId === sessionId) {
+      if (hasPendingUserRequest(sessionId, tabId)) continue;
       claims.delete(tabId);
       any = true;
     }
@@ -354,6 +361,9 @@ function checkClaim(tabId, sessionId) {
 
 function setClaim(tabId, sessionId) {
   const existing = claims.get(tabId);
+  if (existing && existing.sessionId !== sessionId) {
+    cancelTabUserRequests(tabId, existing.sessionId, "Tab claim transferred");
+  }
   claims.set(tabId, {
     sessionId,
     claimedAt: existing ? existing.claimedAt : nowIso(),
@@ -377,6 +387,10 @@ function cleanupStaleClaims() {
   const now = nowMs();
   let expired = false;
   for (const [tabId, info] of claims.entries()) {
+    if (hasPendingUserRequest(info.sessionId, tabId)) {
+      info.lastSeenAt = now;
+      continue;
+    }
     if (now - info.lastSeenAt > LEASE_TTL_MS) {
       releaseClaim(tabId, { silent: true });
       expired = true;
@@ -802,6 +816,135 @@ async function sessionTabFor(sessionId, route, { create = true } = {}) {
   return await ensureSessionTab(sessionId, route.socket);
 }
 
+function hasPendingUserRequest(sessionId, tabId) {
+  return [...userRequests.values()].some((entry) =>
+    entry.status === "pending" && entry.sessionId === sessionId && entry.tabId === tabId);
+}
+
+function requestView(entry) {
+  return { ...entry.result, ok: entry.result?.ok !== false, status: entry.status,
+    requestId: entry.requestId, tabId: entry.tabId, profile: entry.profile };
+}
+
+function finishUserRequest(entry, result) {
+  if (entry.status !== "pending") return;
+  let terminal;
+  try { terminal = JSON.parse(result?.content); } catch {}
+  if (!terminal || typeof terminal !== "object" || Array.isArray(terminal) ||
+      typeof terminal.status !== "string" || terminal.status === "pending") {
+    terminal = { ok: false, status: "cancelled", reason: "Invalid terminal handoff response" };
+    result = { content: JSON.stringify(terminal) };
+  }
+  entry.status = terminal.status;
+  entry.result = { ...terminal, content: result.content };
+  entry.finishedAt = nowMs();
+  clearInterval(entry.renewal);
+  const pending = extPending.get(entry.extId);
+  if (pending) {
+    clearTimeout(pending.timeout);
+    extPending.delete(entry.extId);
+  }
+}
+
+function cancelledUserRequest(entry, reason) {
+  finishUserRequest(entry, { content: JSON.stringify({ ok: false, status: "cancelled", reason }) });
+}
+
+function cleanupUserRequest(entry, host = entry.host) {
+  return callExtension(host, "request_cancel", { requestId: entry.requestId, tabId: entry.tabId },
+    entry.sessionId, REQUEST_CLEANUP_MS);
+}
+
+function cancelHostUserRequests(host, reason, cleanupHost) {
+  for (const entry of userRequests.values()) {
+    if (entry.host !== host || entry.status !== "pending") continue;
+    cancelledUserRequest(entry, reason);
+    if (cleanupHost) cleanupUserRequest(entry, cleanupHost).catch(() => {});
+  }
+}
+
+function pruneUserRequests() {
+  const now = nowMs();
+  for (const [id, entry] of userRequests) {
+    if (entry.status !== "pending" && now - entry.finishedAt >= REQUEST_RETENTION_MS) userRequests.delete(id);
+  }
+}
+
+async function handleUserRequestControl(tool, args, sessionId, requestedProfile) {
+  pruneUserRequests();
+  const entry = userRequests.get(args.requestId);
+  if (!sessionId || !entry || entry.sessionId !== sessionId || entry.handoffOwner !== args.handoffOwner) {
+    throw new Error("REQUEST_NOT_FOUND: No handoff owned by this session with that requestId");
+  }
+  // A profile switch intentionally blocks control of old-profile handoffs until the session switches back.
+  const selectedProfile = sessionState.get(sessionId)?.profileKey;
+  const profileKey = requestedProfile ? matchProfileKey(requestedProfile) : sessionState.get(sessionId)?.profileKey;
+  if ((selectedProfile && selectedProfile !== entry.profileKey) ||
+      (requestedProfile && !profileKey) || (profileKey && profileKey !== entry.profileKey) ||
+      (args.tabId !== undefined && args.tabId !== entry.tabId)) {
+    throw new Error("REQUEST_OWNERSHIP: Handoff belongs to a different profile or tab");
+  }
+  if (tool === "request_cancel" && (entry.status === "pending" || entry.cancelling)) {
+    // Share cleanup between concurrent cancels; a completion racing cleanup wins if it arrives first.
+    if (!entry.cancelling) {
+      entry.cancelling = cleanupUserRequest(entry).then(
+        (result) => finishUserRequest(entry, result),
+        (error) => cancelledUserRequest(entry, `Cancellation cleanup failed: ${error.message}`));
+    }
+    await entry.cancelling;
+  }
+  return requestView(entry);
+}
+
+function checkPendingHandoffOwner(tabId, sessionId, handoffOwner) {
+  for (const entry of userRequests.values()) {
+    if (entry.status === "pending" && entry.tabId === tabId && entry.sessionId === sessionId &&
+        entry.handoffOwner !== handoffOwner) {
+      throw new Error("REQUEST_OWNERSHIP: Pending handoff belongs to another conversation");
+    }
+  }
+}
+
+function cancelTabUserRequests(tabId, sessionId, reason) {
+  for (const entry of userRequests.values()) {
+    if (entry.tabId !== tabId || entry.sessionId !== sessionId || entry.status !== "pending") continue;
+    cancelledUserRequest(entry, reason);
+    entry.cancelling = cleanupUserRequest(entry).catch(() => {});
+  }
+}
+
+function startUserRequest(route, args, tabId, sessionId) {
+  if (!sessionId) throw new Error("Missing sessionId for async handoff");
+  const selectedProfile = sessionState.get(sessionId)?.profileKey;
+  if (selectedProfile && selectedProfile !== route.key) {
+    throw new Error("REQUEST_OWNERSHIP: Select the target profile with browser_use_profile before starting its handoff");
+  }
+  const requestId = randomUUID();
+  const entry = { requestId, sessionId, handoffOwner: args.handoffOwner, profileKey: route.key, profile: labelFor(route.key),
+    host: route.socket, tabId, status: "pending" };
+  userRequests.set(requestId, entry);
+  maybePin(sessionId, route);
+  tabOwners.set(tabId, route.socket);
+  touchClaim(tabId, sessionId);
+  setDefaultTab(sessionId, tabId);
+  // Renewal is independent of polling and client sockets, including one-shot CLI clients.
+  entry.renewal = setInterval(() => {
+    touchSession(sessionId);
+    const claim = claims.get(tabId);
+    if (claim?.sessionId === sessionId) claim.lastSeenAt = nowMs();
+  }, LEASE_TTL_MS > 0 ? Math.max(1, Math.min(30000, Math.floor(LEASE_TTL_MS / 3))) : 30000);
+  entry.renewal.unref();
+  entry.extId = nextExtId + 1;
+  const { handoffOwner, ...extensionArgs } = args;
+  callExtension(route.socket, "request_user", { ...extensionArgs, tabId, requestId }, sessionId, MAX_TOOL_TIMEOUT_MS).then(
+    (result) => finishUserRequest(entry, result),
+    (error) => {
+      cancelledUserRequest(entry, error.message);
+      if (!route.socket.destroyed) cleanupUserRequest(entry).catch(() => {});
+    });
+  return requestView(entry);
+}
+
 async function handleTool(req) {
   const { tool, sessionId } = req;
   if (!tool) throw new Error("Missing tool");
@@ -810,6 +953,9 @@ async function handleTool(req) {
 
   if (sessionId) touchSession(sessionId);
   const state = sessionId ? getSessionState(sessionId) : null;
+  if (tool === "request_status" || tool === "request_cancel") {
+    return await handleUserRequestControl(tool, args, sessionId, requestedProfile);
+  }
   // Until the agent names its task, the group is named after the first site it opens.
   if (state && !state.label && !state.site && (tool === "open_tab" || tool === "navigate") && args.url) {
     state.site = siteName(args.url);
@@ -823,6 +969,11 @@ async function handleTool(req) {
   if (unscoped && tool in PROFILE_LISTS && !args.restore) return await allProfilesList(tool, args, sessionId);
 
   const route = await resolveRoute(sessionId, { profile: requestedProfile, tabId: args.tabId });
+  if (tool === "request_user" && typeof args.message === "string" && args.message.trim()) {
+    const profile = labelFor(route.key);
+    const identity = route.key && route.key !== profile ? `${profile} · ${route.key}` : profile;
+    args.message = `[${identity}] ${args.message.trim()}`;
+  }
   const isCloseTool = tool === "close_tab";
 
   let tabId = args.tabId;
@@ -832,6 +983,11 @@ async function handleTool(req) {
     const claimCheck = checkClaim(tabId, sessionId);
     if (!claimCheck.ok) throw new Error(claimCheck.error);
   }
+  if (tool === "request_user" && [...userRequests.values()].some((entry) =>
+      entry.status === "pending" && entry.host === route.socket && entry.tabId === tabId)) {
+    throw new Error("REQUEST_PENDING: This tab already has a pending handoff");
+  }
+  if (tool === "request_user" && args.wait === false) return startUserRequest(route, args, tabId, sessionId);
 
   if (tool === "open_tab" && args.group === undefined) Object.assign(args, groupArgs(sessionId, route.socket));
 
@@ -1194,6 +1350,25 @@ function handleClientMessage(socket, client, msg) {
     if (message && message.type === "pong") return;
     if (message && message.type === "identify") {
       if (info) {
+        // Routine identity refreshes do not end handoffs; only a new worker generation does.
+        const workerId = typeof message.workerId === "string" && message.workerId ? message.workerId : null;
+        if (info.workerId && workerId && info.workerId !== workerId) {
+          cancelHostUserRequests(socket, "Extension worker reconnected", socket);
+        }
+        if (workerId) info.workerId = workerId;
+        const nextKey = normalizeKey(message.profileId) || null;
+        for (const [other, otherInfo] of hosts) {
+          if (other !== socket && nextKey && otherInfo.profileKey === nextKey) {
+            cancelHostUserRequests(other, "Extension worker reconnected", socket);
+          }
+        }
+        // Clean orphan UI after a host disconnect once its profile becomes reachable again.
+        for (const entry of userRequests.values()) {
+          if (entry.orphaned && entry.profileKey === nextKey) {
+            entry.orphaned = false;
+            cleanupUserRequest(entry, socket).catch(() => {});
+          }
+        }
         info.profileKey = normalizeKey(message.profileId) || null;
         info.profileId = message.profileId || null;
         info.allowed = message.allowed !== false;
@@ -1225,7 +1400,7 @@ function handleClientMessage(socket, client, msg) {
     }
     if (message && message.type === "tool_response" && typeof message.id === "number") {
       const pending = extPending.get(message.id);
-      if (!pending) return;
+      if (!pending || pending.host !== socket) return;
       extPending.delete(message.id);
       if (pending.timeout) clearTimeout(pending.timeout);
 
@@ -1242,6 +1417,11 @@ function handleClientMessage(socket, client, msg) {
   if (msg && msg.type === "request" && typeof msg.id === "number") {
     const requestId = msg.id;
     const sessionId = msg.sessionId || client.sessionId;
+    if (msg.op === "tool" && ["request_user", "request_status", "request_cancel"].includes(msg.tool) &&
+        client.sessionId && msg.sessionId && msg.sessionId !== client.sessionId) {
+      writeJsonLine(socket, { type: "response", id: requestId, ok: false, error: "REQUEST_OWNERSHIP: Session identity mismatch" });
+      return;
+    }
     if (sessionId) touchSession(sessionId);
 
     const replyOk = (data) => writeJsonLine(socket, { type: "response", id: requestId, ok: true, data });
@@ -1312,6 +1492,7 @@ function handleClientMessage(socket, client, msg) {
           const tabId = msg.tabId;
           const force = !!msg.force;
           if (typeof tabId !== "number") throw new Error("tabId is required");
+          checkPendingHandoffOwner(tabId, sessionId, msg.handoffOwner);
           const existing = claims.get(tabId);
           if (existing && existing.sessionId !== sessionId && !force) {
             throw new Error(`Tab ${tabId} is owned by another Iris session (${existing.sessionId})`);
@@ -1335,6 +1516,7 @@ function handleClientMessage(socket, client, msg) {
         if (msg.op === "release_tab") {
           const tabId = msg.tabId;
           if (typeof tabId !== "number") throw new Error("tabId is required");
+          checkPendingHandoffOwner(tabId, sessionId, msg.handoffOwner);
           const existing = claims.get(tabId);
           if (!existing) {
             replyOk({ ok: true, tabId, released: false });
@@ -1413,6 +1595,10 @@ async function start() {
     socket.on("close", () => {
       clients.delete(client);
       if (client.role === "native-host") {
+        for (const entry of userRequests.values()) {
+          if (entry.host === socket && entry.status === "pending") entry.orphaned = true;
+        }
+        cancelHostUserRequests(socket, "Native host disconnected");
         hosts.delete(socket);
         for (const [tabId, owner] of tabOwners.entries()) {
           if (owner === socket) tabOwners.delete(tabId);
@@ -1455,6 +1641,10 @@ if (LEASE_TTL_MS > 0 && LEASE_SWEEP_MS > 0) {
   const timer = setInterval(cleanupStaleClaims, LEASE_SWEEP_MS);
   if (typeof timer.unref === "function") timer.unref();
 }
+
+// One bounded sweep, rather than a timer per retained terminal result.
+const requestSweep = setInterval(pruneUserRequests, Math.max(1, Math.min(60000, REQUEST_RETENTION_MS || 1)));
+requestSweep.unref();
 
 if (PING_INTERVAL_MS > 0) {
   const timer = setInterval(() => {

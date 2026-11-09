@@ -150,7 +150,8 @@ browser_query selector="button.submit" mode=list limit=10
 
 - If a selector fails twice, run a discovery query before trying again.
 - If a click appears to do nothing, check for modals, overlays, disabled buttons, and navigation state.
-- If a page is behind login, 2FA, or a captcha, hand it to the user and wait: `browser_request_user message="Please sign in." urlPattern="/dashboard"`. Continue on `condition_met` or `user_done`; stop and tell the user on `timeout` or `tab_closed`.
+- If a page is behind login, 2FA, or a captcha, hand it to the user and wait: `browser_request_user message="Please sign in." urlPattern="/dashboard"`. The banner and notification identify the Chrome profile/account automatically. Continue on `condition_met` or `user_done`; stop and tell the user on `timeout` or `tab_closed`. `unreadable_page` with `reason` and `location` means a selector/text condition cannot be observed (including after navigation); choose a readable page or a URL-only condition.
+- Use `browser_request_user wait=false` to keep talking during a handoff; it returns `pending`, `requestId`, `tabId`, and `profile` immediately. Use `browser_request_status requestId="…"` to read progress or `browser_request_cancel requestId="…"` to remove the prompt (idempotent). IDs belong to the creating session/profile; terminal results expire after 10 minutes. Pending requests renew the tab claim; extension disconnect/restart cancels them and cleans prompts.
 - `TAB_NOT_FOUND` means the tab was closed; call `browser_get_tabs` or omit `tabId`.
 - If the same action fails three times, switch strategy or ask for user help.
 

@@ -13336,6 +13336,12 @@ function toolResultText(data, fallback) {
 
 [Iris] This session's pages opened new tabs (already claimed; pass tabId to use them): ${JSON.stringify(opened)}`;
 }
+function handoffResultText(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data))
+    throw new Error("Invalid handoff response");
+  const result = Object.fromEntries(Object.entries(data).filter(([key]) => key !== "content"));
+  return JSON.stringify(result);
+}
 var ROUTER_LOG_PATH = join3(RUNTIME_DIR, "router.log");
 var cachedAppleScriptApp = null;
 function logRouter(message) {
@@ -13473,6 +13479,10 @@ function callTimeoutMs(args) {
   return Math.min(requested, 1800000) + 15000;
 }
 async function routerRequest(toolName, args) {
+  if (["request_user", "request_status", "request_cancel"].includes(toolName)) {
+    const timeoutMs = callTimeoutMs(args);
+    return await brokerRequest("tool", { tool: toolName, args, timeoutMs }, timeoutMs);
+  }
   const errors = [];
   if (!USE_AGENT_BACKEND || !USE_ROUTER_FALLBACKS) {
     try {
@@ -13701,7 +13711,7 @@ var plugin = async (ctx) => {
           force: schema.boolean().optional()
         },
         async execute({ tabId, force }, ctx) {
-          const data = await brokerOnlyRequest("claim_tab", { tabId, force });
+          const data = await brokerOnlyRequest("claim_tab", { tabId, force, handoffOwner: ctx?.sessionID });
           return JSON.stringify(data);
         }
       }),
@@ -13711,7 +13721,7 @@ var plugin = async (ctx) => {
           tabId: schema.number()
         },
         async execute({ tabId }, ctx) {
-          const data = await brokerOnlyRequest("release_tab", { tabId });
+          const data = await brokerOnlyRequest("release_tab", { tabId, handoffOwner: ctx?.sessionID });
           return JSON.stringify(data);
         }
       }),
@@ -14311,27 +14321,44 @@ var plugin = async (ctx) => {
         }
       }),
       browser_request_user: tool({
-        description: "Hand the tab to the user for something only they can do (sign-in, 2FA, CAPTCHA, a choice) and wait. Brings the tab to the front, shows a banner with a Done button and a notification, then returns when urlPattern matches, selector (CSS) or text appears, the user clicks Done, or timeoutMs (default 300000, max 1800000) passes. status: condition_met | user_done | timeout | tab_closed.",
+        description: "Hand the tab to the user for sign-in, 2FA, CAPTCHA, or a choice. Shows a profile-prefixed banner with Done and a notification. Default wait=true blocks until a URL/selector/text condition, Done, or timeout (default 300000ms, max 1800000ms). Set wait=false to return immediately with status=pending and requestId; use browser_request_status or browser_request_cancel while continuing the conversation. Terminal status: condition_met | user_done | timeout | tab_closed | unreadable_page | cancelled. Selector/text waits report unreadable_page with reason/location if page access fails; URL-only waits work without page access. Async requests are session/profile-owned; terminal results are retained for 10 minutes, and pending requests renew the tab claim.",
         args: {
           message: schema.string(),
           urlPattern: schema.string().optional(),
           selector: schema.string().optional(),
           text: schema.string().optional(),
           timeoutMs: schema.number().optional(),
+          wait: schema.boolean().optional(),
           focus: schema.boolean().optional(),
           tabId: schema.number().optional()
         },
-        async execute({ message, urlPattern, selector, text, timeoutMs, focus, tabId }, ctx) {
+        async execute({ message, urlPattern, selector, text, timeoutMs, wait, focus, tabId }, ctx) {
           const data = await toolRequest("request_user", {
             message,
             urlPattern,
             selector,
             text,
             timeoutMs: timeoutMs ?? 300000,
+            wait,
+            handoffOwner: ctx?.sessionID,
             focus,
             tabId
           });
-          return toolResultText(data, "{}");
+          return wait === false ? handoffResultText(data) : toolResultText(data, "{}");
+        }
+      }),
+      browser_request_status: tool({
+        description: "Read a nonblocking browser_request_user request without waiting. Returns pending or its terminal result (condition_met, user_done, timeout, tab_closed, unreadable_page, cancelled), with requestId, tabId and profile. Only the creating session and profile may access it. Terminal results expire after 10 minutes.",
+        args: { requestId: schema.string() },
+        async execute({ requestId }, ctx) {
+          return handoffResultText(await toolRequest("request_status", { requestId, handoffOwner: ctx?.sessionID }));
+        }
+      }),
+      browser_request_cancel: tool({
+        description: "Cancel a nonblocking browser_request_user request and remove its banner/notification. Idempotent: an already completed or cancelled request keeps its terminal result. Only the creating session and profile may cancel it. Terminal results expire after 10 minutes.",
+        args: { requestId: schema.string() },
+        async execute({ requestId }, ctx) {
+          return handoffResultText(await toolRequest("request_cancel", { requestId, handoffOwner: ctx?.sessionID }));
         }
       }),
       browser_evaluate: tool({

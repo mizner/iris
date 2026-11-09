@@ -54,7 +54,13 @@ When a step needs the user (sign-in, 2FA, CAPTCHA, a payment confirmation, a cho
 browser_request_user message="Please sign in to HubSpot." urlPattern="/contacts" timeoutMs=600000
 ```
 
-It brings the tab to the front, shows a banner with a Done button and a notification, and returns when `urlPattern` matches, `selector` (CSS) or `text` appears, the user clicks Done, or the timeout passes. Check `status`: `condition_met` or `user_done` means continue; `timeout` or `tab_closed` means tell the user and stop.
+It brings the tab to the front, shows a banner with a Done button and a notification (both prefixed with the tab's Chrome profile and account), and returns when `urlPattern` matches, `selector` (CSS) or `text` appears, the user clicks Done, or the timeout passes. Check `status`: `condition_met` or `user_done` means continue; `timeout` or `tab_closed` means tell the user and stop. Selector/text waits return `unreadable_page` immediately with `reason` and `location` (URL scheme/host) when the extension cannot read the page, including after navigation. Use a readable page or a URL-only condition instead; `urlPattern`-only waits do not require page access.
+
+To keep talking while the human acts, set `wait=false`. It returns `{ok:true,status:"pending",requestId,tabId,profile}` immediately. Poll `browser_request_status requestId="…"` when needed, or call `browser_request_cancel requestId="…"` to remove the banner/notification. Cancellation is idempotent; a request that already finished keeps its result. Status includes the blocking result fields plus request identity. Requests belong to the creating session and Chrome profile; another session/profile cannot inspect or cancel them. Pending requests renew the tab claim automatically. Terminal results are retained for **10 minutes** after completion, then the ID expires. Extension disconnect/restart cancels pending requests with a reason and cleans up prompts.
+
+Select the target Chrome profile before starting a nonblocking handoff. If you switch profiles while it is pending, switch back to inspect or cancel that request; passing a tab from another profile does not bypass this rule.
+
+Releasing or transferring the tab claim cancels its pending handoff. OpenCode conversations sharing an adapter connection remain isolated by their conversation session ID.
 
 ## Fast path: browser_run
 
@@ -164,6 +170,8 @@ Use `browser_upload selector=<button or file input> files=["/abs/path/file.pdf"]
 - `browser_profile_status` - Return allowlist gating status per profile.
 - `browser_webmcp_status` - Detect WebMCP/native model context signals on the current page.
 - `browser_request_user` - Hand the tab to the user (sign-in, 2FA, CAPTCHA) and wait until they finish.
+- `browser_request_status` - Read a nonblocking handoff's pending or terminal result by `requestId`.
+- `browser_request_cancel` - Cancel a nonblocking handoff by `requestId` and remove its prompt; idempotent.
 - `browser_name_group` - Name this session's tab group after its task (harness is appended); optional `color`.
 - `browser_read` - Read the page (or one section) as markdown; `outline=true` for headings; paged with `offset`.
 - `browser_search_history` - Search this profile's browsing history.
