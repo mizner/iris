@@ -16,9 +16,14 @@
  *   node browser-cli.cjs get_tabs
  *   node browser-cli.cjs status
  *
+ *   node browser-cli.cjs profiles
+ *   node browser-cli.cjs get_tabs --profile work
+ *   IRIS_PROFILE=work node browser-cli.cjs snapshot
+ *
  * Environment:
- *   BROWSER_SESSION  — Override session ID (default: auto-generated)
- *   BROWSER_TIMEOUT  — Request timeout in ms (default: 15000)
+ *   BROWSER_SESSION  — Override session ID (default: the calling agent's PI_SESSION_ID, else the working directory)
+ *   BROWSER_TIMEOUT  — Request timeout in ms (default: 15000; run uses at least 120000)
+ *   IRIS_PROFILE     — Chrome profile (alias or email) for this invocation
  *
  * Exit codes:
  *   0 = success (JSON on stdout)
@@ -33,7 +38,11 @@ const path = require("path");
 const BASE_DIR = path.join(os.homedir(), ".iris");
 const SOCKET_PATH = path.join(BASE_DIR, "broker.sock");
 const TIMEOUT_MS = parseInt(process.env.BROWSER_TIMEOUT, 10) || 15000;
-const SESSION_ID = process.env.BROWSER_SESSION || "cli-" + process.pid;
+// Each CLI call is a new process, so the session comes from the calling agent (OMO/OMP export PI_SESSION_ID),
+// else the working directory: repeated calls share one session, its tab group, and its name.
+const SESSION_ID =
+  process.env.BROWSER_SESSION ||
+  (process.env.PI_SESSION_ID ? "cli-" + process.env.PI_SESSION_ID : "cli-" + process.cwd().replace(/[^a-z0-9]+/gi, "-").slice(-48));
 
 // --- Arg parsing ---
 
@@ -46,8 +55,11 @@ if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     "       history, handle_dialog,\n" +
     "       console, errors, network_start, network_stop, network_list, network_get,\n" +
     "       download, highlight, set_file_input,\n" +
-    "       get_profile_status, get_webmcp_status\n" +
-    "\nOps:   status, list_claims, claim_tab, release_tab\n"
+    "       get_profile_status, get_webmcp_status, request_user, request_status, request_cancel, evaluate\n" +
+    "\nOps:   status, list_claims, claim_tab, release_tab, name_group,\n" +
+    "       profiles, use_profile --profile <name>, resolve_profile --url <url> --task <text>,\n" +
+    "       run --goal <text> [--url <url>] [--facts '[\"name=value\"]']\n" +
+    "\nAny tool accepts --profile <alias|email>; IRIS_PROFILE sets it for every call.\n"
   );
   process.exit(2);
 }
@@ -94,8 +106,14 @@ if (argv.length > 1) {
 
 // --- Broker ops vs tool ops ---
 
-const BROKER_OPS = ["status", "list_claims", "claim_tab", "release_tab"];
+const BROKER_OPS = ["status", "list_claims", "claim_tab", "release_tab", "profiles", "use_profile", "resolve_profile", "run", "name_group"];
 const isBrokerOp = BROKER_OPS.includes(command);
+const PROFILE = (process.env.IRIS_PROFILE || "").trim();
+if (typeof args.facts === "string" && args.facts.trim().startsWith("[")) {
+  try {
+    args.facts = JSON.parse(args.facts);
+  } catch {}
+}
 
 // --- Socket communication ---
 
@@ -105,22 +123,34 @@ let replied = false;
 function die(msg, code) {
   if (replied) return;
   replied = true;
-  process.stderr.write(JSON.stringify({ error: msg }) + "\n");
-  process.exit(code || 1);
+  // Exit only after the write drains: process.exit() right after a large write truncates piped output.
+  process.stderr.write(JSON.stringify({ error: msg }) + "\n", () => process.exit(code || 1));
 }
 
 function succeed(data) {
   if (replied) return;
   replied = true;
-  process.stdout.write(JSON.stringify(data, null, 2) + "\n");
-  process.exit(0);
+  process.stdout.write(JSON.stringify(data, null, 2) + "\n", () => process.exit(0));
 }
 
-const timer = setTimeout(() => die("Timeout after " + TIMEOUT_MS + "ms", 1), TIMEOUT_MS);
+// Long waits (wait_for, request_user) get their own timeoutMs plus a margin, and the broker is told to wait as long.
+const REQUESTED_WAIT_MS = Number.isFinite(args.timeoutMs) ? args.timeoutMs + 15000 : 0;
+const EFFECTIVE_TIMEOUT_MS = Math.max(command === "run" ? Math.max(TIMEOUT_MS, 120000) : TIMEOUT_MS, REQUESTED_WAIT_MS);
+const timer = setTimeout(() => die("Timeout after " + EFFECTIVE_TIMEOUT_MS + "ms", 1), EFFECTIVE_TIMEOUT_MS);
 
 const sock = net.createConnection(SOCKET_PATH, () => {
   // Handshake
-  sock.write(JSON.stringify({ type: "hello", role: "plugin", sessionId: SESSION_ID, pid: process.pid }) + "\n");
+  sock.write(
+    JSON.stringify({
+      type: "hello",
+      role: "plugin",
+      sessionId: SESSION_ID,
+      pid: process.pid,
+      profile: PROFILE || undefined,
+      harness: process.env.IRIS_HARNESS || "cli",
+      project: process.env.IRIS_PROJECT || path.basename(process.cwd()),
+    }) + "\n"
+  );
 
   // Send request immediately (broker doesn't ack hello for plugins)
   if (isBrokerOp) {
@@ -129,7 +159,8 @@ const sock = net.createConnection(SOCKET_PATH, () => {
     Object.assign(payload, args);
     sock.write(JSON.stringify(payload) + "\n");
   } else {
-    sock.write(JSON.stringify({ type: "request", id: 1, op: "tool", tool: command, args }) + "\n");
+    const timeoutMs = REQUESTED_WAIT_MS || undefined;
+    sock.write(JSON.stringify({ type: "request", id: 1, op: "tool", tool: command, args, timeoutMs }) + "\n");
   }
 });
 

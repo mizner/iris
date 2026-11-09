@@ -5,15 +5,29 @@ const net = require("net");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { randomUUID } = require("crypto");
 
 const BASE_DIR = path.join(os.homedir(), ".iris");
 const SOCKET_PATH = (process.env.IRIS_BROKER_SOCK || "").trim() || path.join(BASE_DIR, "broker.sock");
+const CONFIG_PATH = (process.env.IRIS_CONFIG_PATH || "").trim() || path.join(BASE_DIR, "config.json");
 
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
+// Optional decision-model support lives next to the broker; older installs may not have it.
+let decision = null;
+try {
+  decision = require("./decision.cjs");
+} catch {
+  decision = null;
+}
+
 const DEFAULT_LEASE_TTL_MS = 5 * 60 * 1000;
+// How long an idle, disconnected session keeps its tab group name and group ids.
+const SESSION_STATE_TTL_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_PING_INTERVAL_MS = 20000;
 const DEFAULT_PONG_TIMEOUT_MS = 45000;
+const EXTENSION_TIMEOUT_MS = 60000;
+const INVENTORY_TIMEOUT_MS = 5000;
 
 function readMsEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -27,10 +41,12 @@ const LEASE_TTL_MS = (() => {
   if (Number.isFinite(value) && value >= 0) return value;
   return DEFAULT_LEASE_TTL_MS;
 })();
-const LEASE_SWEEP_MS =
-  LEASE_TTL_MS > 0 ? Math.min(Math.max(10000, Math.floor(LEASE_TTL_MS / 2)), 60000) : 0;
+const LEASE_SWEEP_MS = LEASE_TTL_MS > 0 ? Math.max(1, Math.min(Math.floor(LEASE_TTL_MS / 2), 60000)) : 0;
 const PING_INTERVAL_MS = readMsEnv("IRIS_PING_INTERVAL_MS", DEFAULT_PING_INTERVAL_MS);
 const PONG_TIMEOUT_MS = readMsEnv("IRIS_PONG_TIMEOUT_MS", DEFAULT_PONG_TIMEOUT_MS);
+// Terminal handoffs remain queryable for ten minutes, then are removed (tests may shorten this).
+const REQUEST_RETENTION_MS = readMsEnv("IRIS_REQUEST_RETENTION_MS", 10 * 60 * 1000);
+const REQUEST_CLEANUP_MS = readMsEnv("IRIS_REQUEST_CLEANUP_MS", 5000);
 
 function nowMs() {
   return Date.now();
@@ -64,11 +80,25 @@ function writeJsonLine(socket, msg) {
 }
 
 function wantsTab(toolName) {
-  return !["get_tabs", "get_active_tab", "open_tab", "list_downloads"].includes(toolName);
+  return ![
+    "get_tabs",
+    "get_active_tab",
+    "open_tab",
+    "list_downloads",
+    "get_profile_status",
+    "profile_summary",
+    "search_history",
+    "bookmarks",
+    "recently_closed",
+  ].includes(toolName);
 }
 
+// Profile-wide lookups that can search every connected profile when the session has not chosen one yet.
+const PROFILE_LISTS = { search_history: null, bookmarks: null, recently_closed: "recentlyClosed" };
+
 // --- State ---
-const hosts = new Map(); // socket -> { pid, connectedAt, helloAt, lastPongAt }
+// socket -> { pid, connectedAt, helloAt, lastPongAt, profileKey, profileId, allowed, version }
+const hosts = new Map();
 let nextExtId = 0;
 const extPending = new Map(); // extId -> { resolve, reject, sessionId, host, timeout }
 
@@ -76,21 +106,178 @@ const clients = new Set();
 
 // Tab ownership: tabId -> { sessionId, claimedAt, lastSeenAt }
 const claims = new Map();
-// Session state: sessionId -> { defaultTabId, lastSeenAt }
+// Session state: sessionId -> { defaultTabId, lastSeenAt, profileKey }
 const sessionState = new Map();
+// Which host (Chrome profile) a tab lives in: tabId -> host socket
+const tabOwners = new Map();
+// Public handoff ids are random and owned by exactly one session and profile.
+const userRequests = new Map();
+
+// --- Config and profile naming ---
+
+let configCache = { mtimeMs: null, value: {} };
+
+function readConfig() {
+  try {
+    const stat = fs.statSync(CONFIG_PATH);
+    if (stat.mtimeMs !== configCache.mtimeMs) {
+      const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      configCache = { mtimeMs: stat.mtimeMs, value: parsed && typeof parsed === "object" ? parsed : {} };
+    }
+  } catch {
+    configCache = { mtimeMs: null, value: {} };
+  }
+  return configCache.value;
+}
+
+function normalizeKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeHost(value) {
+  const raw = normalizeKey(value);
+  if (!raw) return "";
+  try {
+    return new URL(raw.includes("://") ? raw : `https://${raw}`).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function hostMatches(host, pattern) {
+  return !!host && !!pattern && (host === pattern || host.endsWith(`.${pattern}`));
+}
+
+function sameSite(a, b) {
+  return hostMatches(a, b) || hostMatches(b, a);
+}
+
+function configuredProfiles() {
+  const raw = readConfig().profiles;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const out = [];
+  for (const [alias, entry] of Object.entries(raw)) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = normalizeKey(entry.email || entry.profileId);
+    if (!key) continue;
+    out.push({
+      alias: normalizeKey(alias),
+      key,
+      purpose: typeof entry.purpose === "string" ? entry.purpose.trim() : "",
+      sites: Array.isArray(entry.domains) ? entry.domains.map(normalizeHost).filter(Boolean) : [],
+      isDefault: entry.default === true,
+    });
+  }
+  return out;
+}
+
+function configFor(key) {
+  return configuredProfiles().find((p) => p.key === key) || null;
+}
+
+function labelFor(key) {
+  if (!key) return "unidentified";
+  return configFor(key)?.alias || key;
+}
+
+function matchProfileKey(want) {
+  const w = normalizeKey(want);
+  if (!w) return null;
+  for (const p of configuredProfiles()) {
+    if (p.alias === w || p.key === w) return p.key;
+  }
+  for (const info of hosts.values()) {
+    if (info.profileKey === w) return w;
+  }
+  return null;
+}
+
+function profileError(code, message) {
+  return new Error(`${code}: ${message}`);
+}
+
+function decisionSettings() {
+  if (!decision) return { available: false, reason: "decision module not installed" };
+  return decision.resolveSettings(readConfig());
+}
+
+function decisionStatus() {
+  const settings = decisionSettings();
+  return decision ? decision.publicStatus(settings) : { available: false, reason: settings.reason };
+}
+
+// --- Hosts ---
+
+function healthyHosts() {
+  const now = nowMs();
+  return [...hosts.entries()].filter(([socket, info]) => !socket.destroyed && now - info.lastPongAt <= PONG_TIMEOUT_MS);
+}
+
+function routingCandidates() {
+  return healthyHosts().filter(([, info]) => info.allowed !== false);
+}
+
+function connectedLabels() {
+  return routingCandidates().map(([, info]) => (info.profileKey ? labelFor(info.profileKey) : `unidentified (pid ${info.pid})`));
+}
+
+function knownProfileNames() {
+  const names = new Set(configuredProfiles().map((p) => p.alias));
+  for (const label of connectedLabels()) names.add(label);
+  return [...names];
+}
+
+function hostForProfile(key) {
+  const matches = healthyHosts()
+    .filter(([, info]) => info.profileKey === key)
+    .sort((a, b) => b[1].helloAt - a[1].helloAt);
+  return matches[0]?.[0] ?? null;
+}
+
+function ownerOfTab(tabId) {
+  const socket = tabOwners.get(tabId);
+  if (!socket) return null;
+  if (socket.destroyed || !hosts.has(socket)) {
+    tabOwners.delete(tabId);
+    return null;
+  }
+  return socket;
+}
+
+// --- Claims ---
+
+// Who a session is: the harness that runs it, the project it works in, and its tab group name.
+function sessionOwner(sessionId) {
+  const state = sessionState.get(sessionId);
+  return {
+    sessionId,
+    harness: state?.harness || null,
+    project: state?.project || null,
+    group: state?.groupTitle || null,
+  };
+}
 
 function listClaims() {
   const out = [];
   for (const [tabId, info] of claims.entries()) {
+    const owner = sessionOwner(info.sessionId);
     out.push({
       tabId,
-      sessionId: info.sessionId,
+      ...owner,
       claimedAt: info.claimedAt,
       lastSeenAt: new Date(info.lastSeenAt).toISOString(),
     });
   }
   out.sort((a, b) => a.tabId - b.tabId);
   return out;
+}
+
+// Each profile's badge should only count claims on its own tabs.
+function claimsForHost(hostSocket) {
+  return listClaims().filter((claim) => {
+    const owner = ownerOfTab(claim.tabId);
+    return !owner || owner === hostSocket;
+  });
 }
 
 function sessionHasClaims(sessionId) {
@@ -104,7 +291,7 @@ function getSessionState(sessionId) {
   if (!sessionId) return null;
   let state = sessionState.get(sessionId);
   if (!state) {
-    state = { defaultTabId: null, lastSeenAt: nowMs() };
+    state = { defaultTabId: null, lastSeenAt: nowMs(), profileKey: null };
     sessionState.set(sessionId, state);
   }
   return state;
@@ -134,10 +321,9 @@ function clearDefaultTab(sessionId, tabId) {
 }
 
 function broadcastClaims() {
-  const payload = { type: "to_extension", message: { type: "claims", claims: listClaims() } };
   for (const [hostSocket] of healthyHosts()) {
     try {
-      writeJsonLine(hostSocket, payload);
+      writeJsonLine(hostSocket, { type: "to_extension", message: { type: "claims", claims: claimsForHost(hostSocket) } });
     } catch {}
   }
 }
@@ -145,6 +331,7 @@ function broadcastClaims() {
 function releaseClaim(tabId, { silent = false } = {}) {
   const info = claims.get(tabId);
   if (!info) return false;
+  cancelTabUserRequests(tabId, info.sessionId, "Tab claim released");
   claims.delete(tabId);
   clearDefaultTab(info.sessionId, tabId);
   if (!silent) broadcastClaims();
@@ -155,12 +342,13 @@ function releaseClaimsForSession(sessionId) {
   let any = false;
   for (const [tabId, info] of claims.entries()) {
     if (info.sessionId === sessionId) {
+      if (hasPendingUserRequest(sessionId, tabId)) continue;
       claims.delete(tabId);
       any = true;
     }
   }
   clearDefaultTab(sessionId);
-  sessionState.delete(sessionId);
+  // The session's name and tab groups outlive the connection: CLI calls and reconnecting adapters come back to them.
   if (any) broadcastClaims();
 }
 
@@ -173,6 +361,9 @@ function checkClaim(tabId, sessionId) {
 
 function setClaim(tabId, sessionId) {
   const existing = claims.get(tabId);
+  if (existing && existing.sessionId !== sessionId) {
+    cancelTabUserRequests(tabId, existing.sessionId, "Tab claim transferred");
+  }
   claims.set(tabId, {
     sessionId,
     claimedAt: existing ? existing.claimedAt : nowIso(),
@@ -196,14 +387,19 @@ function cleanupStaleClaims() {
   const now = nowMs();
   let expired = false;
   for (const [tabId, info] of claims.entries()) {
+    if (hasPendingUserRequest(info.sessionId, tabId)) {
+      info.lastSeenAt = now;
+      continue;
+    }
     if (now - info.lastSeenAt > LEASE_TTL_MS) {
       releaseClaim(tabId, { silent: true });
       expired = true;
     }
   }
   if (expired) broadcastClaims();
+  const connected = new Set([...clients].map((client) => client.sessionId).filter(Boolean));
   for (const [sessionId, state] of sessionState.entries()) {
-    if (!sessionHasClaims(sessionId) && now - state.lastSeenAt > LEASE_TTL_MS) {
+    if (!connected.has(sessionId) && !sessionHasClaims(sessionId) && now - state.lastSeenAt > SESSION_STATE_TTL_MS) {
       sessionState.delete(sessionId);
     }
   }
@@ -263,24 +459,12 @@ async function prepareSocketPath() {
   return true;
 }
 
-function healthyHosts() {
-  const now = nowMs();
-  return [...hosts.entries()].filter(([socket, info]) => !socket.destroyed && now - info.lastPongAt <= PONG_TIMEOUT_MS);
-}
+// --- Extension calls ---
 
-function selectHostSocket() {
-  const selected = healthyHosts().sort((a, b) => b[1].helloAt - a[1].helloAt)[0];
-  return selected ? selected[0] : null;
-}
-
-function ensureHost() {
-  const hostSocket = selectHostSocket();
-  if (hostSocket) return hostSocket;
-  throw new Error("Chrome extension is not connected (native host offline)");
-}
-
-function callExtension(tool, args, sessionId) {
-  const hostSocket = ensureHost();
+function callExtension(hostSocket, tool, args, sessionId, timeoutMs = EXTENSION_TIMEOUT_MS) {
+  if (!hostSocket || hostSocket.destroyed) {
+    return Promise.reject(new Error("Chrome extension is not connected (native host offline)"));
+  }
   const extId = ++nextExtId;
 
   return new Promise((resolve, reject) => {
@@ -294,83 +478,541 @@ function callExtension(tool, args, sessionId) {
       if (!extPending.has(extId)) return;
       extPending.delete(extId);
       reject(new Error("Timed out waiting for extension"));
-    }, 60000);
+    }, timeoutMs);
 
-    // attach timeout to resolver
     const pending = extPending.get(extId);
     if (pending) pending.timeout = timeout;
   });
 }
 
-async function ensureSessionTab(sessionId) {
+function parseTabList(result) {
+  if (!result || typeof result.content !== "string") return null;
+  try {
+    const tabs = JSON.parse(result.content);
+    return Array.isArray(tabs) ? tabs : null;
+  } catch {
+    return null;
+  }
+}
+
+function recordTabs(hostSocket, tool, result) {
+  if (!result || typeof result !== "object") return;
+  if (typeof result.tabId === "number") tabOwners.set(result.tabId, hostSocket);
+  if (tool === "get_tabs") {
+    for (const tab of parseTabList(result) || []) {
+      if (typeof tab?.id === "number") tabOwners.set(tab.id, hostSocket);
+    }
+  }
+}
+
+// Label results with the profile they came from so agents can verify where they are.
+function withProfile(tool, result, key) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const profile = labelFor(key);
+  const out = { ...result, profile };
+  if (tool === "get_tabs") {
+    const tabs = parseTabList(result);
+    const ownedBy = (tab) => {
+      const claim = claims.get(tab.id);
+      return claim ? { claimedBy: sessionOwner(claim.sessionId) } : {};
+    };
+    if (tabs) out.content = JSON.stringify(tabs.map((tab) => ({ ...tab, profile, ...ownedBy(tab) })), null, 2);
+  } else if ((tool === "open_tab" || tool === "get_active_tab") && result.content && typeof result.content === "object") {
+    out.content = { ...result.content, profile };
+  }
+  return out;
+}
+
+async function fanOut(tool, args, sessionId, timeoutMs = INVENTORY_TIMEOUT_MS) {
+  const candidates = routingCandidates();
+  const settled = await Promise.allSettled(
+    candidates.map(([socket]) => callExtension(socket, tool, args, sessionId, timeoutMs))
+  );
+  return candidates.map(([socket, info], index) => ({
+    socket,
+    info,
+    ok: settled[index].status === "fulfilled",
+    value: settled[index].status === "fulfilled" ? settled[index].value : null,
+    error: settled[index].status === "rejected" ? settled[index].reason?.message || String(settled[index].reason) : null,
+  }));
+}
+
+function firstFanOutError(results) {
+  return new Error(results.find((r) => r.error)?.error || "Chrome extension is not connected (native host offline)");
+}
+
+async function allProfilesTabs(sessionId) {
+  const results = await fanOut("get_tabs", {}, sessionId);
+  if (!results.some((r) => r.ok)) throw firstFanOutError(results);
+  const tabs = [];
+  for (const r of results) {
+    if (!r.ok) continue;
+    recordTabs(r.socket, "get_tabs", r.value);
+    tabs.push(...(parseTabList(withProfile("get_tabs", r.value, r.info.profileKey)) || []));
+  }
+  return { content: JSON.stringify(tabs, null, 2) };
+}
+
+async function focusedActiveTab(sessionId) {
+  const results = await fanOut("get_active_tab", {}, sessionId);
+  const ok = results.filter((r) => r.ok);
+  if (!ok.length) throw firstFanOutError(results);
+  for (const r of ok) recordTabs(r.socket, "get_active_tab", r.value);
+  const focused = ok.filter((r) => r.value?.content?.windowFocused);
+  if (focused.length === 1) return withProfile("get_active_tab", focused[0].value, focused[0].info.profileKey);
+  return {
+    content: {
+      ambiguous: true,
+      note: "No single focused Chrome window. Pass a tabId from this list, or choose a profile first.",
+      activeTabs: ok.map((r) => ({
+        profile: labelFor(r.info.profileKey),
+        tabId: r.value?.tabId,
+        url: r.value?.content?.url,
+        title: r.value?.content?.title,
+      })),
+    },
+  };
+}
+
+async function allProfileStatuses(sessionId) {
+  const results = await fanOut("get_profile_status", {}, sessionId);
+  return {
+    content: {
+      profiles: results.map((r) =>
+        r.ok
+          ? { profile: labelFor(r.info.profileKey), ...(r.value?.content || r.value || {}) }
+          : { profile: labelFor(r.info.profileKey), error: r.error }
+      ),
+    },
+  };
+}
+
+async function allProfilesList(tool, args, sessionId) {
+  const results = await fanOut(tool, args, sessionId, EXTENSION_TIMEOUT_MS);
+  if (!results.some((r) => r.ok)) throw firstFanOutError(results);
+  const listKey = PROFILE_LISTS[tool];
+  const merged = [];
+  const errors = [];
+  for (const r of results) {
+    const profile = labelFor(r.info.profileKey);
+    if (!r.ok) {
+      errors.push({ profile, error: r.error });
+      continue;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(r.value?.content || "[]");
+    } catch {
+      parsed = [];
+    }
+    const items = listKey ? parsed?.[listKey] || [] : parsed;
+    for (const item of Array.isArray(items) ? items : []) merged.push({ ...item, profile });
+  }
+  return { content: JSON.stringify(errors.length ? { results: merged, errors } : merged, null, 2) };
+}
+
+async function refreshTabOwners(sessionId) {
+  const results = await fanOut("get_tabs", {}, sessionId);
+  for (const r of results) {
+    if (r.ok) recordTabs(r.socket, "get_tabs", r.value);
+  }
+}
+
+// --- Routing ---
+// Order: explicit profile, then the tab's own profile, then the session's profile,
+// then the only connected profile. Several connected profiles and no choice is an error,
+// never a guess.
+async function resolveRoute(sessionId, { profile, tabId }) {
+  const state = sessionId ? getSessionState(sessionId) : null;
+
+  if (profile) {
+    const key = matchProfileKey(profile);
+    if (!key) {
+      throw profileError(
+        "PROFILE_UNKNOWN",
+        `No Chrome profile named "${profile}". Known: ${knownProfileNames().join(", ") || "none"}.`
+      );
+    }
+    const socket = hostForProfile(key);
+    if (!socket) {
+      throw profileError(
+        "PROFILE_NOT_CONNECTED",
+        `${labelFor(key)} is not connected. Open a window in that Chrome profile (iris open-profile ${labelFor(key)}) and retry.`
+      );
+    }
+    return { socket, key, source: "explicit" };
+  }
+
+  if (typeof tabId === "number") {
+    let socket = ownerOfTab(tabId);
+    if (!socket && routingCandidates().length > 1) {
+      await refreshTabOwners(sessionId);
+      socket = ownerOfTab(tabId);
+    }
+    if (socket) return { socket, key: hosts.get(socket)?.profileKey ?? null, source: "tab" };
+  }
+
+  if (state?.profileKey) {
+    const socket = hostForProfile(state.profileKey);
+    if (!socket) {
+      throw profileError(
+        "PROFILE_NOT_CONNECTED",
+        `This session uses ${labelFor(state.profileKey)}, which is not connected. Reopen that profile (iris open-profile ${labelFor(state.profileKey)}) or choose another with browser_use_profile.`
+      );
+    }
+    return { socket, key: state.profileKey, source: "session" };
+  }
+
+  const candidates = routingCandidates();
+  if (candidates.length === 0) throw new Error("Chrome extension is not connected (native host offline)");
+  if (candidates.length === 1) {
+    return { socket: candidates[0][0], key: candidates[0][1].profileKey ?? null, source: "only" };
+  }
+  throw profileError(
+    "PROFILE_REQUIRED",
+    `${candidates.length} Chrome profiles are connected (${connectedLabels().join(", ")}). ` +
+      "Call browser_profiles, then browser_use_profile (or pass profile=...). Iris will not guess."
+  );
+}
+
+function maybePin(sessionId, route) {
+  const state = sessionId ? getSessionState(sessionId) : null;
+  if (state && !state.profileKey && route.key) state.profileKey = route.key;
+}
+
+// One Chrome tab group per agent session; IRIS_TAB_GROUPS=off leaves tabs ungrouped.
+// Title: the agent's name for the task (browser_name_group), else the first site it opened, else its project,
+// followed by the harness, e.g. "Codeable Neverland · omo" or "codeable · omp".
+const GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
+
+function groupsEnabled() {
+  return !/^(off|false|0)$/i.test(process.env.IRIS_TAB_GROUPS || "");
+}
+
+function clipText(value, max) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+function siteName(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "file:") return "local file";
+    if (!/^https?:$/.test(parsed.protocol)) return null;
+    const parts = parsed.hostname.replace(/^www\./, "").split(".");
+    if (parts.length >= 2 && /^\d+$/.test(parts[parts.length - 1])) return parsed.hostname;
+    return parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+  } catch {
+    return null;
+  }
+}
+
+function sessionGroupTitle(sessionId) {
+  if (!sessionId || !groupsEnabled()) return undefined;
+  const state = sessionState.get(sessionId);
+  const name = clipText(state?.label || state?.site || state?.project || "Iris", 30);
+  return state?.harness ? `${name} · ${state.harness}` : name;
+}
+
+// A claimed tab of this session in the given profile: new tabs join that tab's group instead of a same-named one.
+function sessionAnchorTab(sessionId, hostSocket) {
+  for (const [tabId, info] of claims.entries()) {
+    if (info.sessionId === sessionId && ownerOfTab(tabId) === hostSocket) return tabId;
+  }
+  return undefined;
+}
+
+// Group ids are remembered per profile, so new tabs rejoin the session's group even after its claims lapse.
+function hostKey(hostSocket) {
+  return hosts.get(hostSocket)?.profileKey || "default";
+}
+
+function hostForKey(key) {
+  for (const [socket] of healthyHosts()) if (hostKey(socket) === key) return socket;
+  return null;
+}
+
+function rememberGroup(sessionId, hostSocket, groupId) {
+  const state = sessionState.get(sessionId);
+  if (state && Number.isInteger(groupId) && groupId >= 0) (state.groups ||= {})[hostKey(hostSocket)] = groupId;
+}
+
+function groupArgs(sessionId, hostSocket) {
+  const title = sessionGroupTitle(sessionId);
+  if (!title) return {};
+  const state = sessionState.get(sessionId);
+  if (state) state.groupTitle = title;
+  return {
+    group: title,
+    groupColor: state?.color,
+    groupId: state?.groups?.[hostKey(hostSocket)],
+    groupWith: sessionAnchorTab(sessionId, hostSocket),
+  };
+}
+
+// Retitle every group holding this session's tabs (and group any loose ones) after its name changes.
+async function renameSessionGroups(sessionId, { force = false } = {}) {
+  const state = sessionState.get(sessionId);
+  const title = sessionGroupTitle(sessionId);
+  if (!state || !title || (!force && state.groupTitle === title)) return [];
+  state.groupTitle = title;
+  const byHost = new Map();
+  const entry = (host) => {
+    if (!byHost.has(host)) byHost.set(host, { tabIds: [], groupIds: [] });
+    return byHost.get(host);
+  };
+  for (const [key, groupId] of Object.entries(state.groups || {})) {
+    const host = hostForKey(key);
+    if (host) entry(host).groupIds.push(groupId);
+  }
+  for (const [tabId, info] of claims.entries()) {
+    if (info.sessionId !== sessionId) continue;
+    const host = ownerOfTab(tabId);
+    if (host) entry(host).tabIds.push(tabId);
+  }
+  const groups = [];
+  for (const [host, { tabIds, groupIds }] of byHost) {
+    try {
+      const res = await callExtension(host, "name_group", { tabIds, groupIds, title, color: state.color }, sessionId);
+      const named = res?.content?.groups || [];
+      if (!state.groups?.[hostKey(host)]) rememberGroup(sessionId, host, named[0]);
+      groups.push(...named);
+    } catch {
+      // A profile that cannot group (no tabGroups permission yet) keeps its tabs ungrouped.
+    }
+  }
+  return groups;
+}
+
+const MAX_TOOL_TIMEOUT_MS = 31 * 60 * 1000;
+
+function toolTimeoutMs(requested) {
+  const n = Number(requested);
+  if (!Number.isFinite(n) || n <= EXTENSION_TIMEOUT_MS) return EXTENSION_TIMEOUT_MS;
+  return Math.min(n, MAX_TOOL_TIMEOUT_MS);
+}
+
+async function ensureSessionTab(sessionId, hostSocket) {
   if (!sessionId) throw new Error("Missing sessionId for tab creation");
-  const res = await callExtension("open_tab", { active: false }, sessionId);
+  const res = await callExtension(hostSocket, "open_tab", { active: false, ...groupArgs(sessionId, hostSocket) }, sessionId);
   const tabId = res && typeof res.tabId === "number" ? res.tabId : undefined;
   if (!tabId) throw new Error("Failed to create a new tab for this session");
+  rememberGroup(sessionId, hostSocket, res.content?.groupId);
+  tabOwners.set(tabId, hostSocket);
   touchClaim(tabId, sessionId);
   setDefaultTab(sessionId, tabId);
   return tabId;
 }
 
-async function resolveDefaultTabId(sessionId) {
-  if (!sessionId) throw new Error("Missing sessionId for tab resolution");
-  try {
-    const active = await callExtension("get_active_tab", {}, sessionId);
-    const activeId =
-      active && typeof active.tabId === "number"
-        ? active.tabId
-        : active && active.content && typeof active.content.tabId === "number"
-          ? active.content.tabId
-          : null;
-    if (typeof activeId === "number") {
-      const claim = checkClaim(activeId, sessionId);
-      if (claim.ok) {
-        touchClaim(activeId, sessionId);
-        setDefaultTab(sessionId, activeId);
-        return activeId;
-      }
-      // owned by another session — do not steal; fall through to create
-    }
-  } catch {
-    // extension error — fall through to create
+// A session without an explicit tabId works in its own background tab, never the user's active tab.
+async function sessionTabFor(sessionId, route, { create = true } = {}) {
+  const state = getSessionState(sessionId);
+  const defaultTabId = state && Number.isFinite(state.defaultTabId) ? state.defaultTabId : null;
+  if (defaultTabId != null) {
+    const owner = ownerOfTab(defaultTabId);
+    if (!owner || owner === route.socket) return defaultTabId;
   }
-  return await ensureSessionTab(sessionId);
+  if (!create) throw new Error("No tab owned by this session. Open a new tab first.");
+  return await ensureSessionTab(sessionId, route.socket);
 }
 
-async function handleTool(pluginSocket, req) {
-  const { tool, args = {}, sessionId } = req;
+function hasPendingUserRequest(sessionId, tabId) {
+  return [...userRequests.values()].some((entry) =>
+    entry.status === "pending" && entry.sessionId === sessionId && entry.tabId === tabId);
+}
+
+function requestView(entry) {
+  return { ...entry.result, ok: entry.result?.ok !== false, status: entry.status,
+    requestId: entry.requestId, tabId: entry.tabId, profile: entry.profile };
+}
+
+function finishUserRequest(entry, result) {
+  if (entry.status !== "pending") return;
+  let terminal;
+  try { terminal = JSON.parse(result?.content); } catch {}
+  if (!terminal || typeof terminal !== "object" || Array.isArray(terminal) ||
+      typeof terminal.status !== "string" || terminal.status === "pending") {
+    terminal = { ok: false, status: "cancelled", reason: "Invalid terminal handoff response" };
+    result = { content: JSON.stringify(terminal) };
+  }
+  entry.status = terminal.status;
+  entry.result = { ...terminal, content: result.content };
+  entry.finishedAt = nowMs();
+  clearInterval(entry.renewal);
+  const pending = extPending.get(entry.extId);
+  if (pending) {
+    clearTimeout(pending.timeout);
+    extPending.delete(entry.extId);
+  }
+}
+
+function cancelledUserRequest(entry, reason) {
+  finishUserRequest(entry, { content: JSON.stringify({ ok: false, status: "cancelled", reason }) });
+}
+
+function cleanupUserRequest(entry, host = entry.host) {
+  return callExtension(host, "request_cancel", { requestId: entry.requestId, tabId: entry.tabId },
+    entry.sessionId, REQUEST_CLEANUP_MS);
+}
+
+function cancelHostUserRequests(host, reason, cleanupHost) {
+  for (const entry of userRequests.values()) {
+    if (entry.host !== host || entry.status !== "pending") continue;
+    cancelledUserRequest(entry, reason);
+    if (cleanupHost) cleanupUserRequest(entry, cleanupHost).catch(() => {});
+  }
+}
+
+function pruneUserRequests() {
+  const now = nowMs();
+  for (const [id, entry] of userRequests) {
+    if (entry.status !== "pending" && now - entry.finishedAt >= REQUEST_RETENTION_MS) userRequests.delete(id);
+  }
+}
+
+async function handleUserRequestControl(tool, args, sessionId, requestedProfile) {
+  pruneUserRequests();
+  const entry = userRequests.get(args.requestId);
+  if (!sessionId || !entry || entry.sessionId !== sessionId || entry.handoffOwner !== args.handoffOwner) {
+    throw new Error("REQUEST_NOT_FOUND: No handoff owned by this session with that requestId");
+  }
+  // A profile switch intentionally blocks control of old-profile handoffs until the session switches back.
+  const selectedProfile = sessionState.get(sessionId)?.profileKey;
+  const profileKey = requestedProfile ? matchProfileKey(requestedProfile) : sessionState.get(sessionId)?.profileKey;
+  if ((selectedProfile && selectedProfile !== entry.profileKey) ||
+      (requestedProfile && !profileKey) || (profileKey && profileKey !== entry.profileKey) ||
+      (args.tabId !== undefined && args.tabId !== entry.tabId)) {
+    throw new Error("REQUEST_OWNERSHIP: Handoff belongs to a different profile or tab");
+  }
+  if (tool === "request_cancel" && (entry.status === "pending" || entry.cancelling)) {
+    // Share cleanup between concurrent cancels; a completion racing cleanup wins if it arrives first.
+    if (!entry.cancelling) {
+      entry.cancelling = cleanupUserRequest(entry).then(
+        (result) => finishUserRequest(entry, result),
+        (error) => cancelledUserRequest(entry, `Cancellation cleanup failed: ${error.message}`));
+    }
+    await entry.cancelling;
+  }
+  return requestView(entry);
+}
+
+function checkPendingHandoffOwner(tabId, sessionId, handoffOwner) {
+  for (const entry of userRequests.values()) {
+    if (entry.status === "pending" && entry.tabId === tabId && entry.sessionId === sessionId &&
+        entry.handoffOwner !== handoffOwner) {
+      throw new Error("REQUEST_OWNERSHIP: Pending handoff belongs to another conversation");
+    }
+  }
+}
+
+function cancelTabUserRequests(tabId, sessionId, reason) {
+  for (const entry of userRequests.values()) {
+    if (entry.tabId !== tabId || entry.sessionId !== sessionId || entry.status !== "pending") continue;
+    cancelledUserRequest(entry, reason);
+    entry.cancelling = cleanupUserRequest(entry).catch(() => {});
+  }
+}
+
+function startUserRequest(route, args, tabId, sessionId) {
+  if (!sessionId) throw new Error("Missing sessionId for async handoff");
+  const selectedProfile = sessionState.get(sessionId)?.profileKey;
+  if (selectedProfile && selectedProfile !== route.key) {
+    throw new Error("REQUEST_OWNERSHIP: Select the target profile with browser_use_profile before starting its handoff");
+  }
+  const requestId = randomUUID();
+  const entry = { requestId, sessionId, handoffOwner: args.handoffOwner, profileKey: route.key, profile: labelFor(route.key),
+    host: route.socket, tabId, status: "pending" };
+  userRequests.set(requestId, entry);
+  maybePin(sessionId, route);
+  tabOwners.set(tabId, route.socket);
+  touchClaim(tabId, sessionId);
+  setDefaultTab(sessionId, tabId);
+  // Renewal is independent of polling and client sockets, including one-shot CLI clients.
+  entry.renewal = setInterval(() => {
+    touchSession(sessionId);
+    const claim = claims.get(tabId);
+    if (claim?.sessionId === sessionId) claim.lastSeenAt = nowMs();
+  }, LEASE_TTL_MS > 0 ? Math.max(1, Math.min(30000, Math.floor(LEASE_TTL_MS / 3))) : 30000);
+  entry.renewal.unref();
+  entry.extId = nextExtId + 1;
+  const { handoffOwner, ...extensionArgs } = args;
+  callExtension(route.socket, "request_user", { ...extensionArgs, tabId, requestId }, sessionId, MAX_TOOL_TIMEOUT_MS).then(
+    (result) => finishUserRequest(entry, result),
+    (error) => {
+      cancelledUserRequest(entry, error.message);
+      if (!route.socket.destroyed) cleanupUserRequest(entry).catch(() => {});
+    });
+  return requestView(entry);
+}
+
+async function handleTool(req) {
+  const { tool, sessionId } = req;
   if (!tool) throw new Error("Missing tool");
+  const { profile: requestedProfile, ...args } = req.args || {};
+  const timeoutMs = toolTimeoutMs(req.timeoutMs);
 
   if (sessionId) touchSession(sessionId);
+  const state = sessionId ? getSessionState(sessionId) : null;
+  if (tool === "request_status" || tool === "request_cancel") {
+    return await handleUserRequestControl(tool, args, sessionId, requestedProfile);
+  }
+  // Until the agent names its task, the group is named after the first site it opens.
+  if (state && !state.label && !state.site && (tool === "open_tab" || tool === "navigate") && args.url) {
+    state.site = siteName(args.url);
+  }
 
-  let tabId = args.tabId;
-  const toolArgs = { ...args };
+  const unscoped =
+    !requestedProfile && !state?.profileKey && typeof args.tabId !== "number" && routingCandidates().length > 1;
+  if (unscoped && tool === "get_tabs") return await allProfilesTabs(sessionId);
+  if (unscoped && tool === "get_active_tab") return await focusedActiveTab(sessionId);
+  if (unscoped && tool === "get_profile_status") return await allProfileStatuses(sessionId);
+  if (unscoped && tool in PROFILE_LISTS && !args.restore) return await allProfilesList(tool, args, sessionId);
 
+  const route = await resolveRoute(sessionId, { profile: requestedProfile, tabId: args.tabId });
+  if (tool === "request_user" && typeof args.message === "string" && args.message.trim()) {
+    const profile = labelFor(route.key);
+    const identity = route.key && route.key !== profile ? `${profile} · ${route.key}` : profile;
+    args.message = `[${identity}] ${args.message.trim()}`;
+  }
   const isCloseTool = tool === "close_tab";
 
+  let tabId = args.tabId;
+  const implicitTab = wantsTab(tool) && typeof tabId !== "number";
   if (wantsTab(tool)) {
-    if (typeof tabId !== "number") {
-      const state = getSessionState(sessionId);
-      const defaultTabId = state && Number.isFinite(state.defaultTabId) ? state.defaultTabId : null;
-      if (Number.isFinite(defaultTabId)) {
-        tabId = defaultTabId;
-      } else if (!isCloseTool) {
-        tabId = await resolveDefaultTabId(sessionId);
-      } else {
-        throw new Error("No tab owned by this session. Open a new tab first.");
-      }
-    }
-
+    if (implicitTab) tabId = await sessionTabFor(sessionId, route, { create: !isCloseTool });
     const claimCheck = checkClaim(tabId, sessionId);
     if (!claimCheck.ok) throw new Error(claimCheck.error);
   }
+  if (tool === "request_user" && [...userRequests.values()].some((entry) =>
+      entry.status === "pending" && entry.host === route.socket && entry.tabId === tabId)) {
+    throw new Error("REQUEST_PENDING: This tab already has a pending handoff");
+  }
+  if (tool === "request_user" && args.wait === false) return startUserRequest(route, args, tabId, sessionId);
 
-  const res = await callExtension(tool, { ...toolArgs, tabId }, sessionId);
+  if (tool === "open_tab" && args.group === undefined) Object.assign(args, groupArgs(sessionId, route.socket));
+
+  let res;
+  try {
+    res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId, timeoutMs);
+  } catch (error) {
+    if (typeof tabId !== "number" || !/TAB_NOT_FOUND|No tab with id/.test(error?.message || "")) throw error;
+    // The tab is gone (user closed it). Forget it; a session's own implicit tab is replaced transparently.
+    tabOwners.delete(tabId);
+    if (claims.has(tabId)) releaseClaim(tabId);
+    else clearDefaultTab(sessionId, tabId);
+    if (!implicitTab || isCloseTool) throw error;
+    tabId = await ensureSessionTab(sessionId, route.socket);
+    res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId, timeoutMs);
+  }
+  recordTabs(route.socket, tool, res);
+  if (tool === "open_tab" && sessionId) rememberGroup(sessionId, route.socket, res?.content?.groupId);
+  maybePin(sessionId, route);
 
   const usedTabId =
     res && typeof res.tabId === "number" ? res.tabId : typeof tabId === "number" ? tabId : undefined;
   if (typeof usedTabId === "number") {
     if (isCloseTool) {
+      tabOwners.delete(usedTabId);
       if (claims.has(usedTabId)) {
         releaseClaim(usedTabId);
       } else {
@@ -382,14 +1024,305 @@ async function handleTool(pluginSocket, req) {
     }
   }
 
-  return res;
+  if (state?.site && !state.label && state.groupTitle && state.groupTitle !== sessionGroupTitle(sessionId)) {
+    await renameSessionGroups(sessionId).catch(() => {});
+  }
+
+  const out = withProfile(tool, res, route.key);
+  // Report popups and tabs this session's pages opened since its last call.
+  if (state?.openedTabs?.length && out && typeof out === "object" && !Array.isArray(out)) {
+    out.openedTabs = state.openedTabs.splice(0);
+  }
+  return out;
 }
+
+// --- Profile inventory, choice, and selection ---
+
+async function collectInventory(sessionId) {
+  const entries = new Map();
+  for (const p of configuredProfiles()) {
+    entries.set(p.key, {
+      profile: p.alias,
+      profileId: p.key,
+      purpose: p.purpose,
+      sites: p.sites,
+      default: p.isDefault,
+      connected: false,
+    });
+  }
+
+  const healthy = healthyHosts();
+  const summaries = await Promise.allSettled(
+    healthy.map(([socket, info]) =>
+      info.allowed === false ? Promise.resolve(null) : callExtension(socket, "profile_summary", {}, sessionId, INVENTORY_TIMEOUT_MS)
+    )
+  );
+
+  const sockets = new Map();
+  healthy.forEach(([socket, info], index) => {
+    const key = info.profileKey || `pid:${info.pid}`;
+    const entry = entries.get(key) || {
+      profile: info.profileKey ? labelFor(info.profileKey) : `unidentified (pid ${info.pid})`,
+      profileId: info.profileId || null,
+      purpose: "",
+      sites: [],
+      default: false,
+    };
+    entry.connected = true;
+    entry.allowed = info.allowed !== false;
+    const summary = summaries[index];
+    if (summary.status === "fulfilled" && summary.value?.content) {
+      const c = summary.value.content;
+      entry.windowCount = c.windowCount;
+      entry.tabCount = c.tabCount;
+      entry.windowFocused = !!c.windowFocused;
+      entry.activeSite = c.activeHost || null;
+      entry.openSites = Array.isArray(c.domains) ? c.domains.map((d) => d.host) : [];
+    } else if (summary.status === "rejected") {
+      entry.error = summary.reason?.message || String(summary.reason);
+    }
+    entries.set(key, entry);
+    if (info.profileKey) sockets.set(info.profileKey, socket);
+  });
+
+  return { entries: [...entries.values()], sockets };
+}
+
+async function profileInventory(sessionId) {
+  const state = sessionId ? sessionState.get(sessionId) : null;
+  const { entries } = await collectInventory(sessionId);
+  const connected = entries.filter((e) => e.connected && e.allowed !== false);
+  return {
+    profiles: entries.map((e) => ({ ...e, sessionProfile: !!state?.profileKey && e.profileId === state.profileKey })),
+    sessionProfile: state?.profileKey ? labelFor(state.profileKey) : null,
+    connectedCount: connected.length,
+    decisionModel: decisionStatus(),
+    next:
+      state?.profileKey
+        ? `This session uses ${labelFor(state.profileKey)}.`
+        : connected.length === 1
+          ? `Only ${connected[0].profile} is connected; it will be used automatically.`
+          : "Pick one with browser_use_profile, or call browser_resolve_profile with the target url and a short task.",
+  };
+}
+
+const COMMON_MAIL_DOMAINS = new Set(["gmail", "googlemail", "outlook", "hotmail", "icloud", "yahoo", "proton", "protonmail", "live", "me"]);
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mentionsProfile(text, entry) {
+  const tokens = new Set([entry.profile]);
+  const id = normalizeKey(entry.profileId);
+  if (id.includes("@")) {
+    tokens.add(id);
+    const [local, domain] = id.split("@");
+    if (local.length >= 4) tokens.add(local);
+    const stem = domain.split(".")[0];
+    if (stem.length >= 4 && !COMMON_MAIL_DOMAINS.has(stem)) tokens.add(stem);
+  }
+  for (const token of tokens) {
+    if (!token) continue;
+    if (new RegExp(`(^|[^a-z0-9])${escapeRegExp(token)}([^a-z0-9]|$)`).test(text)) return true;
+  }
+  return false;
+}
+
+async function tabsOnSite(socket, site, sessionId) {
+  try {
+    const res = await callExtension(socket, "get_tabs", {}, sessionId, INVENTORY_TIMEOUT_MS);
+    recordTabs(socket, "get_tabs", res);
+    return (parseTabList(res) || [])
+      .filter((tab) => sameSite(normalizeHost(tab.url), site))
+      .slice(0, 5)
+      .map((tab) => ({ tabId: tab.id, title: tab.title, url: tab.url, active: tab.active }));
+  } catch {
+    return [];
+  }
+}
+
+async function resolveProfile(sessionId, { url, task, pin }) {
+  const { entries, sockets } = await collectInventory(sessionId);
+  const connected = entries.filter((e) => e.connected && e.allowed !== false && sockets.has(e.profileId));
+  const targetHost = normalizeHost(url);
+  const text = normalizeKey(task);
+  const openHere = (e) => !!targetHost && (e.openSites || []).some((h) => sameSite(h, targetHost));
+
+  let pick = null;
+  let source = "none";
+  let reason = "";
+  let decisionResult = null;
+
+  if (text) {
+    const named = connected.filter((e) => mentionsProfile(text, e));
+    if (named.length === 1) {
+      pick = named[0];
+      source = "named";
+      reason = `The task names ${pick.profile}.`;
+    }
+  }
+  if (!pick && targetHost) {
+    const open = connected.filter(openHere);
+    if (open.length === 1) {
+      pick = open[0];
+      source = "open_tab";
+      reason = `${targetHost} is already open only in ${pick.profile}.`;
+    }
+  }
+  if (!pick && targetHost) {
+    const hinted = connected.filter((e) => e.sites.some((s) => hostMatches(targetHost, s)));
+    if (hinted.length === 1) {
+      pick = hinted[0];
+      source = "site_rule";
+      reason = `${targetHost} is listed under ${pick.profile} in config.`;
+    }
+  }
+  if (!pick && connected.length === 1) {
+    pick = connected[0];
+    source = "only_connected";
+    reason = `${pick.profile} is the only connected profile.`;
+  }
+
+  const settings = decisionSettings();
+  if (!pick && connected.length > 1 && settings.available) {
+    try {
+      decisionResult = await decision.chooseProfile(decision.createClient(settings), {
+        task,
+        targetHost,
+        profiles: connected.map((e) => ({ name: e.profile, purpose: e.purpose, knownSites: e.sites, targetOpen: openHere(e) })),
+      });
+      if (decisionResult.decision !== decision.UNSURE) {
+        pick = connected.find((e) => e.profile === decisionResult.decision) || null;
+        if (pick) {
+          source = "decision_model";
+          reason = `Decision model chose ${pick.profile} (confidence ${decisionResult.confidence}, margin ${decisionResult.margin}).`;
+        }
+      }
+    } catch (err) {
+      decisionResult = { error: err?.message || String(err) };
+    }
+  }
+
+  const fallback = connected.find((e) => e.default) || null;
+  if (!pick) {
+    reason =
+      connected.length === 0
+        ? "No allowed Chrome profile is connected."
+        : "No rule singled out one profile" +
+          (decisionResult && decisionResult.decision === "UNSURE" ? " and the decision model answered UNSURE" : "") +
+          ". Choose one from the candidates, or ask the user before signing in or changing anything.";
+  }
+
+  const matchingTabs = pick && targetHost ? await tabsOnSite(sockets.get(pick.profileId), targetHost, sessionId) : [];
+  const pinned = !!(pick && pin && sessionId);
+  if (pinned) getSessionState(sessionId).profileKey = pick.profileId;
+
+  return {
+    profile: pick ? pick.profile : null,
+    confident: !!pick,
+    source,
+    reason,
+    suggestion: pick ? null : fallback ? fallback.profile : null,
+    candidates: connected.map((e) => ({ profile: e.profile, purpose: e.purpose, targetOpen: openHere(e), default: e.default })),
+    matchingTabs,
+    decisionModel: decisionResult,
+    pinned,
+  };
+}
+
+function useProfile(sessionId, profile) {
+  const key = matchProfileKey(profile);
+  if (!key) {
+    throw profileError("PROFILE_UNKNOWN", `No Chrome profile named "${profile}". Known: ${knownProfileNames().join(", ") || "none"}.`);
+  }
+  const socket = hostForProfile(key);
+  if (!socket) {
+    throw profileError(
+      "PROFILE_NOT_CONNECTED",
+      `${labelFor(key)} is not connected. Open a window in that Chrome profile (iris open-profile ${labelFor(key)}) and retry.`
+    );
+  }
+  const state = getSessionState(sessionId);
+  if (!state) throw new Error("Missing sessionId");
+  if (state.defaultTabId != null) {
+    const owner = ownerOfTab(state.defaultTabId);
+    if (owner && owner !== socket) clearDefaultTab(sessionId);
+  }
+  state.profileKey = key;
+  const cfg = configFor(key);
+  return { ok: true, profile: labelFor(key), profileId: key, purpose: cfg?.purpose || "" };
+}
+
+function parseFacts(value) {
+  const facts = {};
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const text = String(entry ?? "");
+      const idx = text.indexOf("=");
+      if (idx > 0) facts[text.slice(0, idx).trim()] = text.slice(idx + 1);
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, val] of Object.entries(value)) facts[key] = String(val ?? "");
+  }
+  return facts;
+}
+
+async function runGoalOp(sessionId, msg) {
+  const settings = decisionSettings();
+  if (!settings.available) {
+    return {
+      status: "unavailable",
+      reason: `Decision model unavailable (${settings.reason}). Use the step tools (snapshot, click, type) instead.`,
+    };
+  }
+  if (!msg.goal || !String(msg.goal).trim()) throw new Error("goal is required");
+  if (sessionId) touchSession(sessionId);
+
+  const route = await resolveRoute(sessionId, { profile: msg.profile, tabId: msg.tabId });
+  const tabId = typeof msg.tabId === "number" ? msg.tabId : await sessionTabFor(sessionId, route);
+  const claimCheck = checkClaim(tabId, sessionId);
+  if (!claimCheck.ok) throw new Error(claimCheck.error);
+  maybePin(sessionId, route);
+  touchClaim(tabId, sessionId);
+  setDefaultTab(sessionId, tabId);
+
+  const callTool = async (tool, args) => {
+    const res = await callExtension(route.socket, tool, { ...args, tabId }, sessionId);
+    touchClaim(tabId, sessionId);
+    return res;
+  };
+
+  if (msg.url) await callTool("navigate", { url: msg.url });
+
+  const maxSteps = Number.isFinite(msg.maxSteps) ? Math.min(20, Math.max(1, Math.floor(msg.maxSteps))) : 8;
+  const result = await decision.runGoal({
+    decide: decision.createClient(settings),
+    callTool,
+    goal: String(msg.goal),
+    facts: parseFacts(msg.facts),
+    maxSteps,
+    allowIrreversible: msg.allowIrreversible === true,
+    model: settings.model,
+  });
+  return { ...result, tabId, profile: labelFor(route.key) };
+}
+
+// --- Protocol ---
 
 function handleClientMessage(socket, client, msg) {
   if (msg && msg.type === "hello") {
     client.role = msg.role || "unknown";
     client.sessionId = msg.sessionId;
-    if (client.sessionId) touchSession(client.sessionId);
+    if (client.sessionId) {
+      const state = touchSession(client.sessionId);
+      if (state && typeof msg.profile === "string" && msg.profile.trim()) {
+        state.profileKey = matchProfileKey(msg.profile) || normalizeKey(msg.profile);
+      }
+      if (state && typeof msg.harness === "string" && msg.harness.trim()) state.harness = clipText(msg.harness, 16);
+      if (state && typeof msg.project === "string" && msg.project.trim()) state.project = clipText(msg.project, 40);
+      if (state && Number.isFinite(msg.pid)) state.pid = msg.pid;
+    }
     if (client.role === "native-host") {
       const now = nowMs();
       hosts.set(socket, {
@@ -397,10 +1330,15 @@ function handleClientMessage(socket, client, msg) {
         connectedAt: nowIso(),
         helloAt: now,
         lastPongAt: now,
+        profileKey: null,
+        profileId: null,
+        allowed: null,
+        version: null,
       });
       // allow host to see current state
-      writeJsonLine(socket, { type: "host_ready", claims: listClaims() });
-      writeJsonLine(socket, { type: "to_extension", message: { type: "claims", claims: listClaims() } });
+      writeJsonLine(socket, { type: "host_ready", claims: claimsForHost(socket) });
+      writeJsonLine(socket, { type: "to_extension", message: { type: "claims", claims: claimsForHost(socket) } });
+      writeJsonLine(socket, { type: "to_extension", message: { type: "identify_request" } });
     }
     return;
   }
@@ -410,13 +1348,59 @@ function handleClientMessage(socket, client, msg) {
     if (info) info.lastPongAt = nowMs();
     const message = msg.message;
     if (message && message.type === "pong") return;
+    if (message && message.type === "identify") {
+      if (info) {
+        // Routine identity refreshes do not end handoffs; only a new worker generation does.
+        const workerId = typeof message.workerId === "string" && message.workerId ? message.workerId : null;
+        if (info.workerId && workerId && info.workerId !== workerId) {
+          cancelHostUserRequests(socket, "Extension worker reconnected", socket);
+        }
+        if (workerId) info.workerId = workerId;
+        const nextKey = normalizeKey(message.profileId) || null;
+        for (const [other, otherInfo] of hosts) {
+          if (other !== socket && nextKey && otherInfo.profileKey === nextKey) {
+            cancelHostUserRequests(other, "Extension worker reconnected", socket);
+          }
+        }
+        // Clean orphan UI after a host disconnect once its profile becomes reachable again.
+        for (const entry of userRequests.values()) {
+          if (entry.orphaned && entry.profileKey === nextKey) {
+            entry.orphaned = false;
+            cleanupUserRequest(entry, socket).catch(() => {});
+          }
+        }
+        info.profileKey = normalizeKey(message.profileId) || null;
+        info.profileId = message.profileId || null;
+        info.allowed = message.allowed !== false;
+        info.version = message.version || null;
+      }
+      return;
+    }
     if (message && message.type === "release_tab" && typeof message.tabId === "number") {
       releaseClaim(message.tabId);
       return;
     }
+    if (message && message.type === "tab_opened" && typeof message.tabId === "number") {
+      const opener = claims.get(message.openerTabId);
+      if (!opener || claims.has(message.tabId)) return;
+      tabOwners.set(message.tabId, socket);
+      setClaim(message.tabId, opener.sessionId);
+      const state = getSessionState(opener.sessionId);
+      if (state) {
+        state.openedTabs = state.openedTabs || [];
+        state.openedTabs.push({
+          tabId: message.tabId,
+          openerTabId: message.openerTabId,
+          url: message.url || "",
+          popup: message.windowType === "popup",
+        });
+        if (state.openedTabs.length > 20) state.openedTabs.splice(0, state.openedTabs.length - 20);
+      }
+      return;
+    }
     if (message && message.type === "tool_response" && typeof message.id === "number") {
       const pending = extPending.get(message.id);
-      if (!pending) return;
+      if (!pending || pending.host !== socket) return;
       extPending.delete(message.id);
       if (pending.timeout) clearTimeout(pending.timeout);
 
@@ -433,6 +1417,11 @@ function handleClientMessage(socket, client, msg) {
   if (msg && msg.type === "request" && typeof msg.id === "number") {
     const requestId = msg.id;
     const sessionId = msg.sessionId || client.sessionId;
+    if (msg.op === "tool" && ["request_user", "request_status", "request_cancel"].includes(msg.tool) &&
+        client.sessionId && msg.sessionId && msg.sessionId !== client.sessionId) {
+      writeJsonLine(socket, { type: "response", id: requestId, ok: false, error: "REQUEST_OWNERSHIP: Session identity mismatch" });
+      return;
+    }
     if (sessionId) touchSession(sessionId);
 
     const replyOk = (data) => writeJsonLine(socket, { type: "response", id: requestId, ok: true, data });
@@ -445,23 +1434,31 @@ function handleClientMessage(socket, client, msg) {
           const state = sessionId ? sessionState.get(sessionId) : null;
           const sessionInfo = state
             ? {
-                sessionId,
+                ...sessionOwner(sessionId),
+                pid: state.pid ?? null,
                 defaultTabId: state.defaultTabId,
+                profile: state.profileKey ? labelFor(state.profileKey) : null,
                 lastSeenAt: new Date(state.lastSeenAt).toISOString(),
               }
             : null;
+          const healthySet = new Set(healthyHosts().map(([s]) => s));
           replyOk({
             broker: true,
-            hostConnected: healthyHosts().length > 0,
+            hostConnected: healthySet.size > 0,
             hostCount: hosts.size,
-            hosts: [...hosts.values()].map((info) => ({
+            hosts: [...hosts.entries()].map(([s, info]) => ({
               pid: info.pid,
+              profile: info.profileKey ? labelFor(info.profileKey) : null,
+              profileId: info.profileId,
+              allowed: info.allowed,
+              healthy: healthySet.has(s),
               connectedAt: info.connectedAt,
               lastPongAgoMs: nowMs() - info.lastPongAt,
             })),
             claims: listClaims(),
             leaseTtlMs: LEASE_TTL_MS,
             session: sessionInfo,
+            decisionModel: decisionStatus(),
           });
           return;
         }
@@ -471,10 +1468,31 @@ function handleClientMessage(socket, client, msg) {
           return;
         }
 
+        if (msg.op === "name_group") {
+          const state = getSessionState(sessionId);
+          if (!state) throw new Error("Missing sessionId");
+          const name = clipText(msg.name, 30);
+          if (!name) throw new Error("name is required: 2-4 words describing this session's task");
+          if (msg.color !== undefined && !GROUP_COLORS.has(String(msg.color))) {
+            throw new Error(`color must be one of: ${[...GROUP_COLORS].join(", ")}`);
+          }
+          state.label = name;
+          if (msg.color !== undefined) state.color = String(msg.color);
+          const groups = await renameSessionGroups(sessionId, { force: true });
+          replyOk({
+            ok: true,
+            title: sessionGroupTitle(sessionId),
+            groups,
+            note: groups.length ? undefined : "Saved; tabs this session opens will use this group name.",
+          });
+          return;
+        }
+
         if (msg.op === "claim_tab") {
           const tabId = msg.tabId;
           const force = !!msg.force;
           if (typeof tabId !== "number") throw new Error("tabId is required");
+          checkPendingHandoffOwner(tabId, sessionId, msg.handoffOwner);
           const existing = claims.get(tabId);
           if (existing && existing.sessionId !== sessionId && !force) {
             throw new Error(`Tab ${tabId} is owned by another Iris session (${existing.sessionId})`);
@@ -482,15 +1500,23 @@ function handleClientMessage(socket, client, msg) {
           if (existing && existing.sessionId !== sessionId && force) {
             clearDefaultTab(existing.sessionId, tabId);
           }
+          let owner = ownerOfTab(tabId);
+          if (!owner && routingCandidates().length > 1) {
+            await refreshTabOwners(sessionId);
+            owner = ownerOfTab(tabId);
+          }
           setClaim(tabId, sessionId);
           setDefaultTab(sessionId, tabId);
-          replyOk({ ok: true, tabId, sessionId });
+          const ownerKey = owner ? hosts.get(owner)?.profileKey ?? null : null;
+          if (ownerKey) maybePin(sessionId, { key: ownerKey });
+          replyOk({ ok: true, tabId, sessionId, profile: ownerKey ? labelFor(ownerKey) : null });
           return;
         }
 
         if (msg.op === "release_tab") {
           const tabId = msg.tabId;
           if (typeof tabId !== "number") throw new Error("tabId is required");
+          checkPendingHandoffOwner(tabId, sessionId, msg.handoffOwner);
           const existing = claims.get(tabId);
           if (!existing) {
             replyOk({ ok: true, tabId, released: false });
@@ -504,8 +1530,28 @@ function handleClientMessage(socket, client, msg) {
           return;
         }
 
+        if (msg.op === "profiles") {
+          replyOk(await profileInventory(sessionId));
+          return;
+        }
+
+        if (msg.op === "use_profile") {
+          replyOk(useProfile(sessionId, msg.profile));
+          return;
+        }
+
+        if (msg.op === "resolve_profile") {
+          replyOk(await resolveProfile(sessionId, { url: msg.url, task: msg.task, pin: msg.pin === true }));
+          return;
+        }
+
+        if (msg.op === "run") {
+          replyOk(await runGoalOp(sessionId, msg));
+          return;
+        }
+
         if (msg.op === "tool") {
-          const result = await handleTool(socket, { tool: msg.tool, args: msg.args || {}, sessionId });
+          const result = await handleTool({ tool: msg.tool, args: msg.args || {}, sessionId, timeoutMs: msg.timeoutMs });
           replyOk(result);
           return;
         }
@@ -549,7 +1595,14 @@ async function start() {
     socket.on("close", () => {
       clients.delete(client);
       if (client.role === "native-host") {
+        for (const entry of userRequests.values()) {
+          if (entry.host === socket && entry.status === "pending") entry.orphaned = true;
+        }
+        cancelHostUserRequests(socket, "Native host disconnected");
         hosts.delete(socket);
+        for (const [tabId, owner] of tabOwners.entries()) {
+          if (owner === socket) tabOwners.delete(tabId);
+        }
         // fail pending extension requests for this host
         for (const [extId, pending] of extPending.entries()) {
           if (pending.host !== socket) continue;
@@ -589,6 +1642,10 @@ if (LEASE_TTL_MS > 0 && LEASE_SWEEP_MS > 0) {
   if (typeof timer.unref === "function") timer.unref();
 }
 
+// One bounded sweep, rather than a timer per retained terminal result.
+const requestSweep = setInterval(pruneUserRequests, Math.max(1, Math.min(60000, REQUEST_RETENTION_MS || 1)));
+requestSweep.unref();
+
 if (PING_INTERVAL_MS > 0) {
   const timer = setInterval(() => {
     const now = nowMs();
@@ -606,7 +1663,7 @@ if (PING_INTERVAL_MS > 0) {
       try {
         writeJsonLine(hostSocket, {
           type: "to_extension",
-          message: { type: "ping", id: ++nextExtId, claims: listClaims() },
+          message: { type: "ping", id: ++nextExtId, claims: claimsForHost(hostSocket) },
         });
       } catch {}
     }

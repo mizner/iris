@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -51,15 +51,28 @@ async function waitForSocket(socketPath) {
   throw new Error(`Timed out waiting for broker socket: ${socketPath}`);
 }
 
-async function startBroker(t) {
+const TEST_CONFIG = {
+  profileEmails: [],
+  profiles: {
+    home: { email: "a@x.test", purpose: "Personal", domains: ["home.example"], default: true },
+    work: { email: "b@x.test", purpose: "Work admin", domains: ["work.example"] },
+  },
+};
+
+async function startBroker(t, env = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "iris-broker-"));
   const socketPath = path.join(dir, "broker.sock");
+  const configPath = path.join(dir, "config.json");
+  writeFileSync(configPath, JSON.stringify(TEST_CONFIG));
   const child = spawn(process.execPath, [BROKER_PATH], {
     env: {
       ...process.env,
       IRIS_BROKER_SOCK: socketPath,
+      IRIS_CONFIG_PATH: configPath,
+      IRIS_DECISION: "off",
       IRIS_PING_INTERVAL_MS: "150",
       IRIS_PONG_TIMEOUT_MS: "400",
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -95,10 +108,17 @@ async function startBroker(t) {
     };
 
     socket.on("data", createJsonLineParser(push));
-    socket.once("connect", () => writeJsonLine(socket, hello));
+    // Requests wait for this so the broker always sees the hello (session identity) first.
+    const ready = new Promise((resolve) =>
+      socket.once("connect", () => {
+        writeJsonLine(socket, hello);
+        resolve();
+      })
+    );
 
     return {
       socket,
+      ready,
       closed,
       messages,
       write(message) {
@@ -122,7 +142,7 @@ async function startBroker(t) {
     };
   }
 
-  async function makeHost(pid, { pong = true } = {}) {
+  async function makeHost(pid, { pong = true, profileId, allowed = true, handler, workerId = `worker-${pid}` } = {}) {
     const host = makeClient({ type: "hello", role: "native-host", pid });
     host.pong = pong;
     host.socket.on(
@@ -131,10 +151,34 @@ async function startBroker(t) {
         if (message?.type === "to_extension" && message.message?.type === "ping" && host.pong) {
           host.write({ type: "from_extension", message: { type: "pong" } });
         }
+        if (handler && message?.type === "to_extension" && message.message?.type === "tool_request") {
+          const { id, tool, args } = message.message;
+          Promise.resolve()
+            .then(() => handler(tool, args))
+            .then(
+              (result) => host.write({ type: "from_extension", message: { type: "tool_response", id, result } }),
+              (err) => host.write({ type: "from_extension", message: { type: "tool_response", id, error: { content: err.message } } })
+            );
+        }
       })
     );
     await host.nextMessage((message) => message.type === "host_ready");
+    if (profileId) {
+      host.write({ type: "from_extension", message: { type: "identify", profileId, allowed, workerId } });
+    }
     return host;
+  }
+
+  // Identify messages arrive on host sockets; wait until the broker reports them before routing.
+  async function waitForProfiles(client, expected) {
+    const deadline = Date.now() + 3000;
+    let requestId = 9000;
+    while (Date.now() < deadline) {
+      const status = await request(client, requestId++, "status");
+      const seen = status.data.hosts.filter((h) => h.profileId).length;
+      if (seen >= expected) return status;
+    }
+    throw new Error(`Timed out waiting for ${expected} identified hosts`);
   }
 
   function makePlugin(sessionId = "session-test") {
@@ -142,16 +186,42 @@ async function startBroker(t) {
   }
 
   async function request(client, id, op, extra = {}) {
+    await client.ready;
     client.write({ type: "request", id, op, ...extra });
     return await client.nextMessage((message) => message.type === "response" && message.id === id);
   }
 
-  return { child, logs, makeHost, makePlugin, request };
+  return { child, logs, makeClient, makeHost, makePlugin, request, waitForProfiles };
+}
+
+function toolRequests(host, tool) {
+  return host.messages.filter(
+    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === tool
+  );
+}
+
+function tabsHandler(tabs, summary = {}) {
+  return (tool, args) => {
+    if (tool === "get_tabs") return { content: JSON.stringify(tabs) };
+    if (tool === "profile_summary") return { content: { tabCount: tabs.length, windowCount: 1, domains: [], ...summary } };
+    if (tool === "open_tab") return { tabId: 500 + tabs.length, content: { tabId: 500 + tabs.length } };
+    return { tabId: args.tabId, content: `${tool} ok` };
+  };
 }
 
 function isToolRequest(tool) {
   return (message) => message?.type === "to_extension" && message.message?.type === "tool_request" && message.message.tool === tool;
 }
+
+test("handoff messages identify the routed profile and account", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(901, { profileId: "b@x.test", handler: tabsHandler([]) });
+  const plugin = broker.makePlugin();
+  await broker.waitForProfiles(plugin, 1);
+  const result = await broker.request(plugin, 1, "tool", { tool: "request_user", args: { profile: "work", message: "Please sign in." } });
+  assert.equal(result.ok, true);
+  assert.equal(toolRequests(host, "request_user")[0].message.args.message, "[work · b@x.test] Please sign in.");
+});
 
 test("orphan host remains connected when newer host closes", async (t) => {
   const broker = await startBroker(t);
@@ -180,31 +250,28 @@ test("unresponsive host is reaped", async (t) => {
   assert.equal(status.data.hostConnected, false);
 });
 
-test("pending requests reject per host and next request routes to older healthy host", async (t) => {
+test("pending requests reject per host and a pinned session never falls over to another profile", async (t) => {
   const broker = await startBroker(t);
-  const hostA = await broker.makeHost(301, { pong: true });
-  const hostB = await broker.makeHost(302, { pong: true });
+  const hostA = await broker.makeHost(301, { profileId: "a@x.test" });
+  const hostB = await broker.makeHost(302, { profileId: "b@x.test" });
   const plugin = broker.makePlugin();
+  await broker.waitForProfiles(plugin, 2);
 
-  plugin.write({ type: "request", id: 1, op: "tool", tool: "get_tabs", args: {} });
-  const hostBRequest = await hostB.nextMessage(isToolRequest("get_tabs"));
-  assert.equal(hostBRequest.message.tool, "get_tabs");
+  const pinned = await broker.request(plugin, 1, "use_profile", { profile: "work" });
+  assert.equal(pinned.ok, true);
+  assert.equal(pinned.data.profile, "work");
 
+  plugin.write({ type: "request", id: 2, op: "tool", tool: "get_tabs", args: {} });
+  await hostB.nextMessage(isToolRequest("get_tabs"));
   hostB.destroy();
-  const rejected = await plugin.nextMessage((message) => message.type === "response" && message.id === 1);
+  const rejected = await plugin.nextMessage((message) => message.type === "response" && message.id === 2);
   assert.equal(rejected.ok, false);
   assert.match(rejected.error, /Native host disconnected/);
 
-  plugin.write({ type: "request", id: 2, op: "tool", tool: "get_tabs", args: {} });
-  const hostARequest = await hostA.nextMessage(isToolRequest("get_tabs"));
-  hostA.write({
-    type: "from_extension",
-    message: { type: "tool_response", id: hostARequest.message.id, result: [{ id: 1, title: "ok" }] },
-  });
-
-  const resolved = await plugin.nextMessage((message) => message.type === "response" && message.id === 2);
-  assert.equal(resolved.ok, true);
-  assert.deepEqual(resolved.data, [{ id: 1, title: "ok" }]);
+  const next = await broker.request(plugin, 3, "tool", { tool: "get_tabs", args: {} });
+  assert.equal(next.ok, false);
+  assert.match(next.error, /^PROFILE_NOT_CONNECTED: .*work/);
+  assert.equal(toolRequests(hostA, "get_tabs").length, 0, "must not silently switch to another profile");
 });
 
 test("routing prefers older healthy host when newest host stops ponging", async (t) => {
@@ -272,123 +339,113 @@ test("stale host is unhealthy in status before the socket is reaped", async (t) 
   );
 });
 
-test("wantsTab tool without tabId uses active tab before creating one", async (t) => {
+test("tool without tabId works in a background session tab, not the user's active tab", async (t) => {
   const broker = await startBroker(t);
-  const host = await broker.makeHost(701, { pong: true });
-  const plugin = broker.makePlugin("session-active-tab");
-
-  host.socket.on(
-    "data",
-    createJsonLineParser((message) => {
-      if (message?.type !== "to_extension" || message.message?.type !== "tool_request") return;
-      const { id, tool } = message.message;
-      if (tool === "get_active_tab") {
-        host.write({
-          type: "from_extension",
-          message: {
-            type: "tool_response",
-            id,
-            result: { tabId: 42, content: { tabId: 42, url: "https://example.com", title: "Example" } },
-          },
-        });
-      } else if (tool === "click") {
-        host.write({
-          type: "from_extension",
-          message: { type: "tool_response", id, result: { tabId: 42, content: "Clicked #go" } },
-        });
-      } else if (tool === "open_tab") {
-        host.write({
-          type: "from_extension",
-          message: { type: "tool_response", id, result: { tabId: 99, content: { tabId: 99 } } },
-        });
-      } else {
-        host.write({
-          type: "from_extension",
-          message: { type: "tool_response", id, error: { content: `unexpected tool ${tool}` } },
-        });
-      }
-    })
-  );
-
-  plugin.write({
-    type: "request",
-    id: 1,
-    op: "tool",
-    tool: "click",
-    args: { selector: "#go" },
-    sessionId: "session-active-tab",
+  const host = await broker.makeHost(701, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: 99, content: { tabId: 99 } };
+      if (tool === "click") return { tabId: args.tabId, content: "Clicked #go" };
+      throw new Error(`unexpected tool ${tool}`);
+    },
   });
-  const response = await plugin.nextMessage((m) => m.type === "response" && m.id === 1, 5000);
-  assert.equal(response.ok, true);
+  const plugin = broker.makePlugin("session-background-tab");
 
-  const openTabRequests = host.messages.filter(
-    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "open_tab"
-  );
-  assert.equal(openTabRequests.length, 0, "must not open a new tab when active tab is claimable");
+  const first = await broker.request(plugin, 1, "tool", { tool: "click", args: { selector: "#go" }, sessionId: "session-background-tab" });
+  assert.equal(first.ok, true);
+  const second = await broker.request(plugin, 2, "tool", { tool: "click", args: { selector: "#go" }, sessionId: "session-background-tab" });
+  assert.equal(second.ok, true);
 
-  const getActive = host.messages.filter(
-    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "get_active_tab"
-  );
-  assert.ok(getActive.length >= 1);
-
-  const clickReq = host.messages.filter(
-    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "click"
-  );
-  assert.equal(clickReq.length, 1);
-  assert.equal(clickReq[0].message.args.tabId, 42);
+  assert.equal(toolRequests(host, "get_active_tab").length, 0, "must not read or take over the active tab");
+  const opens = toolRequests(host, "open_tab");
+  assert.equal(opens.length, 1, "second call reuses the session tab");
+  assert.equal(opens[0].message.args.active, false);
+  assert.deepEqual(toolRequests(host, "click").map((m) => m.message.args.tabId), [99, 99]);
 });
 
-test("wantsTab tool creates tab when active tab is owned by another session", async (t) => {
+test("a closed session tab is replaced; a closed explicit tab fails with TAB_NOT_FOUND and is forgotten", async (t) => {
   const broker = await startBroker(t);
-  const host = await broker.makeHost(702, { pong: true });
-
-  const pluginA = broker.makePlugin("session-a");
-  await broker.request(pluginA, 1, "claim_tab", { tabId: 42 });
-
-  const pluginB = broker.makePlugin("session-b");
-  host.socket.on(
-    "data",
-    createJsonLineParser((message) => {
-      if (message?.type !== "to_extension" || message.message?.type !== "tool_request") return;
-      const { id, tool, args } = message.message;
-      if (tool === "get_active_tab") {
-        host.write({
-          type: "from_extension",
-          message: { type: "tool_response", id, result: { tabId: 42, content: { tabId: 42 } } },
-        });
-      } else if (tool === "open_tab") {
-        host.write({
-          type: "from_extension",
-          message: { type: "tool_response", id, result: { tabId: 77, content: { tabId: 77 } } },
-        });
-      } else if (tool === "click") {
-        host.write({
-          type: "from_extension",
-          message: { type: "tool_response", id, result: { tabId: args.tabId, content: "Clicked" } },
-        });
-      }
-    })
-  );
-
-  pluginB.write({
-    type: "request",
-    id: 2,
-    op: "tool",
-    tool: "click",
-    args: { selector: "#x" },
-    sessionId: "session-b",
+  let nextTab = 40;
+  const closed = new Set();
+  const host = await broker.makeHost(702, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: ++nextTab, content: { tabId: nextTab } };
+      if (closed.has(args.tabId)) throw new Error(`TAB_NOT_FOUND: Tab ${args.tabId} no longer exists`);
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
   });
-  const response = await pluginB.nextMessage((m) => m.type === "response" && m.id === 2, 5000);
-  assert.equal(response.ok, true);
+  const plugin = broker.makePlugin("session-stale-tab");
+  const call = (id, args) => broker.request(plugin, id, "tool", { tool: "click", args, sessionId: "session-stale-tab" });
 
-  const openTabRequests = host.messages.filter(
-    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "open_tab"
+  assert.equal((await call(1, { selector: "#a" })).ok, true);
+  closed.add(41);
+  const recovered = await call(2, { selector: "#a" });
+  assert.equal(recovered.ok, true, "implicit session tab is replaced transparently");
+  assert.deepEqual(toolRequests(host, "click").map((m) => m.message.args.tabId), [41, 41, 42]);
+
+  closed.add(42);
+  const explicit = await call(3, { selector: "#a", tabId: 42 });
+  assert.equal(explicit.ok, false);
+  assert.match(explicit.error, /TAB_NOT_FOUND/);
+  const claims = await broker.request(plugin, 4, "list_claims");
+  assert.equal(claims.data.claims.some((c) => c.tabId === 42), false, "closed tab claim is released");
+});
+
+test("tab groups are named from the site, then the agent's name, with the harness; claims show the owner", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(703, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: 70, content: { tabId: 70 } };
+      if (tool === "name_group") return { content: { title: args.title, groups: [9] } };
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const plugin = broker.makeClient({ type: "hello", role: "plugin", sessionId: "session-named", harness: "omo", project: "iris" });
+  const tool = (id, name, args) => broker.request(plugin, id, "tool", { tool: name, args, sessionId: "session-named" });
+
+  assert.equal((await tool(1, "open_tab", { url: "https://app.codeable.io/tasks/1" })).ok, true);
+  assert.equal(toolRequests(host, "open_tab")[0].message.args.group, "codeable · omo");
+
+  const named = await broker.request(plugin, 2, "name_group", { name: "Neverland venue quote", color: "blue" });
+  assert.equal(named.ok, true);
+  assert.equal(named.data.title, "Neverland venue quote · omo");
+  const rename = toolRequests(host, "name_group")[0].message.args;
+  assert.deepEqual([rename.tabIds, rename.title, rename.color], [[70], "Neverland venue quote · omo", "blue"]);
+
+  const claims = (await broker.request(plugin, 3, "list_claims")).data.claims;
+  assert.deepEqual(
+    claims.map((c) => [c.tabId, c.harness, c.project, c.group]),
+    [[70, "omo", "iris", "Neverland venue quote · omo"]]
   );
-  assert.ok(openTabRequests.length >= 1, "must open a new tab when active is foreign-owned");
-  const clickReq = host.messages.filter(
-    (m) => m?.type === "to_extension" && m.message?.type === "tool_request" && m.message.tool === "click"
-  );
-  assert.ok(clickReq.some((m) => m.message.args.tabId === 77));
+  assert.equal((await broker.request(plugin, 4, "name_group", { name: "x", color: "magenta" })).ok, false, "unknown color is rejected");
+});
+
+test("a session that reconnects rejoins its own tab group and keeps its name", async (t) => {
+  const broker = await startBroker(t);
+  let nextTab = 80;
+  const host = await broker.makeHost(704, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") {
+        const tabId = nextTab++;
+        return { tabId, content: { tabId, groupId: args.groupId ?? 12 } };
+      }
+      if (tool === "name_group") return { content: { title: args.title, groups: [12] } };
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const hello = { type: "hello", role: "plugin", sessionId: "cli-agent-1", harness: "cli" };
+
+  const first = broker.makeClient(hello);
+  await broker.request(first, 1, "tool", { tool: "open_tab", args: { url: "https://app.codeable.io/" }, sessionId: "cli-agent-1" });
+  await broker.request(first, 2, "name_group", { name: "Quote follow-up" });
+  const closed = new Promise((resolve) => first.socket.once("close", resolve));
+  first.socket.end();
+  await closed;
+
+  const second = broker.makeClient(hello);
+  await broker.request(second, 3, "tool", { tool: "open_tab", args: { url: "https://example.com/" }, sessionId: "cli-agent-1" });
+  const reopened = toolRequests(host, "open_tab")[1].message.args;
+  assert.equal(reopened.groupId, 12, "the second tab is sent to the remembered group");
+  assert.equal(reopened.group, "Quote follow-up · cli", "the name survives the reconnect");
 });
 
 test("claim_tab broadcasts claims to the extension host", async (t) => {
@@ -444,4 +501,450 @@ test("ping payload includes current claims", async (t) => {
     2000
   );
   assert.ok(ping.message.claims.some((c) => c.tabId === 91));
+});
+
+test("several connected profiles and no choice is an error, not a guess", async (t) => {
+  const broker = await startBroker(t);
+  const hostA = await broker.makeHost(901, { profileId: "a@x.test", handler: tabsHandler([]) });
+  const hostB = await broker.makeHost(902, { profileId: "b@x.test", handler: tabsHandler([]) });
+  const plugin = broker.makePlugin("session-ambiguous");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "tool", { tool: "click", args: { selector: "#go" } });
+  assert.equal(response.ok, false);
+  assert.match(response.error, /^PROFILE_REQUIRED: 2 Chrome profiles are connected \((home, work|work, home)\)/);
+  assert.equal(toolRequests(hostA, "click").length + toolRequests(hostB, "click").length, 0);
+  assert.equal(toolRequests(hostA, "open_tab").length + toolRequests(hostB, "open_tab").length, 0);
+});
+
+test("get_tabs without a profile lists every profile's tabs, labeled by profile", async (t) => {
+  const broker = await startBroker(t);
+  await broker.makeHost(911, { profileId: "a@x.test", handler: tabsHandler([{ id: 101, url: "https://home.example/" }]) });
+  await broker.makeHost(912, { profileId: "b@x.test", handler: tabsHandler([{ id: 202, url: "https://work.example/" }]) });
+  const plugin = broker.makePlugin("session-fanout");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "tool", { tool: "get_tabs", args: {} });
+  assert.equal(response.ok, true);
+  const tabs = JSON.parse(response.data.content).sort((a, b) => a.id - b.id);
+  assert.deepEqual(tabs.map((tab) => [tab.id, tab.profile]), [[101, "home"], [202, "work"]]);
+});
+
+test("history search without a profile searches every profile and labels results", async (t) => {
+  const broker = await startBroker(t);
+  const history = (url) => (tool) =>
+    tool === "search_history" ? { content: JSON.stringify([{ url, title: "t" }]) } : tabsHandler([])(tool, {});
+  await broker.makeHost(913, { profileId: "a@x.test", handler: history("https://home.example/") });
+  await broker.makeHost(914, { profileId: "b@x.test", handler: history("https://work.example/") });
+  const plugin = broker.makePlugin("session-history");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "tool", { tool: "search_history", args: { query: "example" } });
+  assert.equal(response.ok, true);
+  const rows = JSON.parse(response.data.content).sort((a, b) => a.url.localeCompare(b.url));
+  assert.deepEqual(rows.map((row) => [row.url, row.profile]), [["https://home.example/", "home"], ["https://work.example/", "work"]]);
+});
+
+test("a tab opened by a claimed tab is claimed for that session and reported once", async (t) => {
+  const broker = await startBroker(t);
+  const host = await broker.makeHost(915, {
+    handler: (tool, args) => {
+      if (tool === "open_tab") return { tabId: 60, content: { tabId: 60 } };
+      return { tabId: args.tabId, content: `${tool} ok` };
+    },
+  });
+  const plugin = broker.makePlugin("session-popup");
+  const call = (id) => broker.request(plugin, id, "tool", { tool: "click", args: { selector: "#login" }, sessionId: "session-popup" });
+
+  assert.equal((await call(1)).ok, true);
+  host.write({ type: "from_extension", message: { type: "tab_opened", tabId: 61, openerTabId: 60, url: "https://auth.example/", windowType: "popup" } });
+  host.write({ type: "from_extension", message: { type: "tab_opened", tabId: 99, openerTabId: 12345, url: "https://other/" } });
+
+  const deadline = Date.now() + 2000;
+  let claims = [];
+  while (Date.now() < deadline) {
+    claims = (await broker.request(plugin, 100 + claims.length, "list_claims")).data.claims;
+    if (claims.some((c) => c.tabId === 61)) break;
+  }
+  assert.ok(claims.some((c) => c.tabId === 61), "popup is claimed by the opener's session");
+  assert.equal(claims.some((c) => c.tabId === 99), false, "tabs opened by unclaimed tabs are ignored");
+
+  const next = await call(2);
+  assert.deepEqual(next.data.openedTabs, [{ tabId: 61, openerTabId: 60, url: "https://auth.example/", popup: true }]);
+  const after = await call(3);
+  assert.equal(after.data.openedTabs, undefined, "reported only once");
+});
+
+test("explicit profile routes to that profile and pins the session", async (t) => {
+  const broker = await startBroker(t);
+  const hostA = await broker.makeHost(921, { profileId: "a@x.test", handler: tabsHandler([]) });
+  const hostB = await broker.makeHost(922, { profileId: "b@x.test", handler: tabsHandler([]) });
+  const plugin = broker.makePlugin("session-explicit");
+  await broker.waitForProfiles(plugin, 2);
+
+  const opened = await broker.request(plugin, 1, "tool", { tool: "open_tab", args: { url: "https://work.example/", profile: "work" } });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.data.profile, "work");
+  assert.equal(opened.data.content.profile, "work");
+
+  const followUp = await broker.request(plugin, 2, "tool", { tool: "get_tabs", args: {} });
+  assert.equal(followUp.ok, true);
+  assert.equal(toolRequests(hostB, "get_tabs").length, 1);
+  assert.equal(toolRequests(hostA, "get_tabs").length, 0, "pinned session reads only its own profile");
+
+  const status = await broker.request(plugin, 3, "status");
+  assert.equal(status.data.session.profile, "work");
+});
+
+test("a tabId routes to the profile that owns the tab", async (t) => {
+  const broker = await startBroker(t);
+  const hostA = await broker.makeHost(931, { profileId: "a@x.test", handler: tabsHandler([{ id: 101, url: "https://home.example/" }]) });
+  const hostB = await broker.makeHost(932, { profileId: "b@x.test", handler: tabsHandler([{ id: 202, url: "https://work.example/" }]) });
+  const plugin = broker.makePlugin("session-tab-owner");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "tool", { tool: "query", args: { tabId: 202, mode: "page_text" } });
+  assert.equal(response.ok, true);
+  assert.equal(response.data.profile, "work");
+  assert.equal(toolRequests(hostB, "query").length, 1);
+  assert.equal(toolRequests(hostA, "query").length, 0);
+});
+
+test("a profile outside the allowlist is never a routing candidate", async (t) => {
+  const broker = await startBroker(t);
+  const hostA = await broker.makeHost(941, { profileId: "a@x.test", handler: tabsHandler([]) });
+  const blocked = await broker.makeHost(942, { profileId: "c@x.test", allowed: false, handler: tabsHandler([]) });
+  const plugin = broker.makePlugin("session-allowlist");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "tool", { tool: "get_tabs", args: {} });
+  assert.equal(response.ok, true);
+  assert.equal(response.data.profile, "home");
+  assert.equal(toolRequests(hostA, "get_tabs").length, 1);
+  assert.equal(toolRequests(blocked, "get_tabs").length, 0);
+});
+
+test("profiles lists configured and connected profiles with their open sites", async (t) => {
+  const broker = await startBroker(t);
+  await broker.makeHost(951, { profileId: "a@x.test", handler: tabsHandler([], { domains: [{ host: "home.example", count: 2 }] }) });
+  const plugin = broker.makePlugin("session-inventory");
+  await broker.waitForProfiles(plugin, 1);
+
+  const response = await broker.request(plugin, 1, "profiles");
+  assert.equal(response.ok, true);
+  const byName = Object.fromEntries(response.data.profiles.map((p) => [p.profile, p]));
+  assert.equal(byName.home.connected, true);
+  assert.deepEqual(byName.home.openSites, ["home.example"]);
+  assert.equal(byName.home.default, true);
+  assert.equal(byName.work.connected, false);
+  assert.equal(response.data.connectedCount, 1);
+  assert.equal(response.data.decisionModel.available, false);
+});
+
+test("resolve_profile prefers the profile where the site is already open, then pins it", async (t) => {
+  const broker = await startBroker(t);
+  await broker.makeHost(961, {
+    profileId: "a@x.test",
+    handler: tabsHandler([{ id: 101, url: "https://home.example/" }], { domains: [{ host: "home.example", count: 1 }] }),
+  });
+  await broker.makeHost(962, {
+    profileId: "b@x.test",
+    handler: tabsHandler([{ id: 202, url: "https://portal.azure.example/billing", title: "Billing" }], {
+      domains: [{ host: "portal.azure.example", count: 1 }],
+    }),
+  });
+  const plugin = broker.makePlugin("session-resolve");
+  await broker.waitForProfiles(plugin, 2);
+
+  const response = await broker.request(plugin, 1, "resolve_profile", { url: "https://portal.azure.example/", task: "read billing", pin: true });
+  assert.equal(response.ok, true);
+  assert.equal(response.data.profile, "work");
+  assert.equal(response.data.source, "open_tab");
+  assert.equal(response.data.confident, true);
+  assert.deepEqual(response.data.matchingTabs.map((tab) => tab.tabId), [202]);
+  assert.equal(response.data.pinned, true);
+
+  const unknown = await broker.request(plugin, 2, "resolve_profile", { url: "https://elsewhere.example/" });
+  assert.equal(unknown.data.confident, false);
+  assert.equal(unknown.data.profile, null);
+  assert.equal(unknown.data.suggestion, "home");
+});
+
+test("hello with a profile pins the session before the first call", async (t) => {
+  const broker = await startBroker(t);
+  const hostA = await broker.makeHost(971, { profileId: "a@x.test", handler: tabsHandler([]) });
+  const hostB = await broker.makeHost(972, { profileId: "b@x.test", handler: tabsHandler([]) });
+  const watcher = broker.makePlugin("session-watch");
+  await broker.waitForProfiles(watcher, 2);
+
+  const plugin = broker.makePlugin("session-env-pin");
+  plugin.write({ type: "hello", role: "plugin", sessionId: "session-env-pin", profile: "home" });
+  const response = await broker.request(plugin, 1, "tool", { tool: "get_tabs", args: {} });
+  assert.equal(response.ok, true);
+  assert.equal(response.data.profile, "home");
+  assert.equal(toolRequests(hostA, "get_tabs").length, 1);
+  assert.equal(toolRequests(hostB, "get_tabs").length, 0);
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function handoffResult(status, extra = {}) {
+  return { tabId: 77, content: JSON.stringify({ ok: true, status, ...extra }) };
+}
+
+async function pendingHandoff(t, env = {}, handoffOwner) {
+  const broker = await startBroker(t, env);
+  const done = deferred();
+  const cleanup = deferred();
+  const host = await broker.makeHost(1101, {
+    profileId: "a@x.test",
+    handler: (tool, args) => {
+      if (tool === "request_user") return done.promise;
+      if (tool === "request_cancel") return cleanup.promise;
+      return tabsHandler([])(tool, args);
+    },
+  });
+  const plugin = broker.makePlugin("handoff-owner");
+  await broker.waitForProfiles(plugin, 1);
+  const started = await broker.request(plugin, 1, "tool", {
+    tool: "request_user", args: { wait: false, tabId: 77, message: "Please continue", handoffOwner },
+  });
+  assert.equal(started.ok, true);
+  assert.deepEqual(started.data, { ok: true, status: "pending", requestId: started.data.requestId, tabId: 77, profile: "home" });
+  assert.match(started.data.requestId, /^[0-9a-f-]{36}$/);
+  const forwarded = await host.nextMessage(isToolRequest("request_user"));
+  assert.equal(forwarded.message.args.requestId, started.data.requestId);
+  assert.equal(forwarded.message.args.handoffOwner, undefined);
+  assert.equal(forwarded.message.args.message, "[home · a@x.test] Please continue");
+  const control = (client, id, tool = "request_status", args = {}) => broker.request(client, id, "tool", {
+    tool, args: { requestId: started.data.requestId, ...args },
+  });
+  return { broker, host, plugin, done, cleanup, started, control };
+}
+
+async function terminalStatus(control, plugin, firstId = 20) {
+  for (let id = firstId; id < firstId + 100; id++) {
+    const response = await control(plugin, id);
+    if (!response.ok || response.data.status !== "pending") return response;
+    await wait(5);
+  }
+  throw new Error("Handoff did not become terminal");
+}
+
+test("async handoffs reject cross-session, profile, tab and forged session access", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t);
+  await broker.makeHost(1102, { profileId: "b@x.test", handler: tabsHandler([]) });
+  await broker.waitForProfiles(plugin, 2);
+  const stranger = broker.makePlugin("handoff-stranger");
+  for (const [index, tool] of ["request_status", "request_cancel"].entries()) {
+    assert.equal((await control(stranger, 2 + index, tool)).ok, false);
+    assert.equal((await control(plugin, 4 + index, tool, { profile: "work" })).ok, false);
+    assert.equal((await control(plugin, 6 + index, tool, { tabId: 88 })).ok, false);
+  }
+  const forged = await broker.request(stranger, 8, "tool", {
+    sessionId: "handoff-owner", tool: "request_status", args: { requestId: "unused" },
+  });
+  assert.equal(forged.ok, false);
+  assert.match(forged.error, /Session identity mismatch/);
+  assert.equal((await control(plugin, 9)).data.status, "pending");
+  assert.equal(toolRequests(host, "request_status").length, 0);
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+});
+
+test("async terminal content is retained then expires", async (t) => {
+  const { plugin, done, control } = await pendingHandoff(t, { IRIS_REQUEST_RETENTION_MS: "180" });
+  const terminal = handoffResult("unreadable_page", { reason: "Restricted page" });
+  done.resolve(terminal);
+  const response = await terminalStatus(control, plugin);
+  assert.equal(response.data.status, "unreadable_page");
+  assert.equal(response.data.content, terminal.content);
+  await wait(240);
+  const expired = await control(plugin, 121);
+  assert.equal(expired.ok, false);
+  assert.match(expired.error, /REQUEST_NOT_FOUND/);
+});
+
+test("cancel waits for cleanup and completion racing cancellation wins", async (t) => {
+  const { host, plugin, done, cleanup, control } = await pendingHandoff(t);
+  const cancellation = control(plugin, 2, "request_cancel");
+  await host.nextMessage(isToolRequest("request_cancel"));
+  assert.equal(plugin.messages.some((m) => m.type === "response" && m.id === 2), false);
+  done.resolve(handoffResult("condition_met"));
+  assert.equal((await terminalStatus(control, plugin)).data.status, "condition_met");
+  assert.equal(plugin.messages.some((m) => m.type === "response" && m.id === 2), false);
+  cleanup.resolve(handoffResult("cancelled", { reason: "requested" }));
+  assert.equal((await cancellation).data.status, "condition_met");
+  assert.equal((await control(plugin, 121, "request_cancel")).data.status, "condition_met");
+  assert.equal(toolRequests(host, "request_cancel").length, 1);
+});
+
+test("cancel wins before late completion and repeated cancels share cleanup", async (t) => {
+  const { host, plugin, done, cleanup, control } = await pendingHandoff(t);
+  const first = control(plugin, 2, "request_cancel");
+  const second = control(plugin, 3, "request_cancel");
+  await host.nextMessage(isToolRequest("request_cancel"));
+  cleanup.resolve(handoffResult("cancelled", { reason: "requested" }));
+  assert.equal((await first).data.status, "cancelled");
+  assert.equal((await second).data.status, "cancelled");
+  done.resolve(handoffResult("user_done"));
+  assert.equal((await control(plugin, 4)).data.status, "cancelled");
+  assert.equal(toolRequests(host, "request_cancel").length, 1);
+});
+
+test("pending handoff renews short leases after client disconnect without polling", async (t) => {
+  const { broker, plugin, done, started } = await pendingHandoff(t, { IRIS_CLAIM_TTL_MS: "80" });
+  plugin.destroy();
+  await plugin.closed;
+  await wait(280);
+  const observer = broker.makePlugin("lease-observer");
+  const claims = await broker.request(observer, 1, "list_claims");
+  assert.ok(claims.data.claims.some((claim) => claim.tabId === 77 && claim.sessionId === "handoff-owner"));
+  const reconnected = broker.makePlugin("handoff-owner");
+  const status = await broker.request(reconnected, 2, "tool", {
+    tool: "request_status", args: { requestId: started.data.requestId },
+  });
+  assert.equal(status.data.status, "pending");
+  done.resolve(handoffResult("user_done"));
+});
+
+test("host disconnect cancels pending handoff and reconnect cleans orphan banner", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t);
+  host.destroy();
+  await host.closed;
+  const status = await terminalStatus(control, plugin);
+  assert.equal(status.data.status, "cancelled");
+  assert.match(status.data.reason, /Native host disconnected/);
+  const replacement = await broker.makeHost(1103, { profileId: "a@x.test", handler: () => handoffResult("cancelled") });
+  await replacement.nextMessage(isToolRequest("request_cancel"));
+  assert.equal((await control(plugin, 121)).data.reason, "Native host disconnected");
+});
+
+test("identity refresh keeps handoff pending but changed worker cancels with bounded cleanup", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t, { IRIS_REQUEST_CLEANUP_MS: "40" });
+  host.write({ type: "from_extension", message: { type: "identify", profileId: "a@x.test", workerId: "worker-1101" } });
+  // Host and plugin use separate sockets; a same-host request is an ordering barrier for identify.
+  await broker.request(plugin, 10, "tool", { tool: "get_tabs", args: {} });
+  assert.equal((await control(plugin, 11)).data.status, "pending");
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+  host.write({ type: "from_extension", message: { type: "identify", profileId: "a@x.test" } });
+  await broker.request(plugin, 12, "tool", { tool: "get_tabs", args: {} });
+  assert.equal((await control(plugin, 13)).data.status, "pending");
+  host.write({ type: "from_extension", message: { type: "identify", profileId: "a@x.test", workerId: "worker-restarted" } });
+  await host.nextMessage(isToolRequest("request_cancel"));
+  const status = await control(plugin, 2);
+  assert.equal(status.data.status, "cancelled");
+  assert.match(status.data.reason, /worker reconnected/);
+  await wait(80);
+  assert.equal((await control(plugin, 3)).data.status, "cancelled");
+});
+
+test("unresponsive cancellation cleanup is bounded", async (t) => {
+  const { plugin, control } = await pendingHandoff(t, { IRIS_REQUEST_CLEANUP_MS: "40" });
+  const cancelled = await control(plugin, 2, "request_cancel");
+  assert.equal(cancelled.data.status, "cancelled");
+  assert.match(cancelled.data.reason, /Cancellation cleanup failed: Timed out/);
+});
+
+test("pending handoff refuses duplicate tab requests and never resurrects a released claim", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t, { IRIS_CLAIM_TTL_MS: "80" });
+  const duplicate = await broker.request(plugin, 2, "tool", {
+    tool: "request_user", args: { wait: false, tabId: 77, message: "Duplicate" },
+  });
+  assert.equal(duplicate.ok, false);
+  assert.match(duplicate.error, /REQUEST_PENDING/);
+  assert.equal(toolRequests(host, "request_user").length, 1);
+  await broker.request(plugin, 3, "release_tab", { tabId: 77 });
+  await wait(130);
+  assert.equal((await broker.request(plugin, 4, "list_claims")).data.claims.some((claim) => claim.tabId === 77), false);
+  const terminal = await control(plugin, 5);
+  assert.equal(terminal.data.status, "cancelled");
+  assert.equal(terminal.data.reason, "Tab claim released");
+  await host.nextMessage(isToolRequest("request_cancel"));
+});
+
+test("async start requires selecting the routed tab's profile first", async (t) => {
+  const broker = await startBroker(t);
+  await broker.makeHost(1201, { profileId: "a@x.test", handler: tabsHandler([{ id: 101 }]) });
+  const work = await broker.makeHost(1202, {
+    profileId: "b@x.test",
+    handler: (tool, args) => tool === "request_user" ? new Promise(() => {}) : tabsHandler([{ id: 202 }])(tool, args),
+  });
+  const plugin = broker.makePlugin("cross-profile-start");
+  await broker.waitForProfiles(plugin, 2);
+  await broker.request(plugin, 1, "tool", { tool: "get_tabs", args: {} });
+  await broker.request(plugin, 2, "use_profile", { profile: "home" });
+  const start = (id, profile) => broker.request(plugin, id, "tool", {
+    tool: "request_user", args: { wait: false, tabId: 202, message: "Continue", ...(profile ? { profile } : {}) },
+  });
+  for (const [id, profile] of [[3, undefined], [4, "work"]]) {
+    const rejected = await start(id, profile);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error, /REQUEST_OWNERSHIP: Select the target profile/);
+  }
+  assert.equal(toolRequests(work, "request_user").length, 0);
+  await broker.request(plugin, 5, "use_profile", { profile: "work" });
+  assert.equal((await start(6)).data.status, "pending");
+});
+
+test("switching profile blocks handoff controls until switching back", async (t) => {
+  const { broker, plugin, control } = await pendingHandoff(t);
+  await broker.makeHost(1203, { profileId: "b@x.test", handler: tabsHandler([]) });
+  await broker.waitForProfiles(plugin, 2);
+  await broker.request(plugin, 2, "use_profile", { profile: "work" });
+  assert.equal((await control(plugin, 3)).ok, false);
+  assert.equal((await control(plugin, 4, "request_status", { profile: "home" })).ok, false);
+  assert.equal((await control(plugin, 5, "request_cancel", { profile: "home" })).ok, false);
+  await broker.request(plugin, 6, "use_profile", { profile: "home" });
+  assert.equal((await control(plugin, 7)).data.status, "pending");
+});
+
+test("forced claim transfer cancels former owner's handoff before another session observes", async (t) => {
+  const { broker, host, plugin, done, cleanup, control } = await pendingHandoff(t);
+  const other = broker.makePlugin("new-tab-owner");
+  const transferred = await broker.request(other, 1, "claim_tab", { tabId: 77, force: true });
+  assert.equal(transferred.ok, true);
+  const terminal = await control(plugin, 2);
+  assert.equal(terminal.data.status, "cancelled");
+  assert.equal(terminal.data.reason, "Tab claim transferred");
+  await host.nextMessage(isToolRequest("request_cancel"));
+  cleanup.resolve(handoffResult("cancelled"));
+  done.resolve(handoffResult("condition_met", { observed: "new owner's data" }));
+  const later = await control(plugin, 3);
+  assert.equal(later.data.status, "cancelled");
+  assert.equal(later.data.observed, undefined);
+  assert.equal((await broker.request(other, 2, "list_claims")).data.claims.find((claim) => claim.tabId === 77).sessionId, "new-tab-owner");
+});
+
+test("shared transport handoffs require the exact internal conversation owner", async (t) => {
+  const { host, plugin, cleanup, control } = await pendingHandoff(t, {}, "conversation-a");
+  for (const [index, tool] of ["request_status", "request_cancel"].entries()) {
+    assert.equal((await control(plugin, 2 + index, tool, { handoffOwner: "conversation-b" })).ok, false);
+    assert.equal((await control(plugin, 4 + index, tool)).ok, false);
+  }
+  assert.equal((await control(plugin, 6, "request_status", { handoffOwner: "conversation-a" })).data.status, "pending");
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+  cleanup.resolve(handoffResult("cancelled"));
+  assert.equal((await control(plugin, 7, "request_cancel", { handoffOwner: "conversation-a" })).data.status, "cancelled");
+});
+
+test("claim and release require the same-session pending handoff owner before cancelling", async (t) => {
+  const { broker, host, plugin, control } = await pendingHandoff(t, {}, "conversation-a");
+  const attempts = [
+    [2, plugin, "release_tab", { tabId: 77, handoffOwner: "conversation-b" }],
+    [3, plugin, "release_tab", { tabId: 77 }],
+    [4, plugin, "claim_tab", { tabId: 77, force: true, handoffOwner: "conversation-b" }],
+  ];
+  for (const [id, client, op, extra] of attempts) {
+    const response = await broker.request(client, id, op, extra);
+    assert.equal(response.ok, false);
+    assert.match(response.error, /REQUEST_OWNERSHIP/);
+  }
+  assert.equal((await control(plugin, 6, "request_status", { handoffOwner: "conversation-a" })).data.status, "pending");
+  assert.equal(toolRequests(host, "request_cancel").length, 0);
+  assert.equal((await broker.request(plugin, 7, "release_tab", { tabId: 77, handoffOwner: "conversation-a" })).data.released, true);
+  assert.equal((await control(plugin, 8, "request_status", { handoffOwner: "conversation-a" })).data.status, "cancelled");
 });

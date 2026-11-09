@@ -39,8 +39,36 @@ function toStructuredContent(value: unknown): Record<string, unknown> | undefine
   return { value };
 }
 
+
+// Screenshots arrive as a data URL, or as JSON with an `image` data URL plus metadata. Return them as image
+// content so the model sees a picture instead of a base64 string.
+function splitImage(text: string): { image?: { data: string; mimeType: string }; rest?: string } {
+  const asImage = (url: unknown) => {
+    const match = typeof url === "string" ? url.match(/^data:(image\/[a-z+]+);base64,([\s\S]+)$/) : null;
+    return match ? { mimeType: match[1], data: match[2] } : undefined;
+  };
+  if (text.startsWith("data:image/")) return { image: asImage(text) };
+  if (text.startsWith('{"image"')) {
+    try {
+      const { image, ...rest } = JSON.parse(text);
+      const parsed = asImage(image);
+      if (parsed) return { image: parsed, rest: JSON.stringify(rest, null, 2) };
+    } catch {}
+  }
+  return {};
+}
+
 function normalizeResult(result: unknown) {
   if (typeof result === "string") {
+    const { image, rest } = splitImage(result);
+    if (image) {
+      return {
+        content: [
+          { type: "image" as const, data: image.data, mimeType: image.mimeType },
+          ...(rest ? [{ type: "text" as const, text: rest }] : []),
+        ],
+      };
+    }
     try {
       const parsed = JSON.parse(result);
       return {
@@ -109,6 +137,15 @@ async function main() {
       async (args) => normalizeResult(await tool.execute((args as Record<string, unknown>) || {}, {}))
     );
   }
+
+  // Name the harness after the MCP client (omo, codex, hermes, ...) so tab groups and claims show who owns them.
+  server.server.oninitialized = () => {
+    if (process.env.IRIS_HARNESS) return;
+    const client = String(server.server.getClientVersion()?.name || "").toLowerCase();
+    const known = [["senpi", "omo"], ["omo", "omo"], ["codex", "codex"], ["hermes", "hermes"], ["claude", "claude"], ["cursor", "cursor"]];
+    const match = known.find(([needle]) => client.includes(needle));
+    process.env.IRIS_HARNESS = match ? match[1] : client.replace(/[-_ ]?mcp[-_ ]?client$/, "").slice(0, 16) || "mcp";
+  };
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

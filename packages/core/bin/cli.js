@@ -12,6 +12,7 @@
  *   status    - Show installation and live status
  *   doctor    - Diagnose broker/extension connectivity
  *   reconnect - Restart the local broker/native-host pipeline
+ *   open-profile <alias|email> - Open a window in that Chrome profile so its extension connects
  */
 
 import {
@@ -44,6 +45,7 @@ const EXTENSION_MANIFEST_PATH = join(PACKAGE_ROOT, "extension", "manifest.json")
 const BROKER_DST = join(BASE_DIR, "broker.cjs");
 const BROWSER_CLI_DST = join(BASE_DIR, "browser-cli.cjs");
 const NATIVE_HOST_DST = join(BASE_DIR, "native-host.cjs");
+const DECISION_DST = join(BASE_DIR, "decision.cjs");
 const NATIVE_HOST_WRAPPER = join(BASE_DIR, "host-wrapper.sh");
 const CONFIG_DST = join(BASE_DIR, "config.json");
 const BROKER_SOCKET = join(BASE_DIR, "broker.sock");
@@ -215,6 +217,9 @@ function writeHostWrapper(nodePath) {
     `# Prefer a stable Node symlink so runtime updates do not break Chrome native messaging.\n` +
     `NODE=${shellQuote(nodePath)}\n` +
     `[ -x "$NODE" ] || NODE="$(command -v node)"\n` +
+    `# Chrome passes its login environment to the host; a compile cache on a drive Chrome may not read\n` +
+    `# (external volumes need macOS permission) blocks Node before the host starts. The host does not need it.\n` +
+    `unset NODE_COMPILE_CACHE\n` +
     `exec "$NODE" ${shellQuote(NATIVE_HOST_DST)}\n`;
   writeFileSync(NATIVE_HOST_WRAPPER, script, { mode: 0o755 });
   chmodSync(NATIVE_HOST_WRAPPER, 0o755);
@@ -304,7 +309,11 @@ function sleep(ms) {
 function spawnBroker() {
   ensureDir(BASE_DIR);
   const out = openSync(join(BASE_DIR, "broker.log"), "a");
-  const child = spawn(process.execPath, [BROKER_DST], { detached: true, stdio: ["ignore", "ignore", out] });
+  // Use the Node recorded at install time, not whichever Node happened to run this CLI (it may be a
+  // tool-private runtime that later moves or upgrades).
+  const configured = loadConfig()?.nodePath;
+  const nodePath = configured && existsSync(configured) ? configured : resolveNodePath();
+  const child = spawn(nodePath, [BROKER_DST], { detached: true, stdio: ["ignore", "ignore", out] });
   child.unref();
 }
 
@@ -375,12 +384,15 @@ function loadConfig(configPath = CONFIG_DST) {
   }
 }
 
+// Merge into the existing file so user-owned keys (profiles, decisionModel, ...) survive install/update.
 function saveConfig(config, configPath = CONFIG_DST) {
   ensureDir(dirname(configPath));
+  const existing = loadConfig(configPath) || {};
   writeFileSync(
     configPath,
     JSON.stringify(
       {
+        ...existing,
         ...config,
         profileEmails: normalizeProfileEmails(config?.profileEmails),
       },
@@ -394,10 +406,12 @@ function installRuntimeFiles() {
   const brokerSrc = join(PACKAGE_ROOT, "bin", "broker.cjs");
   const browserCliSrc = join(PACKAGE_ROOT, "bin", "browser-cli.cjs");
   const nativeHostSrc = join(PACKAGE_ROOT, "bin", "native-host.cjs");
+  const decisionSrc = join(PACKAGE_ROOT, "bin", "decision.cjs");
 
   copyFileSync(brokerSrc, BROKER_DST);
   copyFileSync(browserCliSrc, BROWSER_CLI_DST);
   copyFileSync(nativeHostSrc, NATIVE_HOST_DST);
+  copyFileSync(decisionSrc, DECISION_DST);
 
   try {
     chmodSync(BROKER_DST, 0o755);
@@ -465,6 +479,8 @@ ${color("cyan", "Browser automation runtime (native messaging + per-tab ownershi
     await agentInstall();
   } else if (command === "agent-gateway") {
     await agentGateway();
+  } else if (command === "open-profile") {
+    await openProfile(process.argv[3]);
   } else {
     log(`
 ${color("bright", "Usage:")}
@@ -477,6 +493,7 @@ ${color("bright", "Usage:")}
   iris uninstall
   iris agent-install
   iris agent-gateway
+  iris open-profile <alias|email>
 
 ${color("bright", "Options:")}
   --extension-id <id> (or IRIS_EXTENSION_ID / OPENCODE_BROWSER_EXTENSION_ID)
@@ -847,6 +864,7 @@ Find it at ${color("cyan", "chrome://extensions")}:
   success(`Updated broker: ${BROKER_DST}`);
   success(`Updated browser CLI: ${BROWSER_CLI_DST}`);
   success(`Updated native host: ${NATIVE_HOST_DST}`);
+  success(`Updated decision module: ${DECISION_DST}`);
 
   const nodePath = resolveNodePath();
   if (!/node(\.exe)?$/.test(nodePath)) {
@@ -1009,6 +1027,7 @@ async function status() {
   } else {
     warn(`Extension: NOT connected (hosts: ${hostCount})`);
   }
+  printProfiles(live.data);
   const claimCount = Array.isArray(live.data?.claims) ? live.data.claims.length : 0;
   success(`Claims: ${claimCount}`);
   if (live.data?.hostConnected) {
@@ -1059,7 +1078,112 @@ function runtimeArtifactPairs() {
     { name: "broker.cjs", src: join(PACKAGE_ROOT, "bin", "broker.cjs"), dst: BROKER_DST },
     { name: "native-host.cjs", src: join(PACKAGE_ROOT, "bin", "native-host.cjs"), dst: NATIVE_HOST_DST },
     { name: "browser-cli.cjs", src: join(PACKAGE_ROOT, "bin", "browser-cli.cjs"), dst: BROWSER_CLI_DST },
+    { name: "decision.cjs", src: join(PACKAGE_ROOT, "bin", "decision.cjs"), dst: DECISION_DST },
   ];
+}
+
+function printProfiles(data) {
+  const hosts = Array.isArray(data?.hosts) ? data.hosts : [];
+  for (const host of hosts) {
+    const flags = [host.allowed === false ? "not in allowlist" : null, host.healthy === false ? "stale" : null].filter(Boolean);
+    success(`Profile: ${host.profile || "unidentified"}${host.profileId && host.profileId !== host.profile ? ` <${host.profileId}>` : ""}${flags.length ? ` (${flags.join(", ")})` : ""}`);
+  }
+  if (data?.decisionModel) {
+    const dm = data.decisionModel;
+    success(`Decision model: ${dm.available ? `available (${dm.model})` : `off (${dm.reason})`}`);
+  }
+}
+
+// Chrome-family Local State files map profile directories to signed-in emails.
+function chromeProfileSources() {
+  const home = homedir();
+  if (platform() === "darwin") {
+    const base = join(home, "Library", "Application Support");
+    return [
+      { app: "Google Chrome", localState: join(base, "Google", "Chrome", "Local State") },
+      { app: "Brave Browser", localState: join(base, "BraveSoftware", "Brave-Browser", "Local State") },
+      { app: "Chromium", localState: join(base, "Chromium", "Local State") },
+    ];
+  }
+  const base = join(home, ".config");
+  return [
+    { app: "google-chrome", localState: join(base, "google-chrome", "Local State") },
+    { app: "brave-browser", localState: join(base, "BraveSoftware", "Brave-Browser", "Local State") },
+    { app: "chromium", localState: join(base, "chromium", "Local State") },
+  ];
+}
+
+function findChromeProfileDir(email) {
+  for (const source of chromeProfileSources()) {
+    try {
+      const state = JSON.parse(readFileSync(source.localState, "utf8"));
+      const cache = state?.profile?.info_cache || {};
+      for (const [dir, info] of Object.entries(cache)) {
+        if (String(info?.user_name || "").trim().toLowerCase() === email) {
+          return { app: source.app, dir, name: info?.name || dir };
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function profileConnected(data, email) {
+  return (data?.hosts || []).some((h) => h.healthy !== false && String(h.profileId || "").trim().toLowerCase() === email);
+}
+
+async function openProfile(want) {
+  header("Open profile");
+  const wantKey = String(want || "").trim().toLowerCase();
+  if (!wantKey) {
+    error("Usage: iris open-profile <alias|email>");
+    process.exit(2);
+  }
+  const profiles = loadConfig()?.profiles;
+  let email = null;
+  if (profiles && typeof profiles === "object") {
+    for (const [alias, entry] of Object.entries(profiles)) {
+      const candidate = String(entry?.email || entry?.profileId || "").trim().toLowerCase();
+      if (alias.trim().toLowerCase() === wantKey || candidate === wantKey) email = candidate;
+    }
+  }
+  if (!email && wantKey.includes("@")) email = wantKey;
+  if (!email) {
+    error(`Unknown profile "${want}". Add it under "profiles" in ${CONFIG_DST}.`);
+    process.exit(1);
+  }
+
+  const before = await getBrokerStatus();
+  if (before.ok && profileConnected(before.data, email)) {
+    success(`${want} (${email}) is already connected.`);
+    return;
+  }
+
+  const found = findChromeProfileDir(email);
+  if (!found) {
+    error(`No local Chrome profile is signed in as ${email}.`);
+    process.exit(1);
+  }
+
+  // -g keeps the browser in the background where macOS allows it; the profile only needs a window to load.
+  const child =
+    platform() === "darwin"
+      ? spawn("open", ["-g", "-na", found.app, "--args", `--profile-directory=${found.dir}`], { detached: true, stdio: "ignore" })
+      : spawn(found.app, [`--profile-directory=${found.dir}`], { detached: true, stdio: "ignore" });
+  child.unref();
+  success(`Asked ${found.app} to open profile "${found.name}" (${found.dir})`);
+
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    const live = await getBrokerStatus(1000);
+    if (live.ok && profileConnected(live.data, email)) {
+      success(`${want} connected to Iris.`);
+      return;
+    }
+  }
+  warn(`${want} did not connect within 30s. Click the Iris icon in that profile's window once, then retry.`);
+  process.exitCode = 1;
 }
 
 /** @returns {{ name: string, status: "CURRENT"|"STALE"|"MISSING_SRC"|"MISSING_DST", srcHash: string|null, dstHash: string|null }[]} */
@@ -1086,6 +1210,7 @@ async function doctor() {
     } else {
       warn(`Extension: NOT connected (hosts: ${hostCount})`);
     }
+    printProfiles(live.data);
     const claims = Array.isArray(live.data?.claims) ? live.data.claims.length : 0;
     success(`Claims: ${claims}`);
     const hosts = Array.isArray(live.data?.hosts) ? live.data.hosts : [];

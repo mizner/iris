@@ -2,6 +2,7 @@ import { redactHeaders, redactNetworkBody } from "./lib/network-redact.mjs"
 import { diffSnapshots, indexByUid } from "./lib/snapshot-diff.mjs"
 
 const NATIVE_HOST_NAME = "com.iris.host"
+const workerId = crypto.randomUUID()
 const KEEPALIVE_ALARM = "keepalive"
 const PERMISSION_HINT = "Click the Iris extension icon and approve requested permissions."
 const OPTIONAL_RUNTIME_PERMISSIONS = ["nativeMessaging", "downloads", "debugger"]
@@ -98,6 +99,59 @@ async function toolGetProfileStatus() {
   }
 }
 
+// Tell the broker which Chrome profile this extension instance runs in, so it can route by profile.
+async function sendIdentify() {
+  try {
+    const status = await toolGetProfileStatus()
+    send({ type: "identify", profileId: status.profileId, allowed: status.allowed, version: runtimeManifest.version, workerId })
+  } catch (e) {
+    console.warn("[Iris] identify failed:", e)
+  }
+}
+
+function hostOfUrl(url) {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.hostname : ""
+  } catch {
+    return ""
+  }
+}
+
+// Inventory for profile selection: counts and site hostnames only, no titles or full URLs.
+async function toolProfileSummary() {
+  const status = await toolGetProfileStatus()
+  const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] })
+  const hostCounts = new Map()
+  let tabCount = 0
+  let windowFocused = false
+  let activeHost = null
+  for (const w of windows) {
+    if (w.focused) windowFocused = true
+    for (const t of w.tabs || []) {
+      tabCount += 1
+      const host = hostOfUrl(t.url)
+      if (host) hostCounts.set(host, (hostCounts.get(host) || 0) + 1)
+      if (w.focused && t.active) activeHost = host || null
+    }
+  }
+  const domains = [...hostCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 60)
+    .map(([host, count]) => ({ host, count }))
+  return {
+    content: {
+      profileId: status.profileId,
+      allowed: status.allowed,
+      windowCount: windows.length,
+      tabCount,
+      windowFocused,
+      activeHost,
+      domains,
+    },
+  }
+}
+
 // WebMCP detection and integration
 const WEBMCP_STORAGE_KEY = "webmcp_tokens"
 
@@ -106,8 +160,9 @@ function detectWebMCP() {
   const hasLegacyWidget = document?.querySelector?.("[data-webmcp-widget]") !== null
   const hasLegacyGlobal = typeof window?.webMCP !== "undefined"
   
-  // Check for native/W3C WebMCP
-  const hasNativeWebMCP = typeof navigator?.modelContext !== "undefined"
+  // Check for native/W3C WebMCP (Chromium moved it from navigator to document in July 2026)
+  const hasNativeWebMCP =
+    typeof document?.modelContext !== "undefined" || typeof navigator?.modelContext !== "undefined"
   
   return {
     legacy: hasLegacyWidget || hasLegacyGlobal,
@@ -167,7 +222,9 @@ async function toolGetWebMCPStatus({ tabId } = {}) {
       func: () => {
         const hasLegacyWidget = document.querySelector("[data-webmcp-widget]") !== null
         const hasLegacyGlobal = typeof window.webMCP !== "undefined"
-        const hasNativeWebMCP = typeof navigator.modelContext !== "undefined"
+        // Chromium moved WebMCP from navigator.modelContext to document.modelContext in July 2026.
+        const hasNativeWebMCP =
+          typeof document.modelContext !== "undefined" || typeof navigator.modelContext !== "undefined"
         
         let capabilities = null
         if (window.webMCP?.isConnected) {
@@ -660,6 +717,10 @@ if (chrome.debugger?.onEvent) {
     if (method === "Page.javascriptDialogClosed") {
       state.pendingDialog = null
     }
+
+    if (method === "Page.fileChooserOpened" && state.fileChooserWaiter) {
+      state.fileChooserWaiter(params)
+    }
   })
 }
 
@@ -681,6 +742,46 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   lastSnapshot.delete(tabId)
   agentCursorByTab.delete(tabId)
+  for (const key of lastScreenshotHash.keys()) if (key.startsWith(`${tabId}|`)) lastScreenshotHash.delete(key)
+  // Let the broker drop claims and default-tab pointers for the closed tab.
+  if (isConnected && lastClaims.some((claim) => claim.tabId === tabId)) send({ type: "release_tab", tabId })
+})
+
+// Popups and new tabs opened from a claimed tab (OAuth windows, target=_blank, window.open) belong to the same
+// session: put them in the opener's tab group and tell the broker so it claims them.
+const reportedOpenedTabs = new Set()
+
+async function reportOpenedTab(tabId, openerTabId, knownUrl = "") {
+  if (!Number.isFinite(tabId) || !Number.isFinite(openerTabId) || reportedOpenedTabs.has(tabId)) return
+  if (!lastClaims.some((claim) => claim.tabId === openerTabId)) return
+  reportedOpenedTabs.add(tabId)
+  const [tab, opener] = await Promise.all([chrome.tabs.get(tabId).catch(() => null), chrome.tabs.get(openerTabId).catch(() => null)])
+  if (!tab) return
+  const win = await chrome.windows.get(tab.windowId).catch(() => null)
+  if (opener && opener.groupId >= 0 && opener.windowId === tab.windowId && chrome.tabs.group) {
+    await chrome.tabs.group({ groupId: opener.groupId, tabIds: [tabId] }).catch(() => {})
+  }
+  if (isConnected) {
+    send({
+      type: "tab_opened",
+      tabId,
+      openerTabId,
+      url: knownUrl || tab.pendingUrl || tab.url || "",
+      windowType: win?.type || "normal",
+    })
+  }
+}
+
+// onCreatedNavigationTarget carries the real source tab and the URL; onCreated is a delayed fallback for tabs
+// it does not cover, by which time the URL is known.
+if (chrome.webNavigation?.onCreatedNavigationTarget) {
+  chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
+    reportOpenedTab(details.tabId, details.sourceTabId, details.url)
+  })
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (Number.isFinite(tab.openerTabId)) setTimeout(() => reportOpenedTab(tab.id, tab.openerTabId), 500)
 })
 
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.25 })
@@ -724,6 +825,8 @@ async function connect() {
 }
 
 async function connectOnce() {
+  await handoffStartupCleanup
+  await cancelAllUserRequests("disconnected")
   clearReconnectTimer()
 
   if (port) {
@@ -758,6 +861,7 @@ async function connectOnce() {
     port.onDisconnect.addListener(() => {
       isConnected = false
       port = null
+      void cancelAllUserRequests("disconnected")
       updateBadge(false)
 
       const err = chrome.runtime.lastError
@@ -822,7 +926,7 @@ function send(message) {
 
 function isBrokerSourcedMessage(message) {
   const t = message?.type
-  return t === "ping" || t === "tool_request" || t === "reload" || t === "claims"
+  return t === "ping" || t === "tool_request" || t === "reload" || t === "claims" || t === "identify_request"
 }
 
 async function handleMessage(message) {
@@ -835,6 +939,7 @@ async function handleMessage(message) {
     isConnected = true
     connectionAttempts = 0
     updateBadge(true)
+    if (message.type !== "identify_request") sendIdentify()
   }
 
   if (Array.isArray(message.claims)) applyClaims(message.claims)
@@ -845,11 +950,14 @@ async function handleMessage(message) {
     send({ type: "pong" })
   } else if (message.type === "claims") {
     applyClaims(message.claims)
+  } else if (message.type === "identify_request") {
+    await sendIdentify()
   } else if (message.type === "config_response") {
     const cfg = message.config || {}
     const allowlist = normalizeAllowlist(cfg.profileEmails)
     await chrome.storage.local.set({ [ALLOWLIST_STORAGE_KEY]: allowlist })
     profileVerified = false // re-verify on next tool call with fresh allowlist
+    if (isConnected) await sendIdentify()
   } else if (message.type === "reload") {
     try {
       chrome.runtime.reload()
@@ -915,7 +1023,17 @@ async function executeTool(toolName, args) {
     network_list: toolNetworkList,
     network_get: toolNetworkGet,
     get_profile_status: toolGetProfileStatus,
+    profile_summary: toolProfileSummary,
     get_webmcp_status: toolGetWebMCPStatus,
+    request_user: toolRequestUser,
+    request_cancel: toolRequestCancel,
+    evaluate: toolEvaluate,
+    read: toolRead,
+    search_history: toolSearchHistory,
+    bookmarks: toolBookmarks,
+    recently_closed: toolRecentlyClosed,
+    upload: toolUpload,
+    name_group: toolNameGroup,
   }
 
   const fn = tools[toolName]
@@ -930,7 +1048,18 @@ async function getActiveTab() {
 }
 
 async function getTabById(tabId) {
-  return tabId ? await chrome.tabs.get(tabId) : await getActiveTab()
+  if (!tabId) return await getActiveTab()
+  try {
+    return await chrome.tabs.get(tabId)
+  } catch (error) {
+    if (/No tab with id/i.test(error?.message || "")) {
+      throw new Error(
+        `TAB_NOT_FOUND: Tab ${tabId} no longer exists in this Chrome profile (closed, or it belongs to another profile). ` +
+          "Call browser_get_tabs for current tab ids, or omit tabId to use this session's own tab."
+      )
+    }
+    throw error
+  }
 }
 
 async function runInPage(tabId, command, args) {
@@ -1444,7 +1573,10 @@ async function pageOps(command, args) {
     return { ok: false, error: "selector, text, pattern, or urlPattern is required" }
   }
 
-  const mode = typeof options.mode === "string" && options.mode ? options.mode : "text"
+  const MODE_ALIASES = { count: "exists", all: "list", page: "page_text" }
+  const rawMode = typeof options.mode === "string" && options.mode ? options.mode : "text"
+  const mode = MODE_ALIASES[rawMode] || rawMode
+  const QUERY_MODES = ["text", "value", "attribute", "property", "html", "list", "exists", "page_text"]
   const selectors = normalizeSelectorList(options.selector)
   const index = Number.isFinite(options.index) ? options.index : 0
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : DEFAULT_TIMEOUT_MS
@@ -1593,14 +1725,21 @@ async function pageOps(command, args) {
     }
     const target = document.activeElement || document.body
     const opts = { key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, bubbles: true, cancelable: true, ...mod }
+    let submitted = false
     try {
-      target.dispatchEvent(new KeyboardEvent("keydown", opts))
+      const notCancelled = target.dispatchEvent(new KeyboardEvent("keydown", opts))
       target.dispatchEvent(new KeyboardEvent("keypress", opts))
       target.dispatchEvent(new KeyboardEvent("keyup", opts))
+      // Synthetic key events have no default action, so emulate the browser's implicit form submission.
+      const plainEnter = key === "Enter" && !mod.ctrlKey && !mod.metaKey && !mod.altKey
+      if (plainEnter && notCancelled && target.tagName === "INPUT" && target.form) {
+        target.form.requestSubmit()
+        submitted = true
+      }
     } catch (e) {
       return { ok: false, error: e?.message || String(e) }
     }
-    return { ok: true, key, selectorUsed, method: "dom" }
+    return { ok: true, key, selectorUsed, method: "dom", submitted }
   }
 
   if (command === "select") {
@@ -1724,6 +1863,14 @@ async function pageOps(command, args) {
     return { ok: true, selectorUsed: match.selectorUsed, count: dt.files.length, names }
   }
 
+  if (command === "mark") {
+    const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
+    if (!match.chosen) return { ok: false, error: `Element not found for selectors: ${selectors.join(", ")}` }
+    match.chosen.setAttribute("data-iris-mark", safeString(options.token))
+    const isFileInput = match.chosen.tagName === "INPUT" && String(match.chosen.type).toLowerCase() === "file"
+    return { ok: true, selectorUsed: match.selectorUsed, isFileInput }
+  }
+
   if (command === "element_rect") {
     const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
     if (!match.chosen) {
@@ -1843,8 +1990,12 @@ async function pageOps(command, args) {
       return { ok: true, value: getPageText(limit, pattern, flags) }
     }
 
+    if (!QUERY_MODES.includes(mode)) {
+      return { ok: false, error: `Unknown mode: ${rawMode}. Valid modes: ${QUERY_MODES.join(", ")} (count is an alias of exists).` }
+    }
+
     if (!selectors.length) {
-      return { ok: false, error: "Selector is required" }
+      return { ok: false, error: `selector is required for mode=${mode}; use mode=page_text to read the whole page.` }
     }
 
     const match = await resolveMatches(selectors, index, timeoutMs, pollMs)
@@ -1858,7 +2009,13 @@ async function pageOps(command, args) {
     }
 
     if (!match.chosen) {
-      return { ok: false, error: `No matches for selectors: ${selectors.join(", ")}` }
+      return {
+        ok: false,
+        error:
+          `No matches for selectors: ${selectors.join(", ")}. ` +
+          "mode=exists returns {exists:false} instead of failing; browser_snapshot or " +
+          'browser_query mode=list selector="button,a,input,textarea,[role]" shows what is on the page.',
+      }
     }
 
     if (mode === "text") {
@@ -1899,7 +2056,7 @@ async function pageOps(command, args) {
       }
     }
 
-    return { ok: false, error: `Unknown mode: ${mode}` }
+    return { ok: false, error: `Unknown mode: ${rawMode}. Valid modes: ${QUERY_MODES.join(", ")}.` }
   }
 
   return { ok: false, error: `Unknown command: ${String(command)}` }
@@ -1908,19 +2065,588 @@ async function pageOps(command, args) {
 async function toolGetActiveTab() {
   const tab = await getActiveTab()
   const pendingDialog = debuggerState.get(tab.id)?.pendingDialog || null
+  const win = await chrome.windows.get(tab.windowId).catch(() => null)
   return {
     tabId: tab.id,
-    content: { tabId: tab.id, url: tab.url, title: tab.title, pendingDialog },
+    content: { tabId: tab.id, url: tab.url, title: tab.title, pendingDialog, windowFocused: !!win?.focused },
   }
 }
 
-async function toolOpenTab({ url, active = true }) {
+// Agent tabs are collected in one Chrome tab group per session so they are visible and easy to close together.
+// Join the group of anchorTabId (another tab of the same session) when it is in this window; otherwise start a new
+// group. Matching by title alone would merge two sessions that happen to share a name ("codeable · omo").
+async function addToSessionGroup(tab, title, color, anchorTabId, groupId) {
+  if (!chrome.tabGroups || !chrome.tabs.group || !title) return null
+  try {
+    // The session's remembered group comes first: it survives lapsed claims and reconnects.
+    const known = Number.isInteger(groupId) ? await chrome.tabGroups.get(groupId).catch(() => null) : null
+    if (known && known.windowId === tab.windowId) {
+      await chrome.tabs.group({ groupId: known.id, tabIds: [tab.id] })
+      return known.id
+    }
+    const anchor = Number.isFinite(anchorTabId) ? await chrome.tabs.get(anchorTabId).catch(() => null) : null
+    if (anchor && anchor.groupId >= 0 && anchor.windowId === tab.windowId) {
+      await chrome.tabs.group({ groupId: anchor.groupId, tabIds: [tab.id] })
+      return anchor.groupId
+    }
+    const created = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } })
+    await chrome.tabGroups.update(created, { title, color: color || "green" })
+    return created
+  } catch (error) {
+    console.warn("[Iris] Could not group tab:", error?.message || error)
+    return { error: error?.message || String(error) }
+  }
+}
+
+// Background by default: agents should not take over the tab the user is looking at.
+async function toolOpenTab({ url, active = false, group, groupColor, groupId, groupWith }) {
   const createOptions = {}
   if (typeof url === "string" && url.trim()) createOptions.url = url.trim()
   if (typeof active === "boolean") createOptions.active = active
 
   const tab = await chrome.tabs.create(createOptions)
-  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active } }
+  const joined = await addToSessionGroup(tab, group, groupColor, groupWith, groupId)
+  const grouping = joined && typeof joined === "object" ? { groupId: null, groupError: joined.error } : { groupId: joined }
+  return { tabId: tab.id, content: { tabId: tab.id, url: tab.url, active: tab.active, ...grouping } }
+}
+
+// Retitle the groups holding these tabs; loose tabs join the first of those groups (or a new one) per window.
+async function toolNameGroup({ tabIds = [], groupIds = [], title, color } = {}) {
+  if (!chrome.tabGroups || !chrome.tabs.group) throw new Error("Tab groups unavailable. Reload the Iris extension.")
+  if (typeof title !== "string" || !title.trim()) throw new Error("title is required")
+  const tabs = (await Promise.all(tabIds.map((id) => chrome.tabs.get(id).catch(() => null)))).filter(Boolean)
+  const groups = new Set()
+  const groupByWindow = new Map()
+  for (const id of groupIds) {
+    const group = await chrome.tabGroups.get(id).catch(() => null)
+    if (!group) continue
+    await chrome.tabGroups.update(group.id, { title, ...(color ? { color } : {}) })
+    groups.add(group.id)
+    if (!groupByWindow.has(group.windowId)) groupByWindow.set(group.windowId, group.id)
+  }
+  for (const tab of tabs) {
+    if (tab.groupId < 0) continue
+    if (!groups.has(tab.groupId)) {
+      await chrome.tabGroups.update(tab.groupId, { title, ...(color ? { color } : {}) })
+      groups.add(tab.groupId)
+    }
+    if (!groupByWindow.has(tab.windowId)) groupByWindow.set(tab.windowId, tab.groupId)
+  }
+  for (const tab of tabs) {
+    if (tab.groupId >= 0) continue
+    const existing = groupByWindow.get(tab.windowId)
+    if (existing !== undefined) {
+      await chrome.tabs.group({ groupId: existing, tabIds: [tab.id] }).catch(() => {})
+    } else {
+      const gid = await addToSessionGroup(tab, title, color)
+      if (Number.isInteger(gid)) {
+        groups.add(gid)
+        groupByWindow.set(tab.windowId, gid)
+      }
+    }
+  }
+  return { content: { title, groups: [...groups] } }
+}
+
+// Runs in the page (isolated world): shows or removes the handoff banner and checks the completion condition.
+function irisUserPrompt(message, selector, text, mode, requestId = "", leaseUntil = 0) {
+  const ID = "__iris_user_prompt"
+  if (mode === "probe") return { readable: true }
+  let bar = document.getElementById(ID)
+  const cancelled = window.__irisCancelledHandoffs ||= new Set()
+  if (mode === "remove" && requestId) cancelled.add(requestId)
+  if (mode !== "remove" && requestId && (cancelled.has(requestId) || Date.now() > leaseUntil)) return { done: false, matched: false }
+  if (mode === "remove") {
+    if (!requestId || window.__irisHandoffId === requestId) {
+      bar?.remove()
+      window.clearTimeout?.(window.__irisHandoffTimer)
+    }
+    return { done: false, matched: false }
+  }
+  if (mode === "start") window.__irisUserDone = false
+  if (requestId) {
+    window.__irisHandoffId = requestId
+    window.clearTimeout?.(window.__irisHandoffTimer)
+    window.__irisHandoffTimer = window.setTimeout?.(() => {
+      if (window.__irisHandoffId !== requestId) return
+      cancelled.add(requestId)
+      document.getElementById(ID)?.remove()
+    }, Math.max(0, leaseUntil - Date.now()))
+  }
+  if (!bar && !window.__irisUserDone) {
+    bar = document.createElement("div")
+    bar.id = ID
+    bar.style.cssText =
+      "position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;gap:12px;align-items:center;" +
+      "padding:10px 16px;background:#14532d;color:#fff;font:14px/1.4 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.3)"
+    const label = document.createElement("span")
+    label.style.flex = "1"
+    label.textContent = `Iris: ${message} The agent is waiting; click Done when finished.`
+    const button = document.createElement("button")
+    button.textContent = "Done"
+    button.style.cssText = "padding:4px 14px;border:0;border-radius:4px;background:#22c55e;color:#052e16;font-weight:600;cursor:pointer"
+    button.addEventListener("click", () => {
+      window.__irisUserDone = true
+      bar.remove()
+    })
+    bar.append(label, button)
+    ;(document.body || document.documentElement).appendChild(bar)
+  }
+  let matched = false
+  try {
+    if (selector) matched = !!document.querySelector(selector)
+    if (!matched && text) {
+      // Agent instructions and the profile prefix are not page completion evidence.
+      const display = bar?.style.display
+      try {
+        if (bar) bar.style.display = "none"
+        matched = (document.body?.innerText || "").includes(text)
+      } finally {
+        if (bar) bar.style.display = display
+      }
+    }
+  } catch {}
+  return { done: !!window.__irisUserDone, matched }
+}
+
+function urlMatches(url, pattern) {
+  if (!pattern || !url) return false
+  try {
+    return new RegExp(pattern).test(url) || url.includes(pattern)
+  } catch {
+    return url.includes(pattern)
+  }
+}
+
+async function injectUserPrompt(tabId, message, selector, text, mode, requestId = "", leaseUntil = 0) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: irisUserPrompt,
+      args: [message, selector || "", text || "", mode, requestId || "", leaseUntil || 0],
+    })
+    return res?.result || { done: false, matched: false }
+  } catch (error) {
+    const reason = error?.message || String(error)
+    const unreadable = /cannot access|cannot be scripted|missing host permission|must request permission|not allowed|extensions gallery|chrome web store/i.test(reason)
+    // Navigation can temporarily destroy the execution context; only access failures are terminal.
+    return { done: false, matched: false, unreadable, reason }
+  }
+}
+
+// Internal transport bookkeeping only; the broker owns public handoff state and ownership.
+const activeUserRequests = new Map()
+const activeUserTabs = new Map()
+const cancelledUserRequests = new Set()
+const HANDOFF_STORAGE_KEY = "iris.activeHandoffs"
+const handoffStorage = chrome.storage?.session || chrome.storage?.local
+let handoffStorageQueue = Promise.resolve()
+
+async function cleanupUserRequest(request) {
+  if (Number.isInteger(request.tabId)) {
+    await injectUserPrompt(request.tabId, "", "", "", "remove", request.requestId)
+    await chrome.notifications?.clear?.(`iris-handoff-${request.requestId}`)?.catch(() => {})
+  }
+}
+
+const handoffStartupCleanup = (async () => {
+  if (!handoffStorage) return
+  const stored = await handoffStorage.get(HANDOFF_STORAGE_KEY)
+  for (const request of stored[HANDOFF_STORAGE_KEY] || []) {
+    cancelledUserRequests.add(request.requestId)
+    await cleanupUserRequest(request)
+  }
+  await handoffStorage.set({ [HANDOFF_STORAGE_KEY]: [] })
+})()
+
+function persistUserRequests() {
+  const write = handoffStorageQueue.then(() => handoffStorage?.set({
+    [HANDOFF_STORAGE_KEY]: [...activeUserRequests.values()]
+      .filter((request) => Number.isInteger(request.tabId))
+      .map(({ requestId, tabId }) => ({ requestId, tabId })),
+  }))
+  handoffStorageQueue = write.catch(() => {})
+  return write
+}
+
+function cancelledUserResult(request) {
+  return { tabId: request.tabId, content: JSON.stringify({ ok: false, status: "cancelled", reason: request.reason || "requested", ...(request.url !== undefined ? { url: request.url } : {}) }, null, 2) }
+}
+
+async function toolRequestCancel({ requestId, tabId } = {}) {
+  if (typeof requestId !== "string" || !requestId) throw new Error("requestId is required")
+  const request = activeUserRequests.get(requestId)
+  if (request) {
+    if (tabId !== undefined && request.tabId !== undefined && request.tabId !== tabId) throw new Error("requestId does not match tabId")
+    cancelledUserRequests.add(requestId)
+    request.cancelled = true
+    request.reason ||= "requested"
+    request.wake?.()
+    await request.finished.catch(() => {})
+    return cancelledUserResult(request)
+  }
+  cancelledUserRequests.add(requestId)
+  await handoffStartupCleanup
+  const missing = { requestId, tabId }
+  if (![...activeUserRequests.values()].some((active) => active.tabId === tabId)) await cleanupUserRequest(missing)
+  return cancelledUserResult(missing)
+}
+
+async function cancelAllUserRequests(reason) {
+  const requests = [...activeUserRequests.values()]
+  for (const request of requests) {
+    cancelledUserRequests.add(request.requestId)
+    request.cancelled = true
+    request.reason = reason
+    request.wake?.()
+  }
+  await Promise.allSettled(requests.map((request) => request.finished))
+}
+
+function toolRequestUser(args = {}) {
+  const requestId = args.requestId || crypto.randomUUID()
+  if (typeof requestId !== "string") return Promise.reject(new Error("requestId must be a string"))
+  if (activeUserRequests.has(requestId)) return Promise.reject(new Error("requestId is already active"))
+  if (cancelledUserRequests.has(requestId)) return Promise.resolve(cancelledUserResult({ requestId, tabId: args.tabId }))
+  const request = { requestId, tabId: args.tabId, cancelled: false }
+  activeUserRequests.set(requestId, request)
+  request.finished = (async () => {
+    try {
+      await handoffStartupCleanup
+      return await runUserRequest(args, request)
+    } finally {
+      try { if (request.cleanup) await cleanupUserRequest(request) } finally {
+        if (activeUserTabs.get(request.tabId) === request) activeUserTabs.delete(request.tabId)
+        activeUserRequests.delete(requestId)
+        await persistUserRequests()
+      }
+    }
+  })()
+  return request.finished
+}
+
+// Hand the tab to the user (sign-in, 2FA, CAPTCHA, a choice only they can make) and wait until they finish.
+async function runUserRequest({ message, tabId, urlPattern, selector, text, timeoutMs, focus = true } = {}, request) {
+  if (typeof message !== "string" || !message.trim()) throw new Error("message is required")
+  const tab = await getTabById(tabId)
+  request.url = tab.url || ""
+  request.tabId = tab.id
+  if (request.cancelled) return cancelledUserResult(request)
+  // Blocking and async callers share one banner per tab; never steal a live handoff.
+  if (activeUserTabs.has(tab.id)) {
+    throw new Error("A user handoff is already active on this tab")
+  }
+  activeUserTabs.set(tab.id, request)
+  await persistUserRequests()
+  if (request.cancelled) return cancelledUserResult(request)
+  const timeout = clampNumber(timeoutMs, 5000, 1800000, 300000)
+  const startUrl = tab.url || ""
+  const needsPage = !!(selector || text)
+  const pageAccess = async (url) => {
+    let location = "unknown"
+    try {
+      const parsed = new URL(url)
+      location = `${parsed.protocol}${parsed.host ? `//${parsed.host}` : ""}`
+      if (!["http:", "https:", "file:", "ftp:"].includes(parsed.protocol)) {
+        return { unreadable: true, reason: `The extension cannot read ${location} pages.`, location }
+      }
+    } catch {}
+    const check = await injectUserPrompt(tab.id, "", "", "", "probe")
+    return { ...check, location }
+  }
+  if (needsPage && !(urlPattern && urlMatches(startUrl, urlPattern))) {
+    const access = await pageAccess(startUrl)
+    if (access.unreadable) {
+      return { tabId: tab.id, content: JSON.stringify({ ok: false, status: "unreadable_page", url: startUrl, reason: access.reason, location: access.location }, null, 2) }
+    }
+  }
+
+  if (request.cancelled) return cancelledUserResult(request)
+  request.cleanup = true
+  if (focus !== false) {
+    await chrome.tabs.update(tab.id, { active: true })
+    await chrome.windows.update(tab.windowId, { focused: true, drawAttention: true }).catch(() => {})
+  }
+  if (chrome.notifications?.create) {
+    await chrome.notifications
+      .create(`iris-handoff-${request.requestId}`, {
+        type: "basic",
+        iconUrl: "icons/icon128.png",
+        title: "Iris needs you",
+        message: message.trim(),
+        requireInteraction: true,
+      })
+      .catch(() => {})
+  }
+  if (request.cancelled) return cancelledUserResult(request)
+
+  let mode = "start"
+  const endAt = Date.now() + timeout
+  let status = "timeout"
+  let finalUrl = startUrl
+  let unreadablePage
+  while (!request.cancelled && Date.now() < endAt) {
+    const current = await chrome.tabs.get(tab.id).catch(() => null)
+    if (request.cancelled) break
+    if (!current) {
+      status = "tab_closed"
+      break
+    }
+    finalUrl = current.url || finalUrl
+    request.url = finalUrl
+    if (urlPattern && urlMatches(finalUrl, urlPattern)) {
+      status = "condition_met"
+      break
+    }
+    if (needsPage) {
+      const access = await pageAccess(finalUrl)
+      if (access.unreadable) {
+        status = "unreadable_page"
+        unreadablePage = { reason: access.reason, location: access.location }
+        break
+      }
+    }
+    if (request.cancelled) break
+    const check = await injectUserPrompt(tab.id, message.trim(), selector, text, mode, request.requestId, Date.now() + 15000)
+    if (request.cancelled) break
+    mode = "poll"
+    if (needsPage && check.unreadable) {
+      status = "unreadable_page"
+      unreadablePage = { reason: check.reason, location: (await pageAccess(finalUrl)).location }
+      break
+    }
+    if (check.matched) {
+      status = "condition_met"
+      break
+    }
+    if (check.done) {
+      status = "user_done"
+      break
+    }
+    await new Promise((resolve) => {
+      request.wake = resolve
+      setTimeout(resolve, 1000)
+      if (request.cancelled) resolve()
+    })
+    request.wake = undefined
+  }
+
+  if (request.cancelled) return cancelledUserResult(request)
+  return {
+    tabId: tab.id,
+    content: JSON.stringify({ ok: status === "condition_met" || status === "user_done", status, url: finalUrl, ...unreadablePage }, null, 2),
+  }
+}
+
+// --- The profile's own memory: history, bookmarks, recently closed tabs, other devices ---
+
+async function toolSearchHistory({ query = "", days = 30, maxResults = 50 } = {}) {
+  if (!chrome.history?.search) throw new Error("History permission not granted. Reload the Iris extension.")
+  const startTime = Date.now() - clampNumber(days, 0.01, 3650, 30) * 86400000
+  const items = await chrome.history.search({ text: String(query || ""), startTime, maxResults: clampNumber(maxResults, 1, 1000, 50) })
+  const out = items.map((item) => ({
+    url: item.url,
+    title: item.title,
+    lastVisit: item.lastVisitTime ? new Date(item.lastVisitTime).toISOString() : null,
+    visits: item.visitCount,
+  }))
+  return { content: JSON.stringify(out, null, 2) }
+}
+
+async function bookmarkFolderPath(parentId, cache) {
+  const parts = []
+  let id = parentId
+  while (id && id !== "0") {
+    if (!cache.has(id)) {
+      const [node] = await chrome.bookmarks.get(id).catch(() => [null])
+      cache.set(id, node)
+    }
+    const node = cache.get(id)
+    if (!node) break
+    if (node.title) parts.unshift(node.title)
+    id = node.parentId
+  }
+  return parts.join(" / ")
+}
+
+async function toolBookmarks({ query = "", maxResults = 50 } = {}) {
+  if (!chrome.bookmarks) throw new Error("Bookmarks permission not granted. Reload the Iris extension.")
+  const limit = clampNumber(maxResults, 1, 1000, 50)
+  const nodes = String(query || "").trim()
+    ? (await chrome.bookmarks.search(String(query))).filter((n) => n.url)
+    : await chrome.bookmarks.getRecent(limit)
+  const cache = new Map()
+  const out = []
+  for (const node of nodes.slice(0, limit)) {
+    out.push({
+      title: node.title,
+      url: node.url,
+      folder: await bookmarkFolderPath(node.parentId, cache),
+      added: node.dateAdded ? new Date(node.dateAdded).toISOString() : null,
+    })
+  }
+  return { content: JSON.stringify(out, null, 2) }
+}
+
+function describeSessionTab(tab) {
+  return { url: tab.url, title: tab.title }
+}
+
+async function toolRecentlyClosed({ maxResults = 25, devices = false, restore } = {}) {
+  if (!chrome.sessions) throw new Error("Sessions permission not granted. Reload the Iris extension.")
+  if (restore) {
+    const restored = await chrome.sessions.restore(String(restore))
+    const tab = restored?.tab || restored?.window?.tabs?.[0]
+    return { tabId: tab?.id, content: { restored: true, tabId: tab?.id, url: tab?.url, title: tab?.title } }
+  }
+  const limit = clampNumber(maxResults, 1, 25, 25)
+  const closed = await chrome.sessions.getRecentlyClosed({ maxResults: limit })
+  const out = {
+    recentlyClosed: closed.map((s) =>
+      s.tab
+        ? { sessionId: s.tab.sessionId, closedAt: new Date(s.lastModified * 1000).toISOString(), ...describeSessionTab(s.tab) }
+        : {
+            sessionId: s.window?.sessionId,
+            closedAt: new Date(s.lastModified * 1000).toISOString(),
+            window: true,
+            tabs: (s.window?.tabs || []).map(describeSessionTab),
+          }
+    ),
+  }
+  if (devices) {
+    const list = await chrome.sessions.getDevices({ maxResults: 10 }).catch(() => [])
+    out.otherDevices = list.map((d) => ({
+      device: d.deviceName,
+      tabs: d.sessions.flatMap((s) => s.window?.tabs || (s.tab ? [s.tab] : [])).map(describeSessionTab).slice(0, 50),
+    }))
+  }
+  return { content: JSON.stringify(out, null, 2) }
+}
+
+// Upload real files by path. A file input gets the files directly; any other element (a custom "Upload" button)
+// is clicked with a user gesture and Chrome's native file chooser is intercepted, so no OS dialog ever appears.
+async function toolUpload({ selector, files, tabId, index = 0, timeoutMs = 2000, pollMs } = {}) {
+  const paths = (Array.isArray(files) ? files : [files]).filter((f) => typeof f === "string" && f.trim())
+  if (!paths.length) throw new Error("files is required (absolute paths)")
+  if (!selector) throw new Error("selector is required: the file input or the button that opens the file chooser")
+  const tab = await getTabById(tabId)
+  const state = await ensureDebuggerAttached(tab.id)
+  if (!state.attached) throw new Error(state.unavailableReason || "Debugger not attached; browser_upload needs it.")
+
+  const token = `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+  const mark = await runInPage(tab.id, "mark", { selector, index, timeoutMs, pollMs, token })
+  if (!mark?.ok) throw new Error(mark?.error || "Element not found")
+
+  const found = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+    expression: `(() => {
+      const find = (root) => {
+        const hit = root.querySelector('[data-iris-mark="${token}"]')
+        if (hit) return hit
+        for (const el of root.querySelectorAll("*")) if (el.shadowRoot) { const deep = find(el.shadowRoot); if (deep) return deep }
+        return null
+      }
+      const el = find(document)
+      if (el) el.removeAttribute("data-iris-mark")
+      return el
+    })()`,
+  })
+  const objectId = found?.result?.objectId
+  if (!objectId) throw new Error("Could not reach the element through the debugger")
+
+  if (mark.isFileInput) {
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.setFileInputFiles", { files: paths, objectId })
+    return { tabId: tab.id, content: JSON.stringify({ ok: true, via: "file-input", files: paths }, null, 2) }
+  }
+
+  await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.setInterceptFileChooserDialog", { enabled: true })
+  try {
+    const opened = new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        state.fileChooserWaiter = null
+        resolve(null)
+      }, 5000)
+      state.fileChooserWaiter = (params) => {
+        clearTimeout(timer)
+        state.fileChooserWaiter = null
+        resolve(params)
+      }
+    })
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: "function () { this.scrollIntoView({ block: 'center' }); this.click() }",
+      userGesture: true,
+    })
+    const chooser = await opened
+    if (!chooser) {
+      throw new Error("Clicking the element did not open a file chooser. Point selector at the upload button or the input[type=file].")
+    }
+    const list = chooser.mode === "selectSingle" ? paths.slice(0, 1) : paths
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.setFileInputFiles", { files: list, backendNodeId: chooser.backendNodeId })
+    return {
+      tabId: tab.id,
+      content: JSON.stringify(
+        { ok: true, via: "file-chooser", mode: chooser.mode, files: list, ...(list.length < paths.length ? { note: "Chooser accepts one file; extra files ignored." } : {}) },
+        null,
+        2
+      ),
+    }
+  } finally {
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {})
+  }
+}
+
+// Evaluate JavaScript in the page's main world. CDP Runtime.evaluate is used first because it ignores page CSP
+// and can await promises; without the debugger it falls back to a main-world script (blocked by strict CSP).
+async function toolEvaluate({ expression, tabId, awaitPromise = true, maxChars = 20000 } = {}) {
+  if (typeof expression !== "string" || !expression.trim()) throw new Error("expression is required")
+  const tab = await getTabById(tabId)
+  const limit = clampNumber(maxChars, 100, 500000, 20000)
+  const format = (value, via) => {
+    let text
+    try {
+      text = typeof value === "string" ? value : JSON.stringify(value, null, 2)
+    } catch {
+      text = String(value)
+    }
+    if (text === undefined) text = "undefined"
+    const truncated = text.length > limit
+    return { tabId: tab.id, content: truncated ? `${text.slice(0, limit)}\n[truncated ${text.length - limit} chars; via ${via}]` : text }
+  }
+
+  const state = await ensureDebuggerAttached(tab.id)
+  if (state.attached) {
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+      expression,
+      awaitPromise: awaitPromise !== false,
+      returnByValue: true,
+      userGesture: true,
+      replMode: true,
+    })
+    if (res?.exceptionDetails) {
+      const detail = res.exceptionDetails.exception?.description || res.exceptionDetails.text || "Evaluation failed"
+      throw new Error(`Evaluation threw: ${detail}`)
+    }
+    const remote = res?.result || {}
+    return format("value" in remote ? remote.value : remote.description ?? remote.type, "cdp")
+  }
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    func: async (code) => {
+      try {
+        const value = await (0, eval)(code)
+        return { ok: true, value: value === undefined ? null : JSON.parse(JSON.stringify(value)) }
+      } catch (error) {
+        return { ok: false, error: error?.message || String(error) }
+      }
+    },
+    args: [expression],
+  })
+  const out = res?.result
+  if (!out?.ok) throw new Error(`Evaluation failed: ${out?.error || "no result"} (debugger unavailable: ${state.unavailableReason || "unknown"})`)
+  return format(out.value, "main-world script")
 }
 
 async function toolCloseTab({ tabId }) {
@@ -2007,7 +2733,9 @@ async function toolClick({ selector, tabId, index = 0, timeoutMs, pollMs, button
   const count = Number(clickCount) >= 2 ? 2 : 1
   const mouseButton = cdpMouseButton(button)
 
-  const state = await ensureDebuggerAttached(tab.id)
+  // Debugger mouse events are not delivered to hidden (background) tabs; a DOM click still runs the
+  // element's activation behavior (links, submit buttons) without bringing the tab to the front.
+  const state = tab.active ? await ensureDebuggerAttached(tab.id) : { attached: false }
   if (state.attached) {
     await cdpClick(tab.id, { x: point.x, y: point.y, button: mouseButton, clickCount: count, modifiers: mods })
   } else {
@@ -2032,7 +2760,7 @@ async function toolHover({ selector, tabId, index = 0, timeoutMs, pollMs } = {})
   const point = await runInPage(tab.id, "rect", { selector, index, timeoutMs, pollMs })
   if (!point?.ok) throw new Error(point?.error || "Hover failed")
   await showAgentCursor(tab.id, { x: point.x, y: point.y })
-  const state = await ensureDebuggerAttached(tab.id)
+  const state = tab.active ? await ensureDebuggerAttached(tab.id) : { attached: false }
   if (state.attached) {
     await dispatchMouse(tab.id, { type: "mouseMoved", x: point.x, y: point.y, button: "left", clickCount: 1 })
   } else {
@@ -2117,6 +2845,9 @@ function cdpKeyFields(key) {
     out.windowsVirtualKeyCode = vk
     out.nativeVirtualKeyCode = vk
   }
+  // keyDown needs text to produce the character event that submits forms and inserts characters.
+  if (k === "Enter") out.text = "\r"
+  else if (k.length === 1) out.text = k
   return out
 }
 
@@ -2130,10 +2861,13 @@ async function toolPress({ key, modifiers, selector, tabId, index = 0, timeoutMs
     if (!focusResult?.ok) throw new Error(focusResult?.error || "Focus failed")
   }
 
-  const state = await ensureDebuggerAttached(tab.id)
+  // Debugger key events are not delivered to hidden (background) tabs; use the in-page path there.
+  const state = tab.active ? await ensureDebuggerAttached(tab.id) : { attached: false }
   if (state.attached) {
     const fields = cdpKeyFields(key.trim())
     const mods = cdpKeyModifiers(modList)
+    // Shortcuts (Ctrl/Cmd/Alt + key) must not insert their character.
+    if (mods & ~8) delete fields.text
     await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: mods, ...fields })
     await sendDebuggerCommand(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: mods, ...fields })
     return { tabId: tab.id, content: `Pressed ${key.trim()}` }
@@ -2195,7 +2929,102 @@ async function getElementScreenshotClip(tabId, selector, index = 0, timeoutMs, p
   }
 }
 
-async function toolScreenshot({
+// Draw a numbered uid label on every visible interactive element. Labels use the same data-iris-uid values as
+// browser_snapshot, so an agent can act on what it sees with selector="uid:e12".
+function irisAnnotate(mode, fullPage) {
+  const LAYER = "__iris_annotations"
+  document.getElementById(LAYER)?.remove()
+  if (mode === "remove") return []
+  const root = document.documentElement
+  if (root.dataset.irisUidUrl !== location.href) {
+    document.querySelectorAll("[data-iris-uid]").forEach((el) => el.removeAttribute("data-iris-uid"))
+    root.dataset.irisUidSeq = "0"
+    root.dataset.irisUidUrl = location.href
+  }
+  const selector =
+    "a[href],button,input:not([type=hidden]),textarea,select,summary,[contenteditable=''],[contenteditable=true]," +
+    "[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[role=combobox],[onclick]"
+  const layer = document.createElement("div")
+  layer.id = LAYER
+  layer.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none"
+  const labels = []
+  for (const el of document.querySelectorAll(selector)) {
+    if (labels.length >= 300) break
+    const rect = el.getBoundingClientRect()
+    if (rect.width < 2 || rect.height < 2) continue
+    const style = getComputedStyle(el)
+    if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") continue
+    if (!fullPage && (rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth)) continue
+    let uid = el.getAttribute("data-iris-uid")
+    if (!uid) {
+      const seq = Number(root.dataset.irisUidSeq || "0") || 0
+      uid = `e${seq}`
+      root.dataset.irisUidSeq = String(seq + 1)
+      el.setAttribute("data-iris-uid", uid)
+    }
+    const x = rect.left + scrollX
+    const y = rect.top + scrollY
+    const box = document.createElement("div")
+    box.style.cssText = `position:absolute;left:${x}px;top:${y}px;width:${rect.width}px;height:${rect.height}px;outline:2px solid #e11d48;outline-offset:-1px`
+    const tag = document.createElement("div")
+    tag.textContent = uid
+    tag.style.cssText = `position:absolute;left:${x}px;top:${Math.max(0, y - 14)}px;background:#e11d48;color:#fff;font:bold 11px/14px monospace;padding:0 3px;border-radius:2px`
+    layer.append(box, tag)
+    const name = (el.getAttribute("aria-label") || el.innerText || el.value || el.placeholder || el.title || "").trim().replace(/\s+/g, " ")
+    labels.push({ uid, role: el.getAttribute("role") || el.tagName.toLowerCase(), name: name.slice(0, 60) })
+  }
+  root.appendChild(layer)
+  return labels
+}
+
+const lastScreenshotHash = new Map()
+
+function hashString(value) {
+  let h = 2166136261
+  for (let i = 0; i < value.length; i += 1) {
+    h ^= value.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(16) + ":" + value.length
+}
+
+async function toolScreenshot(args = {}) {
+  const { tabId, annotate = false, ifChanged = false, fullPage = false } = args
+  const tab = await getTabById(tabId)
+  let labels = null
+  if (annotate) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "ISOLATED",
+      func: irisAnnotate,
+      args: ["draw", !!fullPage],
+    })
+    labels = res?.result || []
+  }
+  let shot
+  try {
+    shot = await captureScreenshot({ ...args, tabId: tab.id })
+  } finally {
+    if (annotate) {
+      await chrome.scripting
+        .executeScript({ target: { tabId: tab.id }, world: "ISOLATED", func: irisAnnotate, args: ["remove", false] })
+        .catch(() => {})
+    }
+  }
+  if (ifChanged) {
+    const key = `${tab.id}|${JSON.stringify([fullPage, args.selector, args.x, args.y, args.width, args.height, annotate])}`
+    const hash = hashString(shot.content)
+    const unchanged = lastScreenshotHash.get(key) === hash
+    lastScreenshotHash.set(key, hash)
+    if (unchanged) {
+      return { tabId: tab.id, content: JSON.stringify({ unchanged: true, note: "Screenshot identical to the previous one for this tab and region." }) }
+    }
+  }
+  if (labels) return { tabId: tab.id, content: JSON.stringify({ image: shot.content, labels }) }
+  return shot
+}
+
+async function captureScreenshot({
   tabId,
   fullPage = false,
   selector,
@@ -2214,7 +3043,9 @@ async function toolScreenshot({
   const hasManualClip = [x, y, width, height].every((value) => Number.isFinite(value))
   const hasSelectorClip = typeof selector === "string" && selector.trim()
 
-  if (!fullPage && !hasManualClip && !hasSelectorClip && screenshotFormat === "png" && !Number.isFinite(quality)) {
+  // captureVisibleTab captures whatever tab is visible in the window, so only use it for the active tab.
+  // Background tabs go through the debugger path, which does not change focus.
+  if (tab.active && !fullPage && !hasManualClip && !hasSelectorClip && screenshotFormat === "png" && !Number.isFinite(quality)) {
     const png = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
     return { tabId: tab.id, content: png }
   }
@@ -2261,12 +3092,170 @@ async function toolScreenshot({
   return { tabId: tab.id, content: `data:${screenshotMime(screenshotFormat)};base64,${result.data}` }
 }
 
-async function toolSnapshot({ tabId, full = false } = {}) {
+// Page content as markdown: far cheaper for an agent to read than page_text or a full snapshot.
+function irisPageToMarkdown(opts) {
+  const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "CANVAS", "IFRAME", "OBJECT", "HEAD"])
+  const CHROME = new Set(["NAV", "FOOTER", "ASIDE", "HEADER"])
+  const includeLinks = opts.includeLinks !== false
+  const includeImages = !!opts.includeImages
+
+  function hidden(el) {
+    if (el.hidden || el.getAttribute("aria-hidden") === "true") return true
+    const style = getComputedStyle(el)
+    return style.display === "none" || style.visibility === "hidden"
+  }
+
+  function pickRoot() {
+    if (opts.selector) {
+      const sel = String(opts.selector).replace(/^(uid|ref)[:=]\s*/i, "")
+      const uidLike = /^e\d+$/.test(sel)
+      const el = document.querySelector(uidLike ? `[data-iris-uid="${sel}"]` : sel)
+      if (!el) return { error: `No element matches ${opts.selector}` }
+      return { root: el, scoped: true }
+    }
+    const main = document.querySelector("main, [role=main], article")
+    return { root: main || document.body, scoped: !!main }
+  }
+
+  const clean = (s) => String(s || "").replace(/\s+/g, " ")
+
+  function inline(node) {
+    let out = ""
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) out += clean(child.textContent)
+      else if (child.nodeType === 1) out += element(child, true)
+    }
+    return out
+  }
+
+  function table(el) {
+    const rows = [...el.querySelectorAll("tr")].slice(0, 200)
+    if (!rows.length) return ""
+    const cells = rows.map((tr) => [...tr.children].map((c) => inline(c).trim().replace(/\|/g, "\\|")))
+    const width = Math.max(...cells.map((r) => r.length))
+    const line = (r) => `| ${Array.from({ length: width }, (_, i) => r[i] || "").join(" | ")} |`
+    return `\n\n${line(cells[0])}\n| ${Array(width).fill("---").join(" | ")} |\n${cells.slice(1).map(line).join("\n")}\n\n`
+  }
+
+  function list(el, depth) {
+    const ordered = el.tagName === "OL"
+    let i = 0
+    let out = "\n"
+    for (const li of el.children) {
+      if (li.tagName !== "LI" || hidden(li)) continue
+      i += 1
+      const nested = [...li.children].filter((c) => c.tagName === "UL" || c.tagName === "OL")
+      const clone = li.cloneNode(true)
+      clone.querySelectorAll("ul,ol").forEach((n) => n.remove())
+      out += `${"  ".repeat(depth)}${ordered ? `${i}.` : "-"} ${inline(clone).trim()}\n`
+      for (const sub of nested) out += list(sub, depth + 1).replace(/^\n/, "")
+    }
+    return out + "\n"
+  }
+
+  function element(el, inInline) {
+    if (SKIP.has(el.tagName) || hidden(el)) return ""
+    if (!opts.includeChrome && !opts.explicit) {
+      // Site chrome: navigation and sidebars anywhere; header/footer only when reading the whole body.
+      const role = el.getAttribute("role")
+      if (el.tagName === "NAV" || el.tagName === "ASIDE" || ["navigation", "complementary", "search", "menu", "menubar"].includes(role)) return ""
+      if (!opts.scoped && CHROME.has(el.tagName)) return ""
+    }
+    const tag = el.tagName
+    if (/^H[1-6]$/.test(tag)) return `\n\n${"#".repeat(Number(tag[1]))} ${inline(el).trim()}\n\n`
+    if (tag === "P") return `\n\n${inline(el).trim()}\n\n`
+    if (tag === "BR") return "\n"
+    if (tag === "HR") return "\n\n---\n\n"
+    if (tag === "UL" || tag === "OL") return list(el, 0)
+    if (tag === "TABLE") return table(el)
+    if (tag === "PRE") return `\n\n\`\`\`\n${el.innerText.replace(/\n+$/, "")}\n\`\`\`\n\n`
+    if (tag === "CODE") return `\`${el.textContent}\``
+    if (tag === "BLOCKQUOTE") return `\n\n> ${inline(el).trim().replace(/\n/g, "\n> ")}\n\n`
+    if (tag === "STRONG" || tag === "B") {
+      const t = inline(el).trim()
+      return t ? ` **${t}** ` : ""
+    }
+    if (tag === "EM" || tag === "I") {
+      const t = inline(el).trim()
+      return t ? ` _${t}_ ` : ""
+    }
+    if (tag === "A") {
+      const t = inline(el).trim()
+      if (!t) return ""
+      const href = el.href && !el.href.startsWith("javascript:") ? el.href : ""
+      return includeLinks && href ? `[${t}](${href})` : t
+    }
+    if (tag === "IMG") return includeImages && el.alt ? `![${clean(el.alt)}](${el.src})` : ""
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") {
+      const label = clean(el.getAttribute("aria-label") || el.placeholder || el.innerText || el.value || el.name || "")
+      return label ? ` [${tag.toLowerCase()}: ${label.trim().slice(0, 80)}] ` : ""
+    }
+    let out = ""
+    for (const child of el.childNodes) {
+      if (child.nodeType === 3) out += clean(child.textContent)
+      else if (child.nodeType === 1) out += element(child, inInline)
+    }
+    if (el.shadowRoot) for (const child of el.shadowRoot.children) out += element(child, inInline)
+    const block = !inInline && /^(DIV|SECTION|ARTICLE|MAIN|LI|DD|DT|FIGURE|FIGCAPTION|DETAILS|SUMMARY|FORM|FIELDSET)$/.test(tag)
+    return block ? `\n${out}\n` : out
+  }
+
+  const picked = pickRoot()
+  if (picked.error) return { ok: false, error: picked.error }
+  opts.scoped = picked.scoped
+  opts.explicit = !!opts.selector
+
+  if (opts.outline) {
+    const heads = [...picked.root.querySelectorAll("h1,h2,h3,h4")].filter((h) => !hidden(h))
+    const outline = heads.map((h) => `${"  ".repeat(Number(h.tagName[1]) - 1)}- ${clean(h.innerText).trim()}`).join("\n")
+    return { ok: true, url: location.href, title: document.title, markdown: outline, totalChars: outline.length, offset: 0, truncated: false }
+  }
+
+  const markdown = element(picked.root, false)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/ {2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+  const offset = Math.max(0, Number(opts.offset) || 0)
+  const maxChars = Math.max(200, Number(opts.maxChars) || 15000)
+  const slice = markdown.slice(offset, offset + maxChars)
+  return {
+    ok: true,
+    url: location.href,
+    title: document.title,
+    markdown: slice,
+    totalChars: markdown.length,
+    offset,
+    truncated: offset + maxChars < markdown.length,
+    nextOffset: offset + maxChars < markdown.length ? offset + maxChars : null,
+  }
+}
+
+async function toolRead({ tabId, selector, maxChars, offset, includeLinks, includeImages, includeChrome, outline } = {}) {
   const tab = await getTabById(tabId)
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "ISOLATED",
+    func: irisPageToMarkdown,
+    args: [{ selector, maxChars, offset, includeLinks, includeImages, includeChrome, outline }],
+  })
+  const out = res?.result
+  if (!out?.ok) throw new Error(out?.error || "Could not read the page")
+  const header = `# ${out.title}\n<${out.url}>`
+  const footer = out.truncated
+    ? `\n\n[truncated: showing ${out.offset}-${out.offset + out.markdown.length} of ${out.totalChars} chars; pass offset=${out.nextOffset} for more]`
+    : ""
+  return { tabId: tab.id, content: `${header}\n\n${out.markdown}${footer}` }
+}
+
+async function toolSnapshot({ tabId, full = false, interactive = false, selector, includeText, maxNodes } = {}) {
+  const tab = await getTabById(tabId)
+  const optionsKey = JSON.stringify([!!interactive, selector || "", includeText ?? null, maxNodes ?? null])
 
   const result = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    args: [{ full: !!full }],
+    args: [{ full: !!full, interactive: !!interactive, selector: selector || "", includeText, maxNodes }],
     func: (opts) => {
       function safeText(s) {
         return typeof s === "string" ? s : ""
@@ -2362,24 +3351,25 @@ async function toolSnapshot({ tabId, full = false } = {}) {
         if (!isVisible(el)) return { nodes: [] }
 
         const isInteractive =
-          ["A", "BUTTON", "INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) ||
+          ["A", "BUTTON", "INPUT", "TEXTAREA", "SELECT", "SUMMARY"].includes(el.tagName) ||
           el.getAttribute("onclick") ||
-          el.getAttribute("role") === "button" ||
+          ["button", "link", "checkbox", "radio", "tab", "menuitem", "option", "switch", "combobox", "textbox"].includes(
+            el.getAttribute("role")
+          ) ||
           el.isContentEditable
 
         const name = getName(el)
         const pt = pseudoText(el)
 
-        const shouldInclude = isInteractive || name.trim() || pt.before || pt.after
+        const shouldInclude = opts.interactive ? !!isInteractive : isInteractive || name.trim() || pt.before || pt.after
 
         if (shouldInclude) {
           const uidStr = takeUid(el)
-          const node = {
-            uid: uidStr,
-            role: el.getAttribute("role") || el.tagName.toLowerCase(),
-            name: name,
-            tag: el.tagName.toLowerCase(),
-          }
+          const tagName = el.tagName.toLowerCase()
+          const role = el.getAttribute("role") || tagName
+          // Compact nodes: act on them with selector="uid:<uid>"; role is omitted when it only repeats the tag.
+          const node = { uid: uidStr, tag: tagName, name: opts.interactive ? name.slice(0, 100) : name }
+          if (role !== tagName) node.role = role
 
           if (pt.before) node.before = pt.before
           if (pt.after) node.after = pt.after
@@ -2400,8 +3390,6 @@ async function toolSnapshot({ tabId, full = false } = {}) {
             if (el.readOnly) node.readOnly = true
             if (el.disabled) node.disabled = true
           }
-
-          node.selector = `[data-iris-uid="${uidStr}"]`
 
           nodes.push(node)
         }
@@ -2433,9 +3421,16 @@ async function toolSnapshot({ tabId, full = false } = {}) {
         return links.slice(0, 200)
       }
 
+      let root = document.body
+      if (opts.selector) {
+        const sel = String(opts.selector).replace(/^(uid|ref)[:=]\s*/i, "")
+        root = document.querySelector(/^e\d+$/.test(sel) ? `[data-iris-uid="${sel}"]` : sel)
+        if (!root) return { error: `No element matches ${opts.selector}` }
+      }
+      const wantText = opts.includeText ?? !opts.interactive
       let pageText = ""
       try {
-        pageText = safeText(document.body?.innerText || "").slice(0, 20000)
+        if (wantText) pageText = safeText(root.innerText || "").slice(0, 20000)
       } catch {}
 
       const reset = !!opts?.full || document.documentElement.dataset.irisUidUrl !== location.href
@@ -2449,14 +3444,15 @@ async function toolSnapshot({ tabId, full = false } = {}) {
       }
       document.documentElement.dataset.irisUidUrl = location.href
 
-      const built = build(document.body).nodes.slice(0, 800)
+      const limit = Math.min(Math.max(Number(opts.maxNodes) || 800, 1), 3000)
+      const built = build(root).nodes.slice(0, limit)
 
       return {
         url: location.href,
         title: document.title,
         text: pageText,
         nodes: built,
-        links: getAllLinks(),
+        links: opts.interactive || opts.selector ? [] : getAllLinks(),
         restamped: reset,
       }
     },
@@ -2464,9 +3460,11 @@ async function toolSnapshot({ tabId, full = false } = {}) {
   })
 
   const snapshot = result[0]?.result || { url: tab.url, title: tab.title, nodes: [] }
+  if (snapshot.error) throw new Error(snapshot.error)
   const prev = lastSnapshot.get(tab.id)
-  const shouldFull = !!full || !prev || prev.url !== snapshot.url || snapshot.restamped
-  lastSnapshot.set(tab.id, { url: snapshot.url, nodesByUid: indexByUid(snapshot.nodes) })
+  // A diff is only meaningful against a snapshot taken with the same filters.
+  const shouldFull = !!full || !prev || prev.url !== snapshot.url || snapshot.restamped || prev.optionsKey !== optionsKey
+  lastSnapshot.set(tab.id, { url: snapshot.url, optionsKey, nodesByUid: indexByUid(snapshot.nodes) })
 
   if (shouldFull) {
     return {
@@ -2476,12 +3474,10 @@ async function toolSnapshot({ tabId, full = false } = {}) {
           mode: "full",
           url: snapshot.url,
           title: snapshot.title,
-          text: snapshot.text,
+          ...(snapshot.text ? { text: snapshot.text } : {}),
           nodes: snapshot.nodes,
-          links: snapshot.links,
-        },
-        null,
-        2
+          ...(snapshot.links?.length ? { links: snapshot.links } : {}),
+        }
       ),
     }
   }
@@ -2497,16 +3493,25 @@ async function toolSnapshot({ tabId, full = false } = {}) {
         added: diff.added,
         removed: diff.removed,
         changed: diff.changed,
-      },
-      null,
-      2
+      }
     ),
   }
 }
 
 async function toolGetTabs() {
   const tabs = await chrome.tabs.query({})
-  const out = tabs.map((t) => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }))
+  const groupTitles = new Map()
+  if (chrome.tabGroups) {
+    for (const g of await chrome.tabGroups.query({}).catch(() => [])) groupTitles.set(g.id, g.title || "")
+  }
+  const out = tabs.map((t) => ({
+    id: t.id,
+    url: t.url,
+    title: t.title,
+    active: t.active,
+    windowId: t.windowId,
+    ...(t.groupId >= 0 ? { group: groupTitles.get(t.groupId) ?? "" } : {}),
+  }))
   return { content: JSON.stringify(out, null, 2) }
 }
 
@@ -2523,7 +3528,9 @@ async function toolQuery({
   pattern,
   flags,
 }) {
-  if (!selector && mode !== "page_text") throw new Error("selector is required")
+  if (!selector && mode !== "page_text" && mode !== "page") {
+    throw new Error(`selector is required for mode=${mode}; use mode=page_text to read the whole page.`)
+  }
   const tab = await getTabById(tabId)
 
   const result = await runInPage(tab.id, "query", {
@@ -2541,7 +3548,7 @@ async function toolQuery({
 
   if (!result?.ok) throw new Error(result?.error || "Query failed")
 
-  if (mode === "list" || mode === "property" || mode === "exists" || mode === "page_text") {
+  if (["list", "all", "property", "exists", "count", "page_text", "page"].includes(mode)) {
     return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
   }
 
@@ -2606,20 +3613,23 @@ async function toolWaitFor({
     }
   }
 
-  const result = await runInPage(tab.id, "wait_for", {
-    selector,
-    text,
-    pattern,
-    urlPattern,
-    state,
-    timeoutMs: timeout,
-    pollMs: poll,
-    index,
-    flags,
-  })
-
-  if (!result?.ok) throw new Error(result?.error || "Wait condition failed")
-  return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+  // Poll from the service worker with single in-page checks: a loop inside the page dies with the document,
+  // so a wait started on about:blank or before a navigation would never see the new page.
+  const endAt = Date.now() + timeout
+  while (true) {
+    let result = null
+    try {
+      result = await runInPage(tab.id, "wait_for", { selector, text, pattern, urlPattern, state, timeoutMs: 0, index, flags })
+    } catch (error) {
+      const message = error?.message || String(error)
+      if (/permission|No tab with id|cannot be scripted/i.test(message)) throw error
+      // Mid-navigation: the frame is being replaced; check again on the next poll.
+    }
+    if (result?.ok) return { tabId: tab.id, content: JSON.stringify(result, null, 2) }
+    if (result && result.error !== "Timed out waiting for condition") throw new Error(result.error || "Wait condition failed")
+    if (Date.now() >= endAt) throw new Error(`Timed out after ${timeout}ms waiting for condition`)
+    await new Promise((resolve) => setTimeout(resolve, poll))
+  }
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -2802,20 +3812,30 @@ async function toolNetworkStart({ tabId, clear = true, maxEntries } = {}) {
   }
 }
 
-async function toolNetworkStop({ tabId } = {}) {
+// Never attaches: stopping capture must not raise Chrome's debugging bar. Detaches by default so the bar goes away.
+async function toolNetworkStop({ tabId, detach = true } = {}) {
   const tab = await getTabById(tabId)
-  const state = await ensureDebuggerAttached(tab.id)
-  const network = state.network
-  if (state.attached && network?.enabled) {
+  const state = debuggerState.get(tab.id)
+  const network = state?.network
+  if (state?.attached && network?.enabled) {
     try {
       await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.disable")
     } catch {}
-    network.enabled = false
     state.enabledDomains?.delete?.("Network")
+  }
+  if (network) network.enabled = false
+  let detached = false
+  if (detach !== false && state?.attached) {
+    try {
+      await chrome.debugger.detach({ tabId: tab.id })
+    } catch {}
+    state.attached = false
+    state.enabledDomains = new Set()
+    detached = true
   }
   return {
     tabId: tab.id,
-    content: JSON.stringify({ ok: true, enabled: false, count: network?.order?.length || 0 }, null, 2),
+    content: JSON.stringify({ ok: true, enabled: false, detached, count: network?.order?.length || 0 }, null, 2),
   }
 }
 
